@@ -11,7 +11,7 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 | 1 | Dependency graph (`common/depgraph.py`) | done — 1 fix round (exclusion cascade bug) |
 | 2 | CLI (`staticer.py`, format sniff, dispatch) | done — clean review |
 | 3 | PE embedder — PIC/reloc-bearing path | done — 1 fix round (no-reloc guard, MSVC bitness skip) |
-| 4 | ELF embedder — PIC/reloc-bearing path | done — 2 fix rounds; verified passing for real on Linux (WSL) |
+| 4 | ELF embedder — PIC/reloc-bearing path | done — 3 fix rounds; verified passing for real on Linux (WSL) |
 | 5 | PE non-PIC / no-reloc base-reservation | not started |
 | 6 | ELF non-PIC / no-reloc base-reservation | not started |
 | 7 | PE unwind preservation + Windows stub | not started |
@@ -63,6 +63,23 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   actually required a stub (unlike Task 3's PE brief), so this is a real
   capability gap left for Task 8, not a regression. Both (b) and (c) in
   `4a00e2b`. All 8 ELF tests now pass for real on Linux, 32- and 64-bit.
+  Fix round 3 (review, confirmed by rebuilding fixtures with the real
+  toolchain): new content's placement was derived only from the host's
+  extended segment rounding its own p_memsz up to a page boundary,
+  silently assuming that slack always covers whatever ordinary trailing
+  non-segment-covered content the binary has (.comment/.symtab/.strtab/
+  .shstrtab/the section header table -- present on any unstripped
+  binary). This suite's own 64-bit fixtures cleared the guard by only
+  ~240 bytes out of ~4096 of slack with no extra flags; adding plain
+  `-g` debug info flipped it negative, spuriously raising "would
+  overlap existing file content" on a completely ordinary binary — a
+  real Task 10 risk, not an edge case. Fixed by taking
+  max(segment's own rounded memsz end, actual EOF + skew) before the
+  final page rounding (`4085898`). Added
+  `test_embed_handles_trailing_debug_info` (built with `-g`,
+  `5c44506`); confirmed on WSL both that it fails without the fix
+  (exact "would overlap" error, 64-bit) and passes with it, alongside
+  the rest of the suite.
 - `firstclass` adopted for `DependencyNode` per explicit direction (pure Python,
   confirmed no compiled backend).
 - `docs/firstclass-feedback.md` — upstream suggestions for the library.
@@ -81,15 +98,18 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 - Parked (Task 1 review): cycle-case `is_excluded` staleness in parent DFS
   frames — low risk, `embed_order` independently raises on any cycle.
 - Task 4 has now been verified for real on Linux (WSL Ubuntu, gcc 15.2.0,
-  both 32- and 64-bit) — all 4 tests (`test_embed_pic_so_into_exe`,
+  both 32- and 64-bit) — all 5 tests (`test_embed_pic_so_into_exe`,
   `test_embedded_output_no_longer_needs_embedded_so`,
   `test_architecture_mismatch_fails_loudly`,
-  `test_embedded_output_preserves_host_tls`) pass for real, not just
-  collect+skip. This surfaced and fixed 3 bugs reasoning-only review hadn't
+  `test_embedded_output_preserves_host_tls`,
+  `test_embed_handles_trailing_debug_info`) pass for real, not just
+  collect+skip. This surfaced and fixed 4 bugs reasoning-only review hadn't
   caught (see "Done so far" above) — most notably that the generated
   init-call stub, which looked correct and well-reasoned on paper, reliably
-  segfaulted. Not yet verified: anything beyond this task's own 2-fixture
-  scope (`lib.c`/`main.c`/`main_tls.c`) — e.g. a dependency with a *real*
+  segfaulted, and that the segment-extension placement logic silently relied
+  on a page-rounding-slack coincidence that a plain `-g` build broke. Not
+  yet verified: anything beyond this task's own 2-fixture scope
+  (`lib.c`/`main.c`/`main_tls.c`) — e.g. a dependency with a *real*
   (non-crtstuff) global constructor, multi-dependency chains, or a host with
   an unusual segment layout (the "highest-vaddr PT_LOAD segment is also last
   in the file" assumption) are all still reasoning-only. Task 12's CI matrix
@@ -118,4 +138,4 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 ## Commit discipline
 
 Small, single-purpose commits per implementer, no amending, no push until
-asked. Current HEAD: `4a00e2b`.
+asked. Current HEAD: `5c44506`.
