@@ -263,7 +263,7 @@ class PortableExecutableEmbedder:
                         val = (val + delta) & mask
                         blob[offset:offset + size] = val.to_bytes(size, "little")
 
-                    if hasattr(dep, "DIRECTORY_ENTRY_BASERELOC"):
+                    if getattr(dep, "DIRECTORY_ENTRY_BASERELOC", None):
                         for block in dep.DIRECTORY_ENTRY_BASERELOC:
                             for entry in block.entries:
                                 if entry.type == IMAGE_REL_BASED_ABSOLUTE:
@@ -278,6 +278,21 @@ class PortableExecutableEmbedder:
                                         f"dependency '{node.name}'"
                                     )
                                 new_reloc_entries.append((X + entry.rva, entry.type))
+                    else:
+                        # No relocation data at all means this dependency is
+                        # fixed-base/non-PIC: it can only be embedded
+                        # correctly via base-address reservation, which is a
+                        # later task (see design doc's non-PIC handling).
+                        # Embedding it verbatim here would silently bake in
+                        # stale build-time absolute addresses -- exactly the
+                        # "looks like it built but crashes at runtime"
+                        # anti-goal -- so fail loudly instead.
+                        raise ValueError(
+                            f"dependency '{node.name}' ({node.path}) carries no "
+                            f"relocation data; embedding fixed-base/non-PIC "
+                            f"dependencies isn't supported yet (base-address "
+                            f"reservation is a later task)"
+                        )
 
                     exports_by_name = {}
                     if hasattr(dep, "DIRECTORY_ENTRY_EXPORT"):

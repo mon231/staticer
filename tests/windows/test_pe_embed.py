@@ -1,6 +1,8 @@
 import platform
 import subprocess
+from pathlib import Path
 
+import pefile
 import pytest
 
 from conftest import FIXTURES, build_exe, build_shared_lib
@@ -60,6 +62,33 @@ def test_architecture_mismatch_fails_loudly(tmp_path, c_compiler, bits):
     # manually place the mismatched-arch build where exe's import of
     # "lib.dll" will resolve to it (search_dirs == [lib_dir] == [tmp_path])
     (tmp_path / "lib.dll").write_bytes(dll_other_arch.read_bytes())
+
+    with pytest.raises(ValueError):
+        PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), lib_dir=tmp_path).embed()
+
+
+def _strip_relocations(dll_path: Path) -> None:
+    """Zero out a PE's Base Relocation data directory in place, producing a
+    dependency that carries no relocation data at all -- simulating a
+    fixed-base/non-PIC build without needing special linker flags to
+    actually produce one."""
+    pe = pefile.PE(str(dll_path))
+    reloc_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]]
+    va_off = reloc_dir.get_field_absolute_offset("VirtualAddress")
+    sz_off = reloc_dir.get_field_absolute_offset("Size")
+    pe.close()  # release the file handle before rewriting it (Windows locking)
+
+    data = bytearray(dll_path.read_bytes())
+    data[va_off:va_off + 4] = b"\x00\x00\x00\x00"
+    data[sz_off:sz_off + 4] = b"\x00\x00\x00\x00"
+    dll_path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_dependency_without_relocation_data_fails_loudly(tmp_path, c_compiler, bits):
+    dll = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=True, bits=bits)
+    _strip_relocations(dll)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main.exe", [dll], pic=True, bits=bits)
 
     with pytest.raises(ValueError):
         PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), lib_dir=tmp_path).embed()
