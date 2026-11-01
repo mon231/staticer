@@ -5,6 +5,7 @@ bitness and PIC-ness.
 """
 
 import functools
+import platform
 import re
 import shutil
 import subprocess
@@ -107,13 +108,16 @@ def build_shared_lib(tmp_path: Path, source: Path, name: str, *, pic: bool, bits
     compiler = _gnu_compiler_for_bits(bits)
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
-    cmd = [
-        compiler, "-shared", bits_flag, pic_flag,
-        "-Wl,--export-all-symbols",
-        "-o", str(out), str(source),
-    ]
-    if not pic:
-        cmd.append("-Wl,--disable-dynamicbase")
+    cmd = [compiler, "-shared", bits_flag, pic_flag, "-o", str(out), str(source)]
+    if platform.system() == "Windows":
+        # mingw-w64 cross/native compiler, producing a PE DLL (used as a
+        # cl.exe-less fallback for the Windows/PE embed tests).
+        cmd.append("-Wl,--export-all-symbols")
+        if not pic:
+            cmd.append("-Wl,--disable-dynamicbase")
+    # Elsewhere (Linux), this produces a native ELF .so: default symbol
+    # visibility already exports lib.c's function, so no extra flag is
+    # needed there.
     _run(cmd)
     return out
 
@@ -132,7 +136,15 @@ def build_exe(tmp_path: Path, source: Path, name: str, libs: List[Path], *, pic:
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
     cmd = [compiler, bits_flag, pic_flag, "-o", str(out), str(source)] + [str(lib) for lib in libs]
-    if not pic:
-        cmd.append("-Wl,--disable-dynamicbase")
+    if platform.system() == "Windows":
+        if not pic:
+            cmd.append("-Wl,--disable-dynamicbase")
+    else:
+        # Native ELF target: make PIC-ness of the *executable* explicit
+        # (modern distro gcc defaults to PIE already, but don't rely on
+        # that default) rather than relying on -fPIC alone, which only
+        # affects code generation, not whether the linker emits an ET_DYN
+        # (PIE) vs ET_EXEC (fixed-base) binary.
+        cmd.append("-pie" if pic else "-no-pie")
     _run(cmd)
     return out
