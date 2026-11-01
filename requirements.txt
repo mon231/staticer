@@ -1,2 +1,4 @@
 lief
 firstclass
+pefile
+pyelftools
