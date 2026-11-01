@@ -65,3 +65,28 @@ def test_architecture_mismatch_fails_loudly(tmp_path, c_compiler, bits):
 
     with pytest.raises(ValueError):
         ElfEmbedder(exe, tmp_path / "out", set(), lib_dir=tmp_path).embed()
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_embedded_output_preserves_host_tls(tmp_path, c_compiler, bits):
+    """Regression test for a bug where embed() relocated the host's
+    program header table into a new PT_LOAD segment with a different
+    p_vaddr-p_offset skew than the host's first PT_LOAD segment. The
+    kernel computes AT_PHDR = load_bias + e_phoff using *that first
+    segment's* skew unconditionally; a skew mismatch sends AT_PHDR to a
+    bogus address still inside the original image, which glibc's
+    _dl_aux_init then misreads while hunting for this executable's own
+    PT_TLS entry -- silently skipping static TLS setup (or crashing) for
+    `main_tls.c`'s `tls_counter`. `lib.c`/`main.c` alone (used by the
+    other tests above) have no TLS and can't catch this class of bug:
+    embed() currently (correctly) never touches e_phoff/e_phnum at all,
+    so AT_PHDR's computation is untouched and TLS keeps working."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.so", pic=True, bits=bits)
+    exe = build_exe(tmp_path, FIXTURES / "main_tls.c", "main_tls", [so], pic=True, bits=bits)
+    out = tmp_path / "static_tls"
+
+    ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+    out.chmod(0o755)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 49  # tls_counter(7) + lib_value()(42)
