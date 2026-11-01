@@ -7,28 +7,25 @@ This module knows nothing about PE or ELF; those formats supply their own
 ``elf_embedder``) and call into ``build_dependency_graph``/``embed_order``.
 """
 
+from dataclasses import field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from firstclass import firstclass
 
+
+@firstclass
 class DependencyNode:
-    def __init__(
-        self,
-        name: str,
-        path: Path,
-        embeddable: bool,
-        imports: Optional[List[str]] = None,
-    ) -> None:
-        self.name = name
-        self.path = path
-        self.embeddable = embeddable
-        # Names of this node's own resolved imports (edges), keyed the same
-        # way as the graph dict. Populated by build_dependency_graph;
-        # embed_order walks it to produce a dependencies-first order. Not
-        # part of the original interface's three fields, but required for
-        # embed_order to have any edge information to sort over, since the
-        # graph dict is its only input.
-        self.imports: List[str] = imports if imports is not None else []
+    name: str
+    path: Path
+    embeddable: bool
+    # Names of this node's own resolved imports (edges), keyed the same
+    # way as the graph dict. Populated by build_dependency_graph;
+    # embed_order walks it to produce a dependencies-first order. Not
+    # part of the original interface's three fields, but required for
+    # embed_order to have any edge information to sort over, since the
+    # graph dict is its only input.
+    imports: List[str] = field(default_factory=list)
 
 
 class CyclicDependencyError(Exception):
