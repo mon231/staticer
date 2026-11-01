@@ -95,19 +95,6 @@ def _pack_phdr(is64: bool, p_type: int, p_flags: int, p_offset: int, p_vaddr: in
                         p_filesz, p_memsz, p_flags, p_align)
 
 
-# ELF header field (offset, size) for the one field embed() ever patches
-# (e_entry -- e_phoff/e_phnum are deliberately never touched; see the
-# large comment on extending `ext` in place, in embed()), per the fixed
-# Elf32_Ehdr/Elf64_Ehdr layout (both start with the same 16-byte e_ident).
-_EHDR_FIELDS_64 = {"e_entry": (24, 8)}
-_EHDR_FIELDS_32 = {"e_entry": (24, 4)}
-
-
-def _set_ehdr_field(raw: bytearray, is64: bool, field: str, value: int) -> None:
-    off, size = (_EHDR_FIELDS_64 if is64 else _EHDR_FIELDS_32)[field]
-    raw[off:off + size] = (value & ((1 << (size * 8)) - 1)).to_bytes(size, "little")
-
-
 def _remove_needed(dyn, raw: bytearray, ptr_size: int, needed_name: str) -> bool:
     """Convert the DT_NEEDED entry for `needed_name` into a DT_DEBUG entry,
     in place. DT_DEBUG is ignored by every real-world runtime linker, and
@@ -176,61 +163,6 @@ def _pack_relative_entries(entries: List[Tuple[int, int]], is64: bool, is_rela: 
     return bytes(out)
 
 
-# -- generated entrypoint stub (placeholder; a later task replaces this) --
-#
-# Mirrors pe_embedder's _x64_call_dllmain/_x64_tail_jmp: each builder
-# returns (bytes, [relative offsets of embedded absolute-VA immediates]),
-# since those immediates are hardcoded addresses that must become new
-# R_*_RELATIVE entries in the host (see embed()) to stay correct if the
-# final image is loaded at a different base (ASLR).
-#
-# Unlike PE's DllMain(..., DLL_PROCESS_ATTACH, ...) convention, an ELF
-# shared object's load-time initialization hooks are its DT_INIT/
-# DT_INIT_ARRAY function pointers, normally called by the dynamic linker's
-# _dl_init when the object is loaded. Removing the dependency from the
-# host's DT_NEEDED list means ld.so will never call them for us, so the
-# stub calls them directly.
-#
-# NOTE -- this is a real simplification, not a harmless one: glibc's own
-# _dl_init calls each init_array entry as init_func(argc, argv, envp) by
-# convention (see glibc's elf/dl-init.c), not with no arguments. The stub
-# below passes nothing. This happens not to matter *yet* because no
-# fixture in this task's test suite has any constructor at all (lib.c has
-# none, so dep_init_calls is always empty and this code path never runs),
-# but it's a real gap Task 8 needs to close -- either by wiring
-# argc/argv/envp through from the host's own entry (they're sitting on
-# the stack at the point this stub runs, before _start's prologue
-# consumes them) or by confirming real init_array consumers never read
-# their arguments and documenting that as an intentional, checked
-# decision rather than an unexamined one.
-#
-# Each call/ret pair is self-balancing on the stack (the callee's own
-# `ret` restores %rsp exactly), so -- unlike PE, which explicitly saves
-# and restores incoming arg registers around its call -- no register or
-# stack bookkeeping is needed between calls: nothing here ever leaves
-# %rsp anywhere other than where it started, which `_start` further down
-# the tail-jump chain needs completely undisturbed to find argc/argv.
-
-def _x64_call(func_va: int):
-    data = b"\x48\xB8" + func_va.to_bytes(8, "little") + b"\xFF\xD0"  # movabs rax, imm64; call rax
-    return data, [2]
-
-
-def _x64_tail_jmp(target_va: int):
-    data = b"\x48\xB8" + target_va.to_bytes(8, "little") + b"\xFF\xE0"  # movabs rax, imm64; jmp rax
-    return data, [2]
-
-
-def _x86_call(func_va: int):
-    data = b"\xB8" + func_va.to_bytes(4, "little") + b"\xFF\xD0"  # mov eax, imm32; call eax
-    return data, [1]
-
-
-def _x86_tail_jmp(target_va: int):
-    data = b"\xB8" + target_va.to_bytes(4, "little") + b"\xFF\xE0"  # mov eax, imm32; jmp eax
-    return data, [1]
-
-
 class ElfEmbedder:
     def __init__(self, input_path: Path, output_path: Path, exclude: Set[str], lib_dir: Optional[Path]):
         self.input_path = Path(input_path)
@@ -273,10 +205,44 @@ class ElfEmbedder:
              that no longer has a provider.
           4. Convert the dependency's DT_NEEDED entry to a harmless
              DT_DEBUG entry in place (see _remove_needed).
-          5. Collect the dependency's own DT_INIT/DT_INIT_ARRAY function
-             pointers (already relocated to their new addresses by step 2,
-             since init_array slots are themselves R_*_RELATIVE targets),
-             to be called from a generated init stub.
+
+        Deliberately NOT done: calling the dependency's own DT_INIT/
+        DT_INIT_ARRAY entries (the ELF analogue of PE's DllMain(...,
+        DLL_PROCESS_ATTACH, ...) call, which pe_embedder's docstring lists
+        as its own step 6). An earlier version of this method did exactly
+        that -- collect those function pointers (already relocated to
+        their new addresses, since init_array slots are themselves
+        R_*_RELATIVE targets) and call them from a generated stub
+        installed as the new e_entry, mirroring pe_embedder's approach.
+        Verified by actually building and running the embedded output on
+        real Linux (not just reasoning about it): on x86 (EM_386), this
+        reliably segfaults. crtstuff's own init_array entries
+        (`frame_dummy`/`register_tm_clones`, injected into *every* GCC-
+        built shared object regardless of user code -- the same
+        toolchain-boilerplate pattern as the weak GLOB_DAT symbols
+        documented below) are compiled as 32-bit PIC code, which computes
+        its own GOT-relative addressing via a `call __x86.get_pc_thunk.bx`
+        / `add ebx, <offset>` sequence at entry; calling them "cold" from
+        a plain `mov eax, imm32; call eax` (no attempt to establish
+        whatever calling-convention precondition that sequence depends
+        on) corrupts something, with a concrete observed crash signature
+        of `SIGSEGV, error 6 (write, not-present), si_addr=1` a few
+        instructions into glibc's own post-relocation startup path. x86-64
+        (EM_X86_64) uses RIP-relative addressing instead and happened not
+        to crash in testing, but calling crtstuff-internal functions
+        directly is risky enough on its own merits (undocumented
+        preconditions, no argc/argv/envp despite glibc's own _dl_init
+        passing them by convention -- see glibc's elf/dl-init.c) that
+        shipping it on the strength of "didn't crash on one machine" would
+        just be trading a *known* bug for an *unknown* one. The task
+        brief's own instructions for this method don't actually list an
+        entrypoint stub as a required step (unlike Task 3's PE brief,
+        which explicitly does) -- so, given it's proven actively unsafe as
+        a naive port of PE's approach, it's left for Task 8 to design
+        properly (which will need to either establish the x86-32 PIC
+        calling convention precondition correctly, or find a safer hook
+        point than "call directly from a synthetic entrypoint stub").
+        e_entry is therefore never touched by this method.
 
         Simplifications for this task (explicitly deferred -- see Task 8):
           - The dependency's *own* further external requirements aren't
@@ -303,18 +269,12 @@ class ElfEmbedder:
             place isn't generally safe -- same reasoning as pe_embedder's
             import-directory rebuild); the original entries are preserved
             byte-for-byte as that new table's prefix.
-          - The host's extended PT_LOAD segment (dependency blobs + stub +
+          - The host's extended PT_LOAD segment (dependency blobs +
             combined relocation table, all appended as a single in-place
             extension of it -- see below) has RWX ORed into its existing
             flags, mirroring pe_embedder's blanket `_SCN_CODE_RWX` section
             characteristics -- a real W^X split is out of scope for this
             placeholder.
-          - Step 5's stub (see the module-level comment above the x64/x86
-            builders) is a flat, unconditional call sequence, one call per
-            init_array/DT_INIT entry across all embedded nodes, then a
-            tail-jump to the host's original entry point. It's built (and
-            e_entry is only repointed to it) when at least one such call
-            exists; otherwise the host's entry point is left untouched.
         """
         search_dirs = self._search_dirs()
         graph = build_dependency_graph(
@@ -372,10 +332,9 @@ class ElfEmbedder:
 
         new_sections: List[Tuple[int, bytes]] = []  # (vaddr, data), contiguous in placement order
         new_reloc_entries: List[Tuple[int, int]] = []  # (host vaddr, value) -> new R_*_RELATIVE entries
-        dep_init_calls: List[int] = []  # absolute (host-space) VAs to call from the stub
         combined_exports: Dict[str, Tuple[int, int]] = {}  # export name -> (X, offset-within-dep)
 
-        # Every newly-built blob/stub/reloc-table is appended as an
+        # Every newly-built blob/reloc-table is appended as an
         # *extension* of the host's own highest-vaddr PT_LOAD segment,
         # rather than as a new PT_LOAD segment of its own -- see the large
         # comment further down, right before this same `ext`/`ext_idx` pair
@@ -461,6 +420,25 @@ class ElfEmbedder:
                         else:
                             sym = dep_dyn.get_symbol(reloc["r_info_sym"])
                             if sym["st_shndx"] == "SHN_UNDEF":
+                                if sym["st_info"]["bind"] == "STB_WEAK":
+                                    # Every GCC-built shared object links in
+                                    # crtstuff's weak references to
+                                    # __cxa_finalize/__gmon_start__/the
+                                    # _ITM_*TMCloneTable hooks via
+                                    # R_*_GLOB_DAT, regardless of what the
+                                    # user's own code does -- this isn't a
+                                    # dependency-specific "further external
+                                    # requirement", it's unconditional
+                                    # toolchain boilerplate. A weak
+                                    # undefined symbol left unresolved is
+                                    # normal ELF semantics: ld.so itself
+                                    # just resolves it to NULL when nothing
+                                    # provides it (callers are required to
+                                    # null-check before using it), so
+                                    # explicitly zero the slot and move on
+                                    # -- exactly what ld.so would have done.
+                                    _write_int(blob, blob_offset, ptr_size, 0)
+                                    continue
                                 raise ValueError(
                                     f"dependency '{node.name}' has an unresolved external "
                                     f"symbol reference ('{sym.name}'); embedding dependencies "
@@ -485,16 +463,9 @@ class ElfEmbedder:
                     ):
                         combined_exports[sym.name] = (X, sym["st_value"] - dep_base)
 
-                init_tag = next(dep_dyn.iter_tags("DT_INIT"), None)
-                if init_tag is not None:
-                    dep_init_calls.append(X + (init_tag.entry.d_val - dep_base))
-                init_array_ptr, _ = dep_dyn.get_table_offset("DT_INIT_ARRAY")
-                if init_array_ptr is not None:
-                    sz_tag = next(dep_dyn.iter_tags("DT_INIT_ARRAYSZ"), None)
-                    count = (sz_tag.entry.d_val // ptr_size) if sz_tag is not None else 0
-                    base_off = init_array_ptr - dep_base
-                    for i in range(count):
-                        dep_init_calls.append(_read_int(blob, base_off + i * ptr_size, ptr_size))
+                # Deliberately not collecting/calling this dependency's own
+                # DT_INIT/DT_INIT_ARRAY entries -- see embed()'s docstring
+                # for why (verified-unsafe on x86).
 
                 if not _remove_needed(host_dyn, raw, ptr_size, node.name):
                     raise ValueError(f"expected DT_NEEDED entry for '{node.name}' not found in host")
@@ -532,27 +503,6 @@ class ElfEmbedder:
 
                 entry_off = table_file_offset + idx * entry_size
                 raw[entry_off:entry_off + entry_size] = b"\x00" * entry_size
-
-        # -- generated init-call stub (placeholder; a later task replaces) -
-        stub_vaddr = None
-        if dep_init_calls:
-            call_fn = _x64_call if is64 else _x86_call
-            tail_fn = _x64_tail_jmp if is64 else _x86_tail_jmp
-
-            stub_vaddr = next_vaddr
-            stub_bytes = bytearray()
-            for func_va in dep_init_calls:
-                block, offs = call_fn(func_va)
-                for off in offs:
-                    new_reloc_entries.append((stub_vaddr + len(stub_bytes) + off, func_va))
-                stub_bytes += block
-            tail_block, tail_offs = tail_fn(elf["e_entry"])
-            for off in tail_offs:
-                new_reloc_entries.append((stub_vaddr + len(stub_bytes) + off, elf["e_entry"]))
-            stub_bytes += tail_block
-
-            new_sections.append((stub_vaddr, bytes(stub_bytes)))
-            next_vaddr = _align_up(stub_vaddr + len(stub_bytes), _PAGE)
 
         # -- combined relocation table -------------------------------------
         if new_reloc_entries:
@@ -629,7 +579,6 @@ class ElfEmbedder:
         entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
         raw[entry_off:entry_off + len(extended_entry)] = extended_entry
 
-        if stub_vaddr is not None:
-            _set_ehdr_field(raw, is64, "e_entry", stub_vaddr)
+        # e_entry is deliberately never touched -- see embed()'s docstring.
 
         self.output_path.write_bytes(bytes(raw))
