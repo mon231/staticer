@@ -4,6 +4,8 @@ tests: locate a C compiler and compile the small synthetic fixtures in
 bitness and PIC-ness.
 """
 
+import functools
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,6 +24,38 @@ def _find_compiler() -> Optional[Tuple[str, Optional[str]]]:
     if shutil.which("gcc") or shutil.which("clang"):
         return ("gnu", None)
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def _msvc_target_bits(cl_path: str) -> Optional[int]:
+    """The bitness `cl_path` actually compiles for, read from its own
+    version banner ("... for x64" / "... for x86"), or None if that can't
+    be determined.
+
+    There's no portable way to make a single `cl.exe` on PATH build for a
+    *different* bitness than the one it was set up for (that's a property
+    of which Developer Command Prompt / vcvarsall.bat environment is
+    active, not a compiler flag) -- so callers must check this and skip
+    rather than silently building the wrong bitness.
+    """
+    result = subprocess.run([cl_path], capture_output=True, text=True)
+    banner = (result.stdout or "") + (result.stderr or "")
+    if re.search(r"\bfor x64\b", banner):
+        return 64
+    if re.search(r"\bfor x86\b", banner):
+        return 32
+    return None
+
+
+def _require_msvc_bits(cl_path: str, bits: int) -> None:
+    active = _msvc_target_bits(cl_path)
+    if active != bits:
+        pytest.skip(
+            f"active cl.exe targets {active if active else 'an unknown'}-bit; "
+            f"this fixture can't select a {bits}-bit MSVC toolchain on its own "
+            f"(that needs a different vcvarsall.bat/Developer Command Prompt "
+            f"environment)"
+        )
 
 
 @pytest.fixture(scope="session")
@@ -65,6 +99,7 @@ def build_shared_lib(tmp_path: Path, source: Path, name: str, *, pic: bool, bits
     out = tmp_path / name
 
     if kind == "msvc":
+        _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
         _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"])
         return out
@@ -88,6 +123,7 @@ def build_exe(tmp_path: Path, source: Path, name: str, libs: List[Path], *, pic:
     out = tmp_path / name
 
     if kind == "msvc":
+        _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
         _run([cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}"] + [str(lib) for lib in libs])
         return out
