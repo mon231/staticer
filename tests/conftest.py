@@ -103,20 +103,23 @@ def _run(cmd: List[str]) -> None:
         )
 
 
-def build_shared_lib(tmp_path: Path, source: Path, name: str, *, pic: bool, bits: int) -> Path:
+def build_shared_lib(
+    tmp_path: Path, source: Path, name: str, *, pic: bool, bits: int,
+    extra_flags: Optional[List[str]] = None,
+) -> Path:
     kind, cl_path = _find_compiler()
     out = tmp_path / name
 
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
-        _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"])
+        _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"] + list(extra_flags or []))
         return out
 
     compiler = _gnu_compiler_for_bits(bits)
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
-    cmd = [compiler, "-shared", bits_flag, pic_flag, "-o", str(out), str(source)]
+    cmd = [compiler, "-shared", bits_flag, pic_flag, "-o", str(out), str(source)] + list(extra_flags or [])
     if platform.system() == "Windows":
         # mingw-w64 cross/native compiler, producing a PE DLL (used as a
         # cl.exe-less fallback for the Windows/PE embed tests).
@@ -130,20 +133,29 @@ def build_shared_lib(tmp_path: Path, source: Path, name: str, *, pic: bool, bits
     return out
 
 
-def build_exe(tmp_path: Path, source: Path, name: str, libs: List[Path], *, pic: bool, bits: int) -> Path:
+def build_exe(
+    tmp_path: Path, source: Path, name: str, libs: List[Path], *, pic: bool, bits: int,
+    extra_flags: Optional[List[str]] = None,
+) -> Path:
     kind, cl_path = _find_compiler()
     out = tmp_path / name
 
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
-        _run([cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}"] + [str(lib) for lib in libs])
+        _run(
+            [cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}"]
+            + [str(lib) for lib in libs] + list(extra_flags or [])
+        )
         return out
 
     compiler = _gnu_compiler_for_bits(bits)
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
-    cmd = [compiler, bits_flag, pic_flag, "-o", str(out), str(source)] + [str(lib) for lib in libs]
+    cmd = (
+        [compiler, bits_flag, pic_flag, "-o", str(out), str(source)]
+        + [str(lib) for lib in libs] + list(extra_flags or [])
+    )
     if platform.system() == "Windows":
         if not pic:
             cmd.append("-Wl,--disable-dynamicbase")

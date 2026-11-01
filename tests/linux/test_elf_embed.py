@@ -90,3 +90,36 @@ def test_embedded_output_preserves_host_tls(tmp_path, c_compiler, bits):
 
     result = subprocess.run([str(out)], capture_output=True)
     assert result.returncode == 49  # tls_counter(7) + lib_value()(42)
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_embed_handles_trailing_debug_info(tmp_path, c_compiler, bits):
+    """Regression test for a bug where the new content's placement was
+    derived purely from the host's own extended PT_LOAD segment rounding
+    up past its *own* p_memsz -- silently assuming that rounding slack
+    always happens to cover whatever ordinary trailing, non-segment-
+    covered content a binary has (.comment/.symtab/.strtab/.shstrtab/the
+    section header table, present on any binary that isn't built with
+    `-s`/stripped, which none of this suite's fixtures are). When that
+    trailing content is bigger than the segment's own rounding slack --
+    completely normal for an unstripped binary with real debug info, not
+    an adversarial case -- embed() spuriously raised "would overlap
+    existing file content" on an otherwise perfectly ordinary host. `-g`
+    here is enough to reliably push a plain host past one page of slack
+    (confirmed against this suite's own minimal fixtures, which clear it
+    by only a couple hundred bytes without `-g`); embed() must place new
+    content past the *actual* end of the file, not just past where its
+    chosen segment's own memsz happens to round up to."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.so", pic=True, bits=bits, extra_flags=["-g"])
+    exe = build_exe(
+        tmp_path, FIXTURES / "main.c", "main", [so], pic=True, bits=bits, extra_flags=["-g"]
+    )
+    out = tmp_path / "static_debug"
+
+    ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+    out.chmod(0o755)
+
+    assert "lib.so" not in list_elf_imports(out)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 42
