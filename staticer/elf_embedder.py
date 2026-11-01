@@ -355,7 +355,24 @@ class ElfEmbedder:
         # The skew this segment's new (extended) content must keep -- any
         # vaddr V within it is at file offset V - ext_skew, and vice versa.
         ext_skew = ext["p_vaddr"] - ext["p_offset"]
-        next_vaddr = _align_up(ext["p_vaddr"] + ext["p_memsz"], ext_align)
+        # New content must start at a vaddr that (a) doesn't collide with
+        # `ext`'s own existing memsz, and (b) whose corresponding file
+        # offset (vaddr - ext_skew) is past the *actual* end of the file
+        # -- which, for any ordinary unstripped binary, extends further
+        # than `ext`'s own rounded-up memsz: .comment/.symtab/.strtab/
+        # .shstrtab/the section header table are normal trailing content
+        # that no PT_* segment covers at all (the check above only
+        # confirms `ext` is the last *segment-covered* content, which
+        # isn't the same as the last *byte in the file*). Taking the max
+        # of both lower bounds before rounding -- rather than assuming
+        # `ext`'s own page-rounding slack always happens to cover
+        # whatever trailing content exists -- means this never
+        # spuriously rejects a completely normal binary just because its
+        # one page of rounding slack happens to be smaller than its
+        # trailing symbol-table/debug-info content.
+        min_vaddr_for_memsz = ext["p_vaddr"] + ext["p_memsz"]
+        min_vaddr_for_eof = len(raw) + ext_skew
+        next_vaddr = _align_up(max(min_vaddr_for_memsz, min_vaddr_for_eof), ext_align)
 
         # -- per-dependency: copy, relocate, and remove its DT_NEEDED -----
         for node in order:
