@@ -1,15 +1,13 @@
-import os
-import sys
-import lief
-from typing import List
 from pathlib import Path
-from collections import OrderedDict
+from typing import Optional, Set
+
 
 class ElfEmbedder:
-    def __init__(self, input_executable: lief.ELF.Binary, output_executable: Path, search_directories: List[Path]):
-        self.executable = input_executable
-        self.output_path = output_executable
-        self.search_directories = search_directories
+    def __init__(self, input_path: Path, output_path: Path, exclude: Set[str], lib_dir: Optional[Path]):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.exclude = exclude
+        self.lib_dir = lib_dir
 
     def embed(self):
-        pass
+        raise NotImplementedError('ELF format isn\'t supported yet')
