@@ -48,8 +48,18 @@ def build_dependency_graph(
     def visit(name: str, path: Path, force_excluded: bool) -> None:
         is_excluded = force_excluded or (name in exclude) or not in_scope(path)
         if name in nodes:
-            if is_excluded:
-                nodes[name].embeddable = False
+            node = nodes[name]
+            # Only cascade when this visit newly excludes the node (guards
+            # against both redundant re-cascading on repeat revisits and,
+            # critically, infinite recursion around cycles: once a node is
+            # already False, re-walking its recorded imports again is a
+            # no-op).
+            if is_excluded and node.embeddable:
+                node.embeddable = False
+                for child_name in node.imports:
+                    child = nodes.get(child_name)
+                    if child is not None:
+                        visit(child_name, child.path, force_excluded=True)
             return
         node = DependencyNode(name=name, path=path, embeddable=not is_excluded)
         nodes[name] = node

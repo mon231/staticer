@@ -81,6 +81,39 @@ def test_exclusion_propagates_transitively_regardless_of_visit_order():
     assert graph["y.dll"].embeddable is False
 
 
+def test_exclusion_cascades_through_already_visited_node():
+    # root -> a.dll -> b.dll -> c.dll   (a.dll visited first, not excluded)
+    # root -> x.dll -> b.dll            (x.dll excluded)
+    #
+    # c.dll is reachable ONLY through b.dll, which is reachable both via the
+    # non-excluded a.dll and via the excluded x.dll. Because a.dll is visited
+    # first, b.dll (and therefore c.dll) is initially recorded as embeddable;
+    # when x.dll's subtree later re-reaches the already-visited b.dll and
+    # excludes it, that exclusion must cascade down into b.dll's own already
+    # -recorded import (c.dll) too -- not stop one hop short.
+    root = Path("root.exe")
+    list_imports, resolve = _fake(
+        imports_by_name={
+            "root.exe": ["a.dll", "x.dll"],
+            "a.dll": ["b.dll"],
+            "x.dll": ["b.dll"],
+            "b.dll": ["c.dll"],
+            "c.dll": [],
+        },
+        resolvable_paths={
+            "a.dll": Path("/libs/a.dll"),
+            "x.dll": Path("/libs/x.dll"),
+            "b.dll": Path("/libs/b.dll"),
+            "c.dll": Path("/libs/c.dll"),
+        },
+    )
+
+    graph = build_dependency_graph(root, list_imports, resolve, [], None, {"x.dll"})
+
+    assert graph["b.dll"].embeddable is False
+    assert graph["c.dll"].embeddable is False
+
+
 def test_lib_dir_scopes_embedding():
     # root -> A (path inside lib_dir), root -> B (path outside lib_dir)
     root = Path("root.exe")
