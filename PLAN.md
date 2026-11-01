@@ -11,7 +11,7 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 | 1 | Dependency graph (`common/depgraph.py`) | done — 1 fix round (exclusion cascade bug) |
 | 2 | CLI (`staticer.py`, format sniff, dispatch) | done — clean review |
 | 3 | PE embedder — PIC/reloc-bearing path | done — 1 fix round (no-reloc guard, MSVC bitness skip) |
-| 4 | ELF embedder — PIC/reloc-bearing path | done — 3 fix rounds; verified passing for real on Linux (WSL) |
+| 4 | ELF embedder — PIC/reloc-bearing path | done — review closed, 3 fix rounds; verified passing for real on Linux (WSL) |
 | 5 | PE non-PIC / no-reloc base-reservation | not started |
 | 6 | ELF non-PIC / no-reloc base-reservation | not started |
 | 7 | PE unwind preservation + Windows stub | not started |
@@ -123,9 +123,10 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 
 ## What's next
 
-- Task 4 (ELF PIC path) done, verified for real on Linux, pending final review.
-- Tasks 5-8 (non-PIC + unwind) depend on 3/4 being settled first (same files) —
-  now unblocked for both sides. Task 8 in particular needs to design the real
+- Task 4 (ELF PIC path) complete — review closed, 3 fix rounds, all re-verified.
+- Task 5 (PE non-PIC base-reservation) — dispatching next.
+- Tasks 6-8 (ELF non-PIC + unwind) depend on 3/4 being settled first (same
+  files) — now unblocked. Task 8 in particular needs to design the real
   init-call mechanism Task 4 deliberately left out (see fix round 2 above) —
   calling crtstuff-style init functions safely needs either establishing the
   x86-32 PIC GOT-base calling convention correctly, or a different hook point.
