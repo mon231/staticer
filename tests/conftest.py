@@ -70,16 +70,24 @@ def c_compiler():
 def _gnu_compiler_for_bits(bits: int) -> str:
     """A gcc/clang binary that actually targets the requested bitness.
 
-    A plain 'gcc' on PATH is frequently a single-target MinGW build with no
-    -m32/-m64 multilib support, so prefer the architecture-prefixed binary
-    name when one is on PATH, and fall back to the generic name plus
-    -m32/-m64 (works for toolchains that do support multilib, e.g. many
-    Linux distro gccs targeting x86).
+    On Windows (the cl.exe-less fallback for the PE/mingw path), a plain
+    'gcc' on PATH is frequently a single-target MinGW build with no
+    -m32/-m64 multilib support, so prefer the architecture-prefixed
+    mingw-w64 binary name when one is on PATH there.
+
+    Elsewhere (native ELF target), *never* prefer that prefixed name even
+    if it happens to be on PATH (e.g. a dev box with mingw-w64 installed
+    for cross-building Windows binaries) -- "x86_64-w64-mingw32-gcc" is a
+    Windows (PE) cross-compiler, not a Linux-targeting one, and would
+    silently produce a `foo.exe` PE binary instead of the requested ELF
+    one. Just use the generic name plus -m32/-m64 (works for toolchains
+    that support multilib, e.g. most Linux distro gccs targeting x86).
     """
-    prefixed = "x86_64-w64-mingw32-gcc" if bits == 64 else "i686-w64-mingw32-gcc"
-    exe = shutil.which(prefixed)
-    if exe:
-        return exe
+    if platform.system() == "Windows":
+        prefixed = "x86_64-w64-mingw32-gcc" if bits == 64 else "i686-w64-mingw32-gcc"
+        exe = shutil.which(prefixed)
+        if exe:
+            return exe
     exe = shutil.which("gcc") or shutil.which("clang")
     if exe:
         return exe
