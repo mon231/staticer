@@ -1,13 +1,15 @@
 """ELF (Linux) dependency embedding.
 
 Implements the reloc-bearing ("PIC path") case: a dependency .so is
-appended into the host ELF executable as a new PT_LOAD segment, its own
-relocations are applied against the new addresses, the host's references
-to it (GOT/PLT slots) are patched to the embedded addresses, and its
-DT_NEEDED entry is neutralized. Non-PIC/no-relocation-data handling,
-unwind-metadata preservation, and the real generated entrypoint stub are
-later tasks; see ``ElfEmbedder.embed()``'s docstring for exactly what's
-simplified here.
+appended as an in-place extension of the host ELF executable's own
+highest-vaddr PT_LOAD segment (deliberately *not* a new PT_LOAD segment of
+its own -- see ``ElfEmbedder.embed()``'s docstring for why that breaks
+AT_PHDR), its own relocations are applied against the new addresses, the
+host's references to it (GOT/PLT slots) are patched to the embedded
+addresses, and its DT_NEEDED entry is neutralized. Non-PIC/no-relocation-
+data handling, unwind-metadata preservation, and the real generated
+entrypoint stub are later tasks; see ``ElfEmbedder.embed()``'s docstring
+for exactly what's simplified here.
 
 ``pyelftools`` is read-only, so every byte this module *writes* is built
 by hand from the fixed, standardized ELF32/ELF64 struct layouts (ELF
@@ -34,7 +36,6 @@ from .common.depgraph import build_dependency_graph, embed_order
 PT_LOAD = 1
 PF_X, PF_W, PF_R = 1, 2, 4
 
-DT_NEEDED = 1
 DT_DEBUG = 21  # harmless/ignored by every runtime linker; see _remove_needed
 
 # Relocation type numbers below happen to share the same values on
@@ -94,11 +95,12 @@ def _pack_phdr(is64: bool, p_type: int, p_flags: int, p_offset: int, p_vaddr: in
                         p_filesz, p_memsz, p_flags, p_align)
 
 
-# ELF header field (offset, size) for the handful of fields embed() needs
-# to patch, per the fixed Elf32_Ehdr/Elf64_Ehdr layout (both start with the
-# same 16-byte e_ident).
-_EHDR_FIELDS_64 = {"e_entry": (24, 8), "e_phoff": (32, 8), "e_phnum": (56, 2)}
-_EHDR_FIELDS_32 = {"e_entry": (24, 4), "e_phoff": (28, 4), "e_phnum": (44, 2)}
+# ELF header field (offset, size) for the one field embed() ever patches
+# (e_entry -- e_phoff/e_phnum are deliberately never touched; see the
+# large comment on extending `ext` in place, in embed()), per the fixed
+# Elf32_Ehdr/Elf64_Ehdr layout (both start with the same 16-byte e_ident).
+_EHDR_FIELDS_64 = {"e_entry": (24, 8)}
+_EHDR_FIELDS_32 = {"e_entry": (24, 4)}
 
 
 def _set_ehdr_field(raw: bytearray, is64: bool, field: str, value: int) -> None:
@@ -150,17 +152,25 @@ def _write_int(buf: bytearray, offset: int, size: int, value: int) -> None:
 
 def _pack_relative_entries(entries: List[Tuple[int, int]], is64: bool, is_rela: bool) -> bytes:
     """Pack (vaddr, value) pairs as new R_*_RELATIVE REL/RELA entries
-    (symbol index 0, so r_info reduces to just the type)."""
+    (symbol index 0, so r_info reduces to just the type).
+
+    `value` is packed as an *unsigned* bit pattern (struct format 'Q'/'I',
+    not 'q'/'i'): the ELF ABI only cares about the addend's raw bits, and
+    `value` is already masked into unsigned range by every caller (see
+    `new_reloc_entries.append(...)` call sites) -- a signed format would
+    raise OverflowError for any legitimate 32-bit address >= 2**31 (common
+    for e.g. mmap-assigned bases), even though the bit pattern itself is
+    perfectly valid."""
     out = bytearray()
     for vaddr, value in entries:
         if is64:
             if is_rela:
-                out += struct.pack("<QQq", vaddr, R_RELATIVE, value)
+                out += struct.pack("<QQQ", vaddr, R_RELATIVE, value & 0xFFFFFFFFFFFFFFFF)
             else:
                 out += struct.pack("<QQ", vaddr, R_RELATIVE)
         else:
             if is_rela:
-                out += struct.pack("<IIi", vaddr, R_RELATIVE, value)
+                out += struct.pack("<III", vaddr, R_RELATIVE, value & 0xFFFFFFFF)
             else:
                 out += struct.pack("<II", vaddr, R_RELATIVE)
     return bytes(out)
@@ -179,10 +189,20 @@ def _pack_relative_entries(entries: List[Tuple[int, int]], is64: bool, is_rela: 
 # DT_INIT_ARRAY function pointers, normally called by the dynamic linker's
 # _dl_init when the object is loaded. Removing the dependency from the
 # host's DT_NEEDED list means ld.so will never call them for us, so the
-# stub calls them directly, with no arguments -- compiler-generated
-# init_array entries (global constructors) are effectively always
-# argument-less in practice, which is the same kind of simplification
-# PE's docstring documents for DllMain's reason-code argument.
+# stub calls them directly.
+#
+# NOTE -- this is a real simplification, not a harmless one: glibc's own
+# _dl_init calls each init_array entry as init_func(argc, argv, envp) by
+# convention (see glibc's elf/dl-init.c), not with no arguments. The stub
+# below passes nothing. This happens not to matter *yet* because no
+# fixture in this task's test suite has any constructor at all (lib.c has
+# none, so dep_init_calls is always empty and this code path never runs),
+# but it's a real gap Task 8 needs to close -- either by wiring
+# argc/argv/envp through from the host's own entry (they're sitting on
+# the stack at the point this stub runs, before _start's prologue
+# consumes them) or by confirming real init_array consumers never read
+# their arguments and documenting that as an intentional, checked
+# decision rather than an unexamined one.
 #
 # Each call/ret pair is self-balancing on the stack (the callee's own
 # `ret` restores %rsp exactly), so -- unlike PE, which explicitly saves
@@ -283,11 +303,12 @@ class ElfEmbedder:
             place isn't generally safe -- same reasoning as pe_embedder's
             import-directory rebuild); the original entries are preserved
             byte-for-byte as that new table's prefix.
-          - The whole new PT_LOAD segment (dependency blobs + stub +
-            combined relocation table + the relocated program header
-            table itself) is marked RWX, mirroring pe_embedder's blanket
-            `_SCN_CODE_RWX` section characteristics -- a real W^X split is
-            out of scope for this placeholder.
+          - The host's extended PT_LOAD segment (dependency blobs + stub +
+            combined relocation table, all appended as a single in-place
+            extension of it -- see below) has RWX ORed into its existing
+            flags, mirroring pe_embedder's blanket `_SCN_CODE_RWX` section
+            characteristics -- a real W^X split is out of scope for this
+            placeholder.
           - Step 5's stub (see the module-level comment above the x64/x86
             builders) is a flat, unconditional call sequence, one call per
             init_array/DT_INIT entry across all embedded nodes, then a
@@ -354,8 +375,28 @@ class ElfEmbedder:
         dep_init_calls: List[int] = []  # absolute (host-space) VAs to call from the stub
         combined_exports: Dict[str, Tuple[int, int]] = {}  # export name -> (X, offset-within-dep)
 
-        max_end = max(seg["p_vaddr"] + seg["p_memsz"] for seg in host_load_segments)
-        next_vaddr = _align_up(max_end, _PAGE)
+        # Every newly-built blob/stub/reloc-table is appended as an
+        # *extension* of the host's own highest-vaddr PT_LOAD segment,
+        # rather than as a new PT_LOAD segment of its own -- see the large
+        # comment further down, right before this same `ext`/`ext_idx` pair
+        # is used to actually grow it, for why a brand new segment (with a
+        # freshly chosen vaddr/offset pair, generally skewed differently
+        # from the host's first PT_LOAD segment) breaks AT_PHDR.
+        all_host_segments = [elf.get_segment(i) for i in range(elf.num_segments())]
+        host_load_indices = [i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_LOAD"]
+        ext_idx = max(host_load_indices, key=lambda i: all_host_segments[i]["p_vaddr"] + all_host_segments[i]["p_memsz"])
+        ext = all_host_segments[ext_idx]
+        max_file_end = max(s["p_offset"] + s["p_filesz"] for s in all_host_segments)
+        if ext["p_offset"] + ext["p_filesz"] != max_file_end:
+            raise ValueError(
+                f"'{self.input_path}': its highest-vaddr PT_LOAD segment isn't also "
+                "the last one in the file; extending it in place isn't supported"
+            )
+        ext_align = ext["p_align"] if ext["p_align"] >= _PAGE else _PAGE
+        # The skew this segment's new (extended) content must keep -- any
+        # vaddr V within it is at file offset V - ext_skew, and vice versa.
+        ext_skew = ext["p_vaddr"] - ext["p_offset"]
+        next_vaddr = _align_up(ext["p_vaddr"] + ext["p_memsz"], ext_align)
 
         # -- per-dependency: copy, relocate, and remove its DT_NEEDED -----
         for node in order:
@@ -530,11 +571,45 @@ class ElfEmbedder:
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_tag_name, reloc_table_vaddr)
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_sz_tag_name, len(combined_bytes))
 
-        # -- lay everything out at the end of the file, in one new RWX
-        #    PT_LOAD segment that also covers the relocated program
-        #    header table itself (so AT_PHDR stays inside mapped memory) --
+        # -- lay everything out as an in-place extension of the host's own
+        #    `ext` PT_LOAD segment (see where ext/ext_idx/ext_skew/ext_align
+        #    were derived, above the per-dependency loop) --
+        #
+        # The straightforward-looking alternative -- append everything at
+        # the end of the file in a brand new PT_LOAD segment of its own --
+        # is wrong: the Linux kernel computes AT_PHDR as
+        # `load_bias + e_phoff`, where `load_bias` is derived once, from
+        # matching the *first* PT_LOAD segment's own p_vaddr/p_offset skew
+        # against where the kernel actually mapped it -- it does not
+        # re-derive a skew per segment, and it never re-translates e_phoff
+        # through address_offsets()-style segment lookup. That formula is
+        # only correct for a given e_phoff when the segment that e_phoff
+        # physically falls inside shares the *first* segment's skew. A
+        # brand new segment, placed at a freshly chosen vaddr/offset pair
+        # with no particular reason to share that skew, breaks this the
+        # moment e_phoff is moved into it: AT_PHDR then lands on
+        # `original_skew + new_e_phoff`, a bogus address still inside the
+        # *original* image's range, not the new segment at all. glibc's
+        # `_dl_aux_init`/`__libc_start_main` walk that (garbage) phdr array
+        # looking for PT_TLS/PT_GNU_RELRO/PT_GNU_STACK for the main
+        # executable -- silently skipping TLS/RELRO/stack-flag setup, or
+        # segfaulting outright if the bogus address isn't even mapped.
+        #
+        # Extending an *existing* segment in place sidesteps this
+        # completely: e_phoff/e_phnum (and every other segment's entry)
+        # stay byte-for-byte untouched, so AT_PHDR's computation doesn't
+        # change at all. Growing `ext`'s p_filesz/p_memsz all the way from
+        # its own original p_offset up to the new end of file is always
+        # safe content-wise (anything in that span that isn't one of our
+        # new blobs is either `ext`'s own original content or inert
+        # trailing bytes -- e.g. a stale section header table -- that
+        # nothing else maps), *as long as* `ext` is confirmed above to
+        # also be the last segment's content in the file, so growing its
+        # filesz can't stomp on some other segment's bytes.
         data_start_vaddr = new_sections[0][0]
-        data_start_offset = _align_up(len(raw), _PAGE)
+        data_start_offset = data_start_vaddr - ext_skew
+        if data_start_offset < len(raw):
+            raise ValueError("internal error: new ELF content would overlap existing file content")
         raw.extend(b"\x00" * (data_start_offset - len(raw)))
 
         cursor_vaddr = data_start_vaddr
@@ -546,25 +621,14 @@ class ElfEmbedder:
             raw.extend(data)
             cursor_vaddr = vaddr + len(data)
 
-        old_phdr_off = elf["e_phoff"]
-        old_phdr_count = elf["e_phnum"]
-        old_phdr_entsize = elf["e_phentsize"]
-        old_phdrs_bytes = bytes(raw[old_phdr_off:old_phdr_off + old_phdr_count * old_phdr_entsize])
-
-        new_phdr_table_offset = _align_up(len(raw), ptr_size)
-        raw.extend(b"\x00" * (new_phdr_table_offset - len(raw)))
-        new_phdr_table_size = (old_phdr_count + 1) * old_phdr_entsize
-
-        new_segment_filesz = (new_phdr_table_offset + new_phdr_table_size) - data_start_offset
-        new_segment = _pack_phdr(
-            is64, PT_LOAD, PF_R | PF_W | PF_X, data_start_offset, data_start_vaddr,
-            data_start_vaddr, new_segment_filesz, new_segment_filesz, _PAGE,
+        new_filesz = len(raw) - ext["p_offset"]
+        extended_entry = _pack_phdr(
+            is64, PT_LOAD, ext["p_flags"] | PF_R | PF_W | PF_X, ext["p_offset"], ext["p_vaddr"],
+            ext["p_paddr"], new_filesz, new_filesz, ext["p_align"],
         )
-        raw.extend(old_phdrs_bytes)
-        raw.extend(new_segment)
+        entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
+        raw[entry_off:entry_off + len(extended_entry)] = extended_entry
 
-        _set_ehdr_field(raw, is64, "e_phoff", new_phdr_table_offset)
-        _set_ehdr_field(raw, is64, "e_phnum", old_phdr_count + 1)
         if stub_vaddr is not None:
             _set_ehdr_field(raw, is64, "e_entry", stub_vaddr)
 
