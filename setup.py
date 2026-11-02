@@ -17,7 +17,7 @@ def main():
         url = "https://github.com/mon231/staticer/",
         long_description_content_type='text/markdown',
         entry_points = {'console_scripts': ['staticer=staticer.staticer:main']},
-        install_requires = ['lief', 'firstclass', 'pefile', 'pyelftools']
+        install_requires = ['firstclass', 'pefile', 'pyelftools']
     )
 
 

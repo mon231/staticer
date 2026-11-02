@@ -16,6 +16,11 @@ Simply run:
 Make sure to have python scripts folder in your path, <br/>
 And use the correct version of pip for python3.
 
+## Usage
+```
+staticer <input> -o <output> [--exclude NAME[,NAME...]] [--lib-dir PATH]
+```
+
 ## Goals & Parctice
 We want to get en executable-file and embed its dependencies recursively. <br />
 We need to patch the executable-file's import-table and prevent it from loading the dynamic libraries. <br />
@@ -28,6 +33,6 @@ In order to intercept explicit dynamic-loading (from the executed code itself), 
 We'll have to hook `dlopen`+`dlsym` / `LoadLibraryW`+`GetProcAddress` and make them return addresses to embedded resources, <br />
 Or make them call the original functions, if they try to access dynamic-libraries that weren't embedded.
 
-**NOTE** we currently do NOT support dependencies that uses OS-based / C++ `exception`s
+**NOTE** OS-based / C++ `exception` unwinding works across embedded-dependency boundaries (unwind metadata is preserved); a self-contained embedded module that both throws and catches internally may still hit compiler-specific personality-routine details beyond the documented ABI
 **NOTE** we currently do NOT support invoking `elf-destructor` / `DllMain` process-detach
 **NOTE** we might never support `DllMain` invoking for thread attach/detach reasons
