@@ -58,6 +58,38 @@ def test_main_reports_clean_error_on_garbage_input(tmp_path, capsys):
     assert "unrecognized" in capsys.readouterr().err.lower()
 
 
+def test_main_reports_clean_error_on_missing_input(tmp_path, capsys):
+    missing = tmp_path / "does-not-exist.exe"
+    code = main([str(missing), "-o", str(tmp_path / "out.exe")])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert err.strip() and "Traceback" not in err
+
+
+def test_main_reports_clean_error_on_truncated_pe(tmp_path, capsys):
+    p = tmp_path / "x.exe"
+    # A plausible MZ header with no valid PE structure behind it: enough
+    # to pass sniff_format's 2-byte magic check, but pefile.PE() should
+    # raise PEFormatError on the truncated/garbage body.
+    p.write_bytes(b"MZ" + b"\x00" * 10)
+    code = main([str(p), "-o", str(tmp_path / "out.exe")])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert err.strip() and "Traceback" not in err
+
+
+def test_main_reports_clean_error_on_truncated_elf(tmp_path, capsys):
+    p = tmp_path / "x"
+    # A plausible ELF magic with no valid header/section data behind it:
+    # enough to pass sniff_format's 4-byte magic check, but pyelftools'
+    # ELFFile() should raise ELFError on the truncated body.
+    p.write_bytes(b"\x7fELF" + b"\x00" * 10)
+    code = main([str(p), "-o", str(tmp_path / "out")])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert err.strip() and "Traceback" not in err
+
+
 def test_main_overwrites_existing_output(tmp_path, monkeypatch):
     out = tmp_path / "out.exe"
     out.write_bytes(b"old")

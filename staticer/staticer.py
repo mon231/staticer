@@ -1,7 +1,11 @@
+import struct
 import sys
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import List, Literal, Optional
+
+import pefile
+from elftools.common.exceptions import ELFError
 
 from .common.depgraph import CyclicDependencyError
 from .elf_embedder import ElfEmbedder
@@ -45,8 +49,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             embedder = ElfEmbedder(args.input, args.output, args.exclude, args.lib_dir)
 
         embedder.embed()
-    except (ValueError, CyclicDependencyError) as e:
-        print(str(e), file=sys.stderr)
+    except (ValueError, CyclicDependencyError, pefile.PEFormatError, ELFError, OSError, struct.error) as e:
+        print(f'error: {e}', file=sys.stderr)
         return 1
 
     return 0
