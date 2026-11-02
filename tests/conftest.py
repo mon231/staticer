@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import pefile
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -103,9 +104,26 @@ def _run(cmd: List[str]) -> None:
         )
 
 
+def _strip_pe_relocations(path: Path) -> None:
+    """Zero out a PE's Base Relocation data directory in place, producing a
+    dependency that carries no relocation data at all -- simulates a
+    fixed-base/non-PIC build without needing to find a compiler/linker flag
+    combination that reliably omits relocations on every toolchain."""
+    pe = pefile.PE(str(path))
+    reloc_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]]
+    va_off = reloc_dir.get_field_absolute_offset("VirtualAddress")
+    sz_off = reloc_dir.get_field_absolute_offset("Size")
+    pe.close()  # release the file handle before rewriting it (Windows locking)
+
+    data = bytearray(path.read_bytes())
+    data[va_off:va_off + 4] = b"\x00\x00\x00\x00"
+    data[sz_off:sz_off + 4] = b"\x00\x00\x00\x00"
+    path.write_bytes(bytes(data))
+
+
 def build_shared_lib(
     tmp_path: Path, source: Path, name: str, *, pic: bool, bits: int,
-    extra_flags: Optional[List[str]] = None,
+    extra_flags: Optional[List[str]] = None, strip_relocs: bool = False,
 ) -> Path:
     kind, cl_path = _find_compiler()
     out = tmp_path / name
@@ -114,6 +132,8 @@ def build_shared_lib(
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
         _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"] + list(extra_flags or []))
+        if strip_relocs:
+            _strip_pe_relocations(out)
         return out
 
     compiler = _gnu_compiler_for_bits(bits)
@@ -126,10 +146,28 @@ def build_shared_lib(
         cmd.append("-Wl,--export-all-symbols")
         if not pic:
             cmd.append("-Wl,--disable-dynamicbase")
+            # --disable-dynamicbase only clears the runtime ASLR flag; the
+            # linker still picks a high-entropy *link-time* preferred base
+            # unless told otherwise, which for a real fixed-base/non-PIC
+            # DLL would defeat the purpose (and, for our purposes, tends to
+            # land far enough from the host's own base to overflow a
+            # 32-bit RVA). Pin it to a conventional default instead -- one
+            # that's comfortably above a typical 64-bit EXE's own default
+            # base (0x140000000) so the two don't collide by coincidence.
+            image_base = 0x180000000 if bits == 64 else 0x10000000
+            cmd.append(f"-Wl,--image-base=0x{image_base:x}")
     # Elsewhere (Linux), this produces a native ELF .so: default symbol
     # visibility already exports lib.c's function, so no extra flag is
     # needed there.
     _run(cmd)
+    if strip_relocs:
+        if platform.system() == "Windows":
+            _strip_pe_relocations(out)
+        else:
+            # ELF-side relocation stripping is a different task's concern
+            # (see the ELF embedder's own no-reloc-data handling); nothing
+            # here does it yet.
+            raise NotImplementedError("strip_relocs isn't implemented for ELF output yet")
     return out
 
 
