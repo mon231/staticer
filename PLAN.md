@@ -14,11 +14,11 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 | 4 | ELF embedder — PIC/reloc-bearing path | done — review closed, 3 fix rounds; verified passing for real on Linux (WSL) |
 | 5 | PE non-PIC / no-reloc base-reservation | done — 1 fix round (filler-range conflict gap) |
 | 6 | ELF non-PIC / no-reloc base-reservation | done — 2 fix rounds (reservation-growth gap, doc) |
-| 7 | PE unwind preservation + Windows stub | dispatching next |
-| 8 | ELF unwind preservation + Linux stub | not started |
+| 7 | PE unwind preservation + Windows stub | done — approved with flagged risk |
+| 8 | ELF unwind preservation + Linux stub | in progress (live, uncommitted WIP in this worktree) |
 | 9 | Scope/overlap end-to-end tests | not started |
 | 10 | Real-world system binaries (cmd.exe/notepad, bash/ls) | not started |
-| 11 | Packaging (drop lief, pefile+pyelftools+firstclass, README) | not started |
+| 11 | Packaging (drop lief, pefile+pyelftools+firstclass, README) | done — approved, 1 low non-blocking note |
 | 12 | CI (GitHub Actions, Windows+Linux matrix) | done |
 
 ## Done so far
