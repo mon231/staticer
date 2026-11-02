@@ -1194,6 +1194,13 @@ class ElfEmbedder:
                     X, offset_in_dep, dep_size = combined_exports[sym.name]
                     size = sym["st_size"] or dep_size
                     src = dep_blob_by_base[X][offset_in_dep:offset_in_dep + size]
+                    if len(src) != size:
+                        raise ValueError(
+                            f"COPY relocation for '{sym.name}' needs {size} bytes "
+                            f"at offset {offset_in_dep} in its defining dependency, "
+                            f"but only {len(src)} are available -- symbol size/offset "
+                            f"mismatch, refusing a silent partial copy"
+                        )
                     target_vaddr = reloc["r_offset"]
                     if not (ext["p_vaddr"] <= target_vaddr < ext["p_vaddr"] + ext["p_memsz"]):
                         raise ValueError(
