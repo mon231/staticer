@@ -192,19 +192,35 @@ def build_linux_stub(
     # stack-alignment guarantee: %rsp/%esp is 16-byte aligned (System V
     # ABI, "Initial Stack and Register State" -- the same convention
     # crt1.o's own `_start` relies on, reading argc/argv/envp directly
-    # off this exact, unmodified pointer). That is NOT the same as the
-    # ordinary *call-site* convention every `call` instruction assumes
-    # (%rsp 16-byte aligned only *after* the implicit return-address
-    # push, i.e. %rsp == 8 (mod 16) immediately *before* the `call`).
-    # Emitting a bare `call` straight off the kernel-provided, 16-aligned
-    # entry pointer -- as an earlier version of this function did --
-    # therefore hands every callee a stack mis-aligned by exactly one
-    # pointer width, with no symptom until something deep in that
-    # callee's own call graph (observed: well past frame_dummy/a real
-    # user constructor, inside glibc's own exit-handling machinery)
-    # finally executes an alignment-sensitive SSE/AVX instruction against
-    # it and faults -- reproduced as a real SIGSEGV, on real Linux (WSL),
-    # for both 32- and 64-bit, before this fix; confirmed fixed by it.
+    # off this exact, unmodified pointer). Luckily that happens to BE a
+    # valid *call-site* alignment too -- the ABI requires %rsp/%esp to be
+    # a clean multiple of 16 immediately *before* a `call` instruction
+    # (so that, after the implicit return-address push, the callee's own
+    # raw incoming %rsp/%esp sits at exactly 16n-8/16n-4, the fixed,
+    # known-odd-by-convention baseline every compiler's own prologue
+    # assumes when it goes on to establish 16-byte-aligned *local* slots
+    # for its own SSE/AVX spills -- this is also exactly what glibc's own
+    # `_start` does: a bare `and $-16, %rsp` immediately before `call
+    # __libc_start_main`, nothing more). Both this stub and its own first
+    # version got this backwards at different times: emitting a bare
+    # `call` straight off the kernel-provided, already-16-aligned entry
+    # pointer, with NO realignment at all, hands every callee a stack
+    # mis-aligned by one pointer width -- and a *later* version of this
+    # function overcorrected, adding an extra `sub $8`/`sub $4` after the
+    # `and`, re-introducing the exact same one-pointer-width
+    # misalignment it was meant to fix (worse, on x86-64 specifically,
+    # since the kernel-provided entry %rsp was *already* a valid pre-call
+    # value there with no adjustment needed at all -- that `sub` was a
+    # straight regression, not just an incomplete fix). Neither mistake
+    # has any symptom until something deep in the affected call's own
+    # call graph (observed: well past frame_dummy/a real user
+    # constructor, inside glibc's own exit-handling machinery) finally
+    # executes an alignment-sensitive SSE/AVX instruction against the
+    # mis-aligned stack and faults -- each reproduced as a real SIGSEGV,
+    # on real Linux (WSL), for both 32- and 64-bit; the version below is
+    # the one actually confirmed correct by running
+    # `tests/fixtures/ctor_sse_align.c`'s `movaps`-using constructor
+    # (see `tests/linux/test_elf_unwind.py`).
     #
     # Save the untouched, kernel-provided pointer in a callee-saved
     # register (unused by anything else in this stub, and ABI-guaranteed
@@ -244,13 +260,11 @@ def build_linux_stub(
     if is64:
         out.extend(b"\x49\x89\xE7")  # mov r15, rsp  (save; r15 is callee-saved)
         out.extend(b"\x48\x89\xD3")  # mov rbx, rdx  (save rtld_fini; rbx is callee-saved)
-        out.extend(b"\x48\x83\xE4\xF0")  # and rsp, -16
-        out.extend(b"\x48\x83\xEC\x08")  # sub rsp, 8  (-> rsp == 8 (mod 16), correct pre-call)
+        out.extend(b"\x48\x83\xE4\xF0")  # and rsp, -16  (-> rsp == 0 (mod 16), correct pre-call)
     else:
         out.extend(b"\x89\xE7")  # mov edi, esp  (save; edi is callee-saved under cdecl)
         out.extend(b"\x89\xD6")  # mov esi, edx  (save rtld_fini; esi is callee-saved)
-        out.extend(b"\x83\xE4\xF0")  # and esp, -16
-        out.extend(b"\x83\xEC\x04")  # sub esp, 4  (-> esp == 12 (mod 16), correct pre-call)
+        out.extend(b"\x83\xE4\xF0")  # and esp, -16  (-> esp == 0 (mod 16), correct pre-call)
 
     for addr in init_calls:
         emit_call(addr)
