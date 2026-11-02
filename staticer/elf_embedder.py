@@ -1,15 +1,19 @@
 """ELF (Linux) dependency embedding.
 
-Implements the reloc-bearing ("PIC path") case: a dependency .so is
+Implements the reloc-bearing ("PIC path") case -- a dependency .so is
 appended as an in-place extension of the host ELF executable's own
 highest-vaddr PT_LOAD segment (deliberately *not* a new PT_LOAD segment of
 its own -- see ``ElfEmbedder.embed()``'s docstring for why that breaks
 AT_PHDR), its own relocations are applied against the new addresses, the
 host's references to it (GOT/PLT slots) are patched to the embedded
-addresses, and its DT_NEEDED entry is neutralized. Non-PIC/no-relocation-
-data handling, unwind-metadata preservation, and the real generated
-entrypoint stub are later tasks; see ``ElfEmbedder.embed()``'s docstring
-for exactly what's simplified here.
+addresses, and its DT_NEEDED entry is neutralized -- and the fixed-base
+("non-PIC path") case, where a dependency's own ELF header says it can
+only ever be loaded at one specific address and gets its own, separate
+PT_LOAD segment reserved at exactly that address instead (see the base-
+address-reservation comment inside ``embed()``, by ``fixed_base_segments``,
+for the full mechanism and its one real limitation). Unwind-metadata
+preservation and the real generated entrypoint stub are later tasks; see
+``ElfEmbedder.embed()``'s docstring for exactly what's simplified here.
 
 ``pyelftools`` is read-only, so every byte this module *writes* is built
 by hand from the fixed, standardized ELF32/ELF64 struct layouts (ELF
@@ -34,6 +38,7 @@ from .common.depgraph import build_dependency_graph, embed_order
 # for reading but useless for re-packing bytes we write ourselves).
 
 PT_LOAD = 1
+PT_PHDR = 6
 PF_X, PF_W, PF_R = 1, 2, 4
 
 DT_DEBUG = 21  # harmless/ignored by every runtime linker; see _remove_needed
@@ -255,15 +260,17 @@ class ElfEmbedder:
             section -- the brief for this task doesn't ask for it, and the
             fixtures this task is scoped to (single-function .so's with no
             further library needs) never exercise it.
-          - Unlike pe_embedder, there's deliberately no "dependency has no
-            relocation data -> fail loudly" guard here: in PE, a DLL with
-            no base-relocation directory at all reliably means a fixed-
-            base/non-PIC build. In ELF, a *simple* PIC .so with no absolute
-            self-pointers (e.g. this task's own `lib.c` fixture) just as
-            reliably produces an *empty* .rela.dyn -- that's the normal,
-            fully-position-independent case, not a warning sign. The ELF-
-            specific non-PIC signal (DT_TEXTREL / relocations into an
-            executable segment) is Task 6's concern, not this one's.
+          - Unlike pe_embedder, this doesn't treat "the dependency has no
+            relocation data at all" as the fixed-base/non-PIC signal: in
+            PE, a DLL with no base-relocation directory at all reliably
+            means a fixed-base build. In ELF, a *simple* PIC .so with no
+            absolute self-pointers (e.g. this task's own `lib.c` fixture)
+            just as reliably produces an *empty* .rela.dyn -- that's the
+            normal, fully-position-independent case, not a warning sign.
+            The actual fixed-base signal this method keys off instead is
+            the dependency's own `e_type` (see the base-address-reservation
+            comment further down, by `fixed_base_segments`, for the full
+            mechanism and its one real limitation).
           - step 3's new-relocation-entries go into a brand new, bigger
             REL(A) table at a new location (growing the existing one in
             place isn't generally safe -- same reasoning as pe_embedder's
@@ -334,6 +341,63 @@ class ElfEmbedder:
         new_reloc_entries: List[Tuple[int, int]] = []  # (host vaddr, value) -> new R_*_RELATIVE entries
         combined_exports: Dict[str, Tuple[int, int]] = {}  # export name -> (X, offset-within-dep)
 
+        # -- base-address reservation for fixed-base (non-PIC) dependencies --
+        # A dependency whose own ELF header says ET_EXEC (not ET_DYN) was
+        # built assuming it will *always* load at exactly its own PT_LOAD
+        # segments' own p_vaddr -- unlike a PIC .so (ET_DYN), which is
+        # designed to tolerate loading at any delta and records every
+        # absolute self-pointer that needs fixing up for that delta in its
+        # own .rela.dyn/.rel.dyn, a fixed-base dependency's code may contain
+        # absolute address references baked directly into its instructions
+        # with *no* corresponding relocation entry at all (real-world
+        # example, confirmed against this project's own toolchain: an
+        # internal-data access compiled with `-fno-pic` for a plain ET_EXEC
+        # target produces a bare `mov 0x<absolute addr>, %eax`-style
+        # instruction with zero relocation tracking, whereas the *same*
+        # access compiled into a `-shared` object -- PIC or not -- always
+        # gets at least an R_*_RELATIVE entry, because any `.so` must
+        # support loading away from its preferred base, and the linker
+        # arranges for that regardless of the `-f{,no-}pic` codegen flag).
+        # This is the ELF analogue of why a PE DLL with no base-relocation
+        # directory can only be loaded at exactly its declared ImageBase:
+        # there's no delta the loader could apply to such a dependency's
+        # untracked absolute references and have them stay correct, so the
+        # only place such a dependency can go is its own already-fixed
+        # address.
+        #
+        # So, for these nodes, `X` below is forced to the dependency's own
+        # `dep_base` (delta = X - dep_base = 0, a no-op for whatever
+        # relocations it *does* still have) rather than freshly allocated
+        # from `next_vaddr`, and that fixed range has to be reserved up
+        # front against both the host's own existing PT_LOAD ranges and
+        # every other such dependency's own reservation -- mirroring
+        # pe_embedder's same-named mechanism for a reloc-table-less DLL.
+        # Because that fixed address generally has nothing to do with where
+        # the host's own content ends, it can't just extend `ext` like
+        # everything else in this method does (see `fixed_base_segments`'s
+        # use, further down, for the brand-new-PT_LOAD-segment mechanism
+        # that needs instead, and why growing the program header array to
+        # add it is still AT_PHDR-safe).
+        #
+        # Soundness note (also true of pe_embedder's mechanism, and not
+        # solved here -- doesn't seem to be solvable at all without a way
+        # to enumerate a dependency's *untracked* absolute references,
+        # which by construction there's no record of): this only stays
+        # correct if the final combined image itself never gets relocated
+        # as a whole at load time (e.g. ASLR). If the host is non-PIE
+        # (ET_EXEC itself -- the realistic pairing for a genuinely
+        # fixed-base dependency, and what this task's own tests use), the
+        # kernel always maps every PT_LOAD segment at exactly its file
+        # p_vaddr and this is completely sound; if the host is PIE, the
+        # whole image (including whatever's reserved here) moves together
+        # under ASLR and a fixed-base dependency's untracked references
+        # silently go stale by the same amount the rest of the image moved.
+        fixed_base_segments: List[Tuple[int, bytes]] = []  # (X, blob) -- each gets its own new PT_LOAD entry
+        reserved_ranges: List[Tuple[int, int, str]] = [
+            (seg["p_vaddr"], seg["p_vaddr"] + seg["p_memsz"], f"the host image ('{self.input_path}')")
+            for seg in host_load_segments
+        ]
+
         # Every newly-built blob/reloc-table is appended as an
         # *extension* of the host's own highest-vaddr PT_LOAD segment,
         # rather than as a new PT_LOAD segment of its own -- see the large
@@ -398,7 +462,19 @@ class ElfEmbedder:
                     start = seg["p_vaddr"] - dep_base
                     blob[start:start + len(data)] = data
 
-                X = next_vaddr
+                is_fixed_base = dep["e_type"] == "ET_EXEC"
+                if is_fixed_base:
+                    X = dep_base
+                    lo, hi = X, X + blob_size
+                    for r_lo, r_hi, label in reserved_ranges:
+                        if lo < r_hi and r_lo < hi:
+                            raise ValueError(
+                                f"base address conflict at {hex(max(lo, r_lo))} between "
+                                f"dependency '{node.name}' (fixed base {hex(X)}) and {label}"
+                            )
+                    reserved_ranges.append((lo, hi, f"dependency '{node.name}' (fixed base {hex(X)})"))
+                else:
+                    X = next_vaddr
                 delta = X - dep_base
 
                 dep_dyn = _dynamic_segment(dep)
@@ -487,8 +563,11 @@ class ElfEmbedder:
                 if not _remove_needed(host_dyn, raw, ptr_size, node.name):
                     raise ValueError(f"expected DT_NEEDED entry for '{node.name}' not found in host")
 
-                new_sections.append((X, bytes(blob)))
-                next_vaddr = _align_up(X + blob_size, _PAGE)
+                if is_fixed_base:
+                    fixed_base_segments.append((X, bytes(blob)))
+                else:
+                    new_sections.append((X, bytes(blob)))
+                    next_vaddr = _align_up(X + blob_size, _PAGE)
 
         # -- patch the host's GOT/PLT references to embedded exports -----
         patch_specs = [(dyn_table_key, dyn_tag_name)]
@@ -537,6 +616,31 @@ class ElfEmbedder:
 
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_tag_name, reloc_table_vaddr)
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_sz_tag_name, len(combined_bytes))
+
+        # -- reserve room for a grown program header array, if any fixed-
+        #    base dependency needs its own new PT_LOAD entry (see the large
+        #    comment above, by `fixed_base_segments`, for why those can't
+        #    just extend `ext` like everything above this point does) --
+        #    placed as one more piece of `ext`'s own extension, same as the
+        #    relocation table just above, so it shares the extension's skew
+        #    and keeps AT_PHDR's computation (which assumes e_phoff always
+        #    falls inside a segment sharing the *first* PT_LOAD segment's
+        #    skew -- see the comment further down, by `data_start_vaddr`)
+        #    correct even though e_phoff is about to move. Its *content*
+        #    can't be filled in yet -- it needs to record `ext`'s own
+        #    final, grown p_filesz/p_memsz, which isn't known until after
+        #    this whole extension (including this array's own reserved
+        #    bytes) is actually laid out below -- so a same-sized
+        #    zero-filled placeholder goes here for now and gets overwritten
+        #    in place, once that size is known, right before this method
+        #    returns.
+        if fixed_base_segments:
+            old_phnum = elf.num_segments()
+            new_phnum = old_phnum + len(fixed_base_segments)
+            phdr_array_size = new_phnum * elf["e_phentsize"]
+            phdr_array_vaddr = next_vaddr
+            new_sections.append((phdr_array_vaddr, b"\x00" * phdr_array_size))
+            next_vaddr = _align_up(phdr_array_vaddr + phdr_array_size, _PAGE)
 
         # -- lay everything out as an in-place extension of the host's own
         #    `ext` PT_LOAD segment (see where ext/ext_idx/ext_skew/ext_align
@@ -593,8 +697,92 @@ class ElfEmbedder:
             is64, PT_LOAD, ext["p_flags"] | PF_R | PF_W | PF_X, ext["p_offset"], ext["p_vaddr"],
             ext["p_paddr"], new_filesz, new_filesz, ext["p_align"],
         )
-        entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
-        raw[entry_off:entry_off + len(extended_entry)] = extended_entry
+
+        if not fixed_base_segments:
+            entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
+            raw[entry_off:entry_off + len(extended_entry)] = extended_entry
+        else:
+            # Grow the program header array itself: copy the *original*
+            # array byte-for-byte (still untouched, at its original
+            # location -- only `ext`'s own entry within the copy gets
+            # updated), append one brand-new PT_LOAD entry per fixed-base
+            # dependency, and write the result into the placeholder
+            # reserved for it above (inside `ext`'s own just-finished
+            # extension, so it shares the first PT_LOAD segment's skew --
+            # see the comment by that placeholder for why that's what
+            # keeps AT_PHDR correct here). The *original* array's bytes are
+            # simply abandoned in place (dead, harmless bytes nothing reads
+            # anymore once e_phoff is repointed) -- the same
+            # leave-it-dead-in-place pattern _remove_needed already uses
+            # for a neutralized DT_NEEDED entry.
+            entsize = elf["e_phentsize"]
+            old_phnum = elf.num_segments()
+            old_array_bytes = bytes(raw[elf["e_phoff"]: elf["e_phoff"] + old_phnum * entsize])
+            new_array = bytearray(old_array_bytes)
+            new_array[ext_idx * entsize:(ext_idx + 1) * entsize] = extended_entry
+
+            placeholder_file_offset = phdr_array_vaddr - ext_skew
+
+            # The PT_PHDR entry (if any -- not every ELF file has one, but
+            # every ordinary executable does) is the *other* place the
+            # array's own location/size is recorded, independently of
+            # e_phoff/e_phnum, and it's just as important to keep correct:
+            # glibc's ld.so derives the main executable's load bias not
+            # from e_phoff but from `AT_PHDR - PT_PHDR.p_vaddr` (AT_PHDR
+            # being where the kernel *actually* put the array, which is
+            # correct automatically -- see the e_phoff/e_phnum comment
+            # below). Leaving PT_PHDR's own copy of the array's old
+            # location in place would make that subtraction produce a
+            # bogus nonzero "load bias" out of what should be a
+            # non-relocated (ET_EXEC) image, corrupting every other
+            # address ld.so derives from it -- confirmed by actually
+            # running the result on real Linux (WSL): it crashes inside
+            # ld.so itself, before any user code runs, with this entry
+            # stale, and runs correctly once it's updated here too.
+            phdr_idx = next((i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_PHDR"), None)
+            if phdr_idx is not None:
+                phdr_seg = all_host_segments[phdr_idx]
+                updated_phdr_entry = _pack_phdr(
+                    is64, PT_PHDR, phdr_seg["p_flags"], placeholder_file_offset, phdr_array_vaddr,
+                    phdr_array_vaddr, phdr_array_size, phdr_array_size, phdr_seg["p_align"],
+                )
+                new_array[phdr_idx * entsize:(phdr_idx + 1) * entsize] = updated_phdr_entry
+
+            # Each fixed-base dependency's own blob is appended past the
+            # very end of the file as it now stands (which already
+            # includes `ext`'s whole extension, placeholder and all) --
+            # unlike everything in `new_sections`, it doesn't need to be
+            # contiguous with `ext` at all (it gets its own PT_LOAD entry,
+            # with its own independent p_offset/p_vaddr pair), only
+            # page-aligned consistently with its own fixed vaddr, which an
+            # at-most-one-page padding gap is always enough to arrange
+            # (the ELF ABI only requires p_vaddr and p_offset to agree
+            # modulo p_align, not to be numerically equal).
+            for X, blob in fixed_base_segments:
+                offset = len(raw) + ((X - len(raw)) % _PAGE)
+                raw.extend(b"\x00" * (offset - len(raw)))
+                raw.extend(blob)
+                new_array += _pack_phdr(is64, PT_LOAD, PF_R | PF_W | PF_X, offset, X, X, len(blob), len(blob), _PAGE)
+
+            if len(new_array) != phdr_array_size:
+                raise ValueError("internal error: grown ELF program header array size mismatch")
+            raw[placeholder_file_offset:placeholder_file_offset + len(new_array)] = new_array
+
+            # e_phoff/e_phnum are fixed-size fields at a fixed byte offset
+            # in every ELF32/ELF64 header alike (this module writes every
+            # byte it touches from the ABI's own fixed, hand-verified
+            # struct layouts rather than through pyelftools, which is
+            # read-only -- see this module's own top-of-file docstring);
+            # e_phoff is ptr-sized (4 bytes for ELF32, 8 for ELF64) and
+            # immediately follows e_ident/e_type/e_machine/e_version/
+            # e_entry, while e_phnum is a fixed 2-byte field three
+            # ptr-sized fields (e_phoff/e_shoff) plus one 4-byte field
+            # (e_flags) and two 2-byte fields (e_ehsize/e_phentsize)
+            # further along.
+            e_phoff_off = 16 + 2 + 2 + 4 + ptr_size
+            e_phnum_off = e_phoff_off + ptr_size * 2 + 4 + 2 + 2
+            _write_int(raw, e_phoff_off, ptr_size, placeholder_file_offset)
+            _write_int(raw, e_phnum_off, 2, old_phnum + len(fixed_base_segments))
 
         # e_entry is deliberately never touched -- see embed()'s docstring.
 
