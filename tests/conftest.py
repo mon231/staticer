@@ -68,6 +68,22 @@ def c_compiler():
     return found
 
 
+def _gnu_cpp_compiler_for_bits(bits: int) -> str:
+    """g++/clang++ equivalent of ``_gnu_compiler_for_bits``, for fixtures
+    that need real C++ exception handling (``throw``/``catch``) -- a plain
+    C compiler can't compile those. Same Windows-mingw-prefix preference
+    and native-ELF-target caveat as the C path; see its docstring."""
+    if platform.system() == "Windows":
+        prefixed = "x86_64-w64-mingw32-g++" if bits == 64 else "i686-w64-mingw32-g++"
+        exe = shutil.which(prefixed)
+        if exe:
+            return exe
+    exe = shutil.which("g++") or shutil.which("clang++")
+    if exe:
+        return exe
+    raise RuntimeError(f"no usable GNU-style C++ compiler found for {bits}-bit")
+
+
 def _gnu_compiler_for_bits(bits: int) -> str:
     """A gcc/clang binary that actually targets the requested bitness.
 
@@ -123,7 +139,7 @@ def _strip_pe_relocations(path: Path) -> None:
 
 def build_shared_lib(
     tmp_path: Path, source: Path, name: str, *, pic: bool, bits: int,
-    extra_flags: Optional[List[str]] = None, strip_relocs: bool = False,
+    extra_flags: Optional[List[str]] = None, strip_relocs: bool = False, cpp: bool = False,
 ) -> Path:
     kind, cl_path = _find_compiler()
     out = tmp_path / name
@@ -131,12 +147,13 @@ def build_shared_lib(
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
-        _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"] + list(extra_flags or []))
+        lang_flags = (["/TP"] if cpp else []) + list(extra_flags or [])
+        _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"] + lang_flags)
         if strip_relocs:
             _strip_pe_relocations(out)
         return out
 
-    compiler = _gnu_compiler_for_bits(bits)
+    compiler = _gnu_cpp_compiler_for_bits(bits) if cpp else _gnu_compiler_for_bits(bits)
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
     cmd = [compiler, "-shared", bits_flag, pic_flag, "-o", str(out), str(source)] + list(extra_flags or [])
@@ -171,9 +188,26 @@ def build_shared_lib(
     return out
 
 
+def _msvc_import_lib_for(dll_path: Path) -> Path:
+    """The sibling .lib import library that MSVC's ``/LD`` produces
+    alongside a DLL it just built, for linking against that DLL from
+    cl.exe/link.exe -- a .dll is itself a PE image, not a COFF object
+    file or import library, so passing it directly as a link input is
+    invalid (link.exe will reject it)."""
+    lib_path = dll_path.with_suffix(".lib")
+    if not lib_path.is_file():
+        raise RuntimeError(
+            f"no MSVC import library found for '{dll_path}' (expected "
+            f"'{lib_path}' alongside it); /LD produces this automatically "
+            "when the DLL is built, so its absence means the DLL wasn't "
+            "built via that path and can't be linked against here"
+        )
+    return lib_path
+
+
 def build_exe(
     tmp_path: Path, source: Path, name: str, libs: List[Path], *, pic: bool, bits: int,
-    extra_flags: Optional[List[str]] = None,
+    extra_flags: Optional[List[str]] = None, cpp: bool = False,
 ) -> Path:
     kind, cl_path = _find_compiler()
     out = tmp_path / name
@@ -181,13 +215,15 @@ def build_exe(
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
+        lang_flags = (["/TP"] if cpp else []) + list(extra_flags or [])
+        link_libs = [_msvc_import_lib_for(lib) for lib in libs]
         _run(
             [cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}"]
-            + [str(lib) for lib in libs] + list(extra_flags or [])
+            + [str(lib) for lib in link_libs] + lang_flags
         )
         return out
 
-    compiler = _gnu_compiler_for_bits(bits)
+    compiler = _gnu_cpp_compiler_for_bits(bits) if cpp else _gnu_compiler_for_bits(bits)
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
     cmd = (
