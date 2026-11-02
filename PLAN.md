@@ -12,9 +12,9 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 | 2 | CLI (`staticer.py`, format sniff, dispatch) | done — clean review |
 | 3 | PE embedder — PIC/reloc-bearing path | done — 1 fix round (no-reloc guard, MSVC bitness skip) |
 | 4 | ELF embedder — PIC/reloc-bearing path | done — review closed, 3 fix rounds; verified passing for real on Linux (WSL) |
-| 5 | PE non-PIC / no-reloc base-reservation | not started |
-| 6 | ELF non-PIC / no-reloc base-reservation | not started |
-| 7 | PE unwind preservation + Windows stub | not started |
+| 5 | PE non-PIC / no-reloc base-reservation | done — 1 fix round (filler-range conflict gap) |
+| 6 | ELF non-PIC / no-reloc base-reservation | done — 2 fix rounds (reservation-growth gap, doc) |
+| 7 | PE unwind preservation + Windows stub | dispatching next |
 | 8 | ELF unwind preservation + Linux stub | not started |
 | 9 | Scope/overlap end-to-end tests | not started |
 | 10 | Real-world system binaries (cmd.exe/notepad, bash/ls) | not started |
@@ -83,6 +83,27 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 - `firstclass` adopted for `DependencyNode` per explicit direction (pure Python,
   confirmed no compiled backend).
 - `docs/firstclass-feedback.md` — upstream suggestions for the library.
+- PE base-address reservation (Task 5): dependencies with zero relocation data
+  are placed at their declared `ImageBase`, with a zero-file-backed filler
+  section bridging any RVA gap to the host's existing sections, and
+  `DYNAMIC_BASE`/`HIGH_ENTROPY_VA` cleared in the output's `DllCharacteristics`
+  since embedding any fixed-base dependency makes the whole image effectively
+  non-ASLR-safe. Conflict detection covers host-vs-dependency,
+  dependency-vs-dependency, AND (after a fix round) dependency-vs-filler-range
+  overlaps — all fail loudly with `ValueError`. Commits `309ef51`, `9f5d5ec`.
+- ELF base-address reservation (Task 6): a dependency is detected as
+  fixed-base via `e_type == ET_EXEC` (not "empty .rela", which is ambiguous
+  for ELF per Task 4's own docstring — a fully-PIC `.so` can legitimately have
+  no self-relocations). Reserved against the host's original PT_LOAD ranges,
+  other fixed-base dependencies, AND (after a fix round) the host's extended
+  segment's final grown extent. Commits `ced376f`, `5fc9143`, `62b5f1a`.
+  Found and fixed 2 more real bugs via live WSL execution: a stale AT_PHDR
+  doc claim (corrected across all 4 instances in the file after 2 rounds),
+  and confirmed — but explicitly left unfixed as pre-existing/out-of-scope —
+  a Task 4 GOT/PLT-patch bug that surfaces for ordinary PIC dependencies on
+  non-PIE hosts (`"unexpected PLT reloc type"`), flagged for whoever next
+  touches that code path since base-reservation is only sound on a non-PIE
+  host in the first place.
 
 ## Known problems / open concerns
 
@@ -123,14 +144,15 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 
 ## What's next
 
-- Task 4 (ELF PIC path) complete — review closed, 3 fix rounds, all re-verified.
-- Task 5 (PE non-PIC base-reservation) — dispatching next.
-- Tasks 6-8 (ELF non-PIC + unwind) depend on 3/4 being settled first (same
-  files) — now unblocked. Task 8 in particular needs to design the real
-  init-call mechanism Task 4 deliberately left out (see fix round 2 above) —
-  calling crtstuff-style init functions safely needs either establishing the
-  x86-32 PIC GOT-base calling convention correctly, or a different hook point.
-- Task 9-11 sequential after 5-8.
+- Tasks 4, 5, 6 all complete, reviews closed.
+- Task 7 (PE unwind preservation + Windows stub) — dispatching next.
+- Task 8 (ELF unwind preservation + Linux stub) needs to design the real
+  init-call mechanism Task 4 deliberately left out — calling crtstuff-style
+  init functions safely needs either establishing the x86-32 PIC GOT-base
+  calling convention correctly, or a different hook point. Can run in
+  parallel with Task 7 (different files: pe_embedder.py/stubs/windows vs
+  elf_embedder.py/stubs/linux).
+- Task 9-11 sequential after 7/8.
 - CI/CD done (Task 12): GitHub Actions Windows+Linux matrix, MSVC via
   ilammy/msvc-dev-cmd, builds C test fixtures with system compiler at
   test-setup time, runs pytest. `pefile`/`pyelftools` now declared as real
@@ -139,4 +161,4 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 ## Commit discipline
 
 Small, single-purpose commits per implementer, no amending, no push until
-asked. Current HEAD: `5c44506`.
+asked. Current HEAD: `62b5f1a`.
