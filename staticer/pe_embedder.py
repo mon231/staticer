@@ -68,6 +68,8 @@ def resolve_pe(name: str, search_dirs: List[Path]) -> Optional[Path]:
     return None
 
 
+
+
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 1:
         return value
@@ -290,6 +292,20 @@ class PortableExecutableEmbedder:
             # those a no-reloc dependency's reserved range collides with.
             occupied_ranges: List[tuple] = [(0, next_rva, self.input_path.name)]
             reserved_base_ranges: List[tuple] = []
+            # Every embedded dependency's own *raw* export table (see the
+            # per-dependency `raw_exports` comment below for what each
+            # entry holds), keyed by lowercased DLL name -- populated once
+            # per dependency in the main loop below, consulted only in the
+            # finalize pass that resolves `pending_host_iat_patches` after
+            # the loop (so a forward's target DLL doesn't need to already
+            # be embedded at the point the forward itself is processed --
+            # see that pass for why that matters).
+            global_raw_exports_by_dll: Dict[str, Dict[object, object]] = {}
+            # (iat_slot_rva, dll_name_lower, name_or_ordinal) for every host
+            # import of an embedded dependency, deferred until every
+            # dependency's raw export table (and X placement) is known --
+            # see `global_raw_exports_by_dll` above.
+            pending_host_iat_patches: List[tuple] = []
 
             for node in order:
                 dep = pefile.PE(str(node.path))
@@ -403,29 +419,78 @@ class PortableExecutableEmbedder:
                     # directory at all (e.g. any x86/32-bit dependency).
                     dep_pdata_entries.extend(_collect_and_patch_dep_unwind(dep, blob, X))
 
-                    exports_by_name = {}
+                    # This dependency's own *raw* export table, by both name
+                    # and ordinal: either an already-absolute VA (a normal,
+                    # non-forwarded export -- cheap to compute right now,
+                    # `image_base + X + sym.address`, no cross-dependency
+                    # information needed) or, for a *forwarded* export (its
+                    # real implementation lives in another DLL entirely --
+                    # or even back in this same DLL, under a different name:
+                    # a real, observed pattern, e.g. RPCRT4.dll's ANSI entry
+                    # points forwarding to its own wide-string ones; pefile
+                    # marks any forward via `sym.forwarder`, and `sym.address`
+                    # is -- misleadingly -- just the RVA of the forwarder
+                    # string itself for these, never a callable address), a
+                    # pending ("fwd", target_dll_lower, target_func, raw_str)
+                    # marker -- deliberately *not* resolved to a VA here.
+                    #
+                    # Resolving a forward needs the target DLL's own raw
+                    # table, which, for a forward to *another* dependency,
+                    # might not exist yet at this point in embed order (a
+                    # forward is a real, observed source of genuine
+                    # dependency cycles against plain PE imports -- e.g. a
+                    # real WS2_32.dll forwards some exports to MSWSOCK.dll,
+                    # while MSWSOCK.dll's own import table imports
+                    # WS2_32.dll back, a cycle no single embed order can
+                    # satisfy). So forward resolution (`_resolve_export`,
+                    # below `global_raw_exports_by_dll`) and the host-IAT
+                    # patches that may need it are both deferred to a
+                    # finalize pass run after every dependency in `order`
+                    # has been placed (has an `X` and a raw table) --
+                    # `pending_host_iat_patches`, below.
+                    raw_exports: Dict[object, object] = {}
                     if hasattr(dep, "DIRECTORY_ENTRY_EXPORT"):
                         for sym in dep.DIRECTORY_ENTRY_EXPORT.symbols:
-                            if sym.name:
-                                exports_by_name[sym.name.decode("ascii")] = sym.address
+                            name = sym.name.decode("ascii") if sym.name else None
+                            if sym.forwarder:
+                                forwarder = sym.forwarder.decode("ascii")
+                                fwd_dll, _, fwd_func = forwarder.rpartition(".")
+                                fwd_dll_lower = fwd_dll.lower()
+                                if not fwd_dll_lower.endswith(".dll"):
+                                    fwd_dll_lower += ".dll"
+                                entry = ("fwd", fwd_dll_lower, fwd_func, forwarder)
+                            else:
+                                entry = image_base + X + sym.address
+                            raw_exports[sym.ordinal] = entry
+                            if name:
+                                raw_exports[name] = entry
+                    global_raw_exports_by_dll[node.name.lower()] = raw_exports
 
                     if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
                         for host_entry in pe.DIRECTORY_ENTRY_IMPORT:
                             if host_entry.dll.decode("ascii") != node.name:
                                 continue
                             for imp in host_entry.imports:
-                                if imp.import_by_ordinal or imp.name is None:
-                                    raise ValueError(
-                                        f"cannot embed '{node.name}': ordinal-only "
-                                        f"imports aren't supported"
-                                    )
-                                fname = imp.name.decode("ascii")
-                                if fname not in exports_by_name:
-                                    raise ValueError(
-                                        f"dependency '{node.name}' does not export "
-                                        f"'{fname}', required by the host's import table"
-                                    )
-                                target_va = image_base + X + exports_by_name[fname]
+                                if imp.import_by_ordinal:
+                                    key = imp.ordinal
+                                    if key not in raw_exports:
+                                        raise ValueError(
+                                            f"dependency '{node.name}' does not "
+                                            f"export ordinal {key}, required "
+                                            f"by the host's import table"
+                                        )
+                                else:
+                                    if imp.name is None:
+                                        raise ValueError(
+                                            f"cannot embed '{node.name}': import "
+                                            f"entry has neither a name nor an ordinal"
+                                        )
+                                    key = imp.name.decode("ascii")
+                                    if key not in raw_exports:
+                                        raise ValueError(
+                                            f"dependency '{node.name}' does not export "
+                                            f"'{key}', required by the host's import table"
+                                        )
                                 # `imp.thunk_rva` is the *lookup* (ILT/
                                 # OriginalFirstThunk) slot pefile derived the
                                 # name from, which is a different array from
@@ -434,13 +499,7 @@ class PortableExecutableEmbedder:
                                 # (`imp.address` is that slot's VA) -- it's
                                 # the IAT slot we must overwrite.
                                 iat_slot_rva = imp.address - image_base
-                                slot_offset = pe.get_offset_from_rva(iat_slot_rva)
-                                output[slot_offset:slot_offset + ptr_size] = target_va.to_bytes(
-                                    ptr_size, "little"
-                                )
-                                new_reloc_entries.append(
-                                    (iat_slot_rva, IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW)
-                                )
+                                pending_host_iat_patches.append((iat_slot_rva, node.name.lower(), key))
                             removed_dll_names_lower.add(node.name.lower())
 
                     if hasattr(dep, "DIRECTORY_ENTRY_IMPORT"):
@@ -491,6 +550,50 @@ class PortableExecutableEmbedder:
                     next_rva = max(next_rva, X + blob_size)
                 finally:
                     dep.close()
+
+            # -- finalize deferred host IAT patches --------------------------
+            # Every dependency in `order` now has an `X` placement and a raw
+            # export table recorded in `global_raw_exports_by_dll` -- resolve
+            # each pending host import (including any forward chain, however
+            # it's oriented relative to embed order; see
+            # `pending_host_iat_patches`'s declaration above for why that
+            # couldn't be done inline in the main loop) and apply it now.
+            def _resolve_raw_export(dll_lower: str, key, _depth: int = 0) -> int:
+                if _depth > 16:
+                    raise ValueError(
+                        f"forward chain resolving '{key}' in '{dll_lower}' is "
+                        f"too deep (possible forwarder cycle)"
+                    )
+                table = global_raw_exports_by_dll.get(dll_lower)
+                if table is None or key not in table:
+                    raise ValueError(
+                        f"cannot resolve export '{key}' of '{dll_lower}': it "
+                        f"isn't an already-embedded dependency (forward "
+                        f"targets must themselves be embedded -- is it "
+                        f"excluded, or not resolvable?)"
+                    )
+                entry = table[key]
+                if isinstance(entry, tuple):
+                    _, fwd_dll_lower, fwd_func, forwarder = entry
+                    try:
+                        return _resolve_raw_export(fwd_dll_lower, fwd_func, _depth + 1)
+                    except ValueError:
+                        raise ValueError(
+                            f"'{dll_lower}' exports '{key}' as a forward to "
+                            f"'{forwarder}', but '{fwd_dll_lower}' isn't an "
+                            f"already-embedded dependency (forward targets "
+                            f"must themselves be embedded -- is it excluded, "
+                            f"or not resolvable?)"
+                        )
+                return entry
+
+            for iat_slot_rva, dll_lower, key in pending_host_iat_patches:
+                target_va = _resolve_raw_export(dll_lower, key)
+                slot_offset = pe.get_offset_from_rva(iat_slot_rva)
+                output[slot_offset:slot_offset + ptr_size] = target_va.to_bytes(ptr_size, "little")
+                new_reloc_entries.append(
+                    (iat_slot_rva, IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW)
+                )
 
             # -- merged/combined import directory -------------------------
             if removed_dll_names_lower or merged_descriptors:
