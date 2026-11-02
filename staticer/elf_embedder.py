@@ -706,6 +706,32 @@ class ElfEmbedder:
             ext["p_paddr"], new_filesz, new_filesz, ext["p_align"],
         )
 
+        # `reserved_ranges` (seeded above, before the per-dependency loop)
+        # only ever checked a fixed-base node's reservation against the
+        # host's own *original* PT_LOAD ranges and other fixed-base
+        # nodes' reservations -- never against `ext`, since fixed-base
+        # nodes don't participate in `next_vaddr`'s progression and
+        # `ext`'s own eventual grown extent (every ordinary dependency's
+        # blob, the combined relocation table, the phdr-array placeholder
+        # -- everything laid out just above) isn't known until right now,
+        # well after every fixed-base node already passed its own check.
+        # A fixed-base reservation that looked clear of the host at the
+        # time could still end up virtually overlapping wherever `ext`
+        # actually grew to by the time this method is done -- the same
+        # silent-overlap anti-goal `reserved_ranges`'s own checks exist to
+        # catch everywhere else, just caught late instead of never (same
+        # class of gap as pe_embedder's alignment-gap-filler fix).
+        if fixed_base_segments:
+            ext_final_lo, ext_final_hi = ext["p_vaddr"], ext["p_vaddr"] + new_filesz
+            for X, blob in fixed_base_segments:
+                lo, hi = X, X + len(blob)
+                if lo < ext_final_hi and ext_final_lo < hi:
+                    raise ValueError(
+                        f"base address conflict at {hex(max(lo, ext_final_lo))} between a "
+                        f"fixed-base dependency (base {hex(X)}) and the host's own extended "
+                        f"image (grown to {hex(ext_final_lo)}-{hex(ext_final_hi)})"
+                    )
+
         if not fixed_base_segments:
             entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
             raw[entry_off:entry_off + len(extended_entry)] = extended_entry

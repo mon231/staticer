@@ -26,6 +26,12 @@ _ET_DYN = 3
 # while building this fixture).
 _FIXED_BASE = 0x20000000
 
+_PAGE = 0x1000
+
+
+def _align_up(value: int, alignment: int = _PAGE) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
 
 def _force_fixed_base(so_path: Path, *, untrack_func: Optional[str] = None, base: int = _FIXED_BASE) -> None:
     """Makes `so_path` -- an ordinary PIC .so, already linked at a chosen
@@ -210,6 +216,58 @@ def test_base_address_conflict_fails_loudly(tmp_path, c_compiler):
     exe = build_exe(tmp_path, FIXTURES / "main_two_libs.c", "main_two_libs", [liba, libb], pic=True, bits=64)
     _force_fixed_base(liba)
     _force_fixed_base(libb)
+
+    with pytest.raises(ValueError):
+        ElfEmbedder(exe, tmp_path / "out", set(), lib_dir=tmp_path).embed()
+
+
+def test_base_address_conflict_inside_ext_growth_fails_loudly(tmp_path, c_compiler):
+    """Regression test for a gap where a fixed-base dependency's
+    reservation was only ever checked (in `embed()`'s per-dependency
+    loop) against the host's *original* PT_LOAD ranges and other
+    fixed-base dependencies' own reservations -- never against `ext`
+    (the host's own extended PT_LOAD segment)'s eventual *grown* extent,
+    which isn't known until after every ordinary dependency's blob, the
+    combined relocation table, and the phdr-array placeholder are all
+    laid out (fixed-base nodes don't participate in `next_vaddr`'s
+    progression, so there was nothing tracking how far that growth
+    reaches by the time a fixed-base node's own check ran). A reservation
+    placed just past the host's *original* end passed that early check
+    even though it ends up virtually inside `ext`'s own final range once
+    a large enough ordinary dependency pushes `ext` that far -- exactly
+    the silent-overlap anti-goal `reserved_ranges` exists to catch
+    everywhere else, just missed for this specific case (the same class
+    of gap as pe_embedder's own alignment-gap-filler fix for the PE
+    side).
+
+    `lib_big.c`'s 2MB `big_buffer` forces `ext` to grow by a couple of
+    megabytes once embedded; the fixed-base dependency below is placed
+    only one page past the host's own *original* vaddr range -- clear of
+    the host at the time it's checked, but comfortably inside where
+    `ext` actually grows to once the big dependency's blob (and the
+    phdr-array placeholder the fixed-base dependency itself requires) are
+    both appended.
+    """
+    big_so = build_shared_lib(tmp_path, FIXTURES / "lib_big.c", "lib_big.so", pic=True, bits=64)
+    # Built at the module default base first, just to get *some* valid
+    # ET_DYN .so for the host to link against -- see
+    # `_build_rebased_so`'s own docstring for why the real base doesn't
+    # matter until after the host exists (DT_NEEDED only records a name).
+    small_so = _build_rebased_so(tmp_path, FIXTURES / "lib_b.c", "lib_b.so", bits=64)
+    exe = build_exe(
+        tmp_path, FIXTURES / "main_two_libs.c", "main_two_libs", [big_so, small_so], pic=True, bits=64
+    )
+
+    with open(exe, "rb") as f:
+        host_end = max(seg["p_vaddr"] + seg["p_memsz"] for seg in ELFFile(f).iter_segments(type="PT_LOAD"))
+    conflict_base = _align_up(host_end) + _PAGE
+
+    # Rebuild the *same* lib_b.so, now at `conflict_base` -- overwriting
+    # it in place doesn't disturb the host's already-built DT_NEEDED
+    # entry for "lib_b.so" (just a name, resolved by `resolve_elf` at
+    # embed() time, same as every other fixture in this file relies on).
+    small_so = _build_rebased_so(tmp_path, FIXTURES / "lib_b.c", "lib_b.so", bits=64, base=conflict_base)
+    _force_fixed_base(small_so)
 
     with pytest.raises(ValueError):
         ElfEmbedder(exe, tmp_path / "out", set(), lib_dir=tmp_path).embed()
