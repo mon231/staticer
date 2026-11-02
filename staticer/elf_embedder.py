@@ -49,6 +49,7 @@ DT_DEBUG = 21  # harmless/ignored by every runtime linker; see _remove_needed
 # EM_386 and EM_X86_64 for every type this module handles.
 R_NONE = 0
 R_ABS_PLUS_ADDEND = 1  # R_X86_64_64 / R_386_32: value = S (+A for RELA)
+R_COPY = 5  # R_X86_64_COPY / R_386_COPY: copy `st_size` bytes from the definition
 R_GLOB_DAT = 6
 R_JUMP_SLOT = 7
 R_RELATIVE = 8
@@ -130,6 +131,88 @@ def _remove_needed(dyn, raw: bytearray, ptr_size: int, needed_name: str) -> bool
             struct.pack_into(fmt, raw, entry_off, DT_DEBUG)
             return True
     return False
+
+
+_VERNEED_ENTRY_SIZE = 16  # Elf32_Verneed/Elf64_Verneed share one layout (see _VERNEED_FMT)
+_VERNEED_FMT = "<HHIII"  # vn_version, vn_cnt, vn_file, vn_aux, vn_next (all fixed-width, class-independent)
+
+
+def _remove_verneed_entry(dyn, raw: bytearray, ptr_size: int, vaddr_to_offset, needed_name: str) -> None:
+    """Remove `needed_name`'s own top-level DT_VERNEED (symbol-versioning
+    "needed version" list) entry, if the host has one, splicing the
+    linked list around it in place -- the version-requirement analogue of
+    _remove_needed, needed for the same reason but discovered only
+    against real system binaries (none of this project's own small
+    fixtures use GNU symbol versioning, so nothing exercised this path
+    before Task 10b): ld.so's _dl_check_map_versions walks the WHOLE
+    top-level Verneed list unconditionally at load time and asserts a
+    loaded module exists for *every* entry's own vn_file SONAME --
+    unconditionally, regardless of whether any relocation still actually
+    references a version from it. Leaving a stale entry for an embedded
+    (DT_NEEDED-neutralized) dependency in place makes that assertion fail
+    at process startup ("Inconsistency detected by ld.so: dl-version.c:
+    ...: _dl_check_map_versions: Assertion `needed != NULL' failed"),
+    confirmed against a real `bash`/`libtinfo.so.6` embed on real Linux
+    (WSL) before this fix -- it ran `embed()` successfully and loaded via
+    a plain run but crashed immediately in the dynamic linker itself,
+    before any user code ran.
+
+    The corresponding Vernaux (per-version) entries hanging off the
+    removed node are simply left as dead bytes in place, unchanged -- the
+    same leave-it-dead-in-place pattern _remove_needed already uses for a
+    neutralized DT_NEEDED entry -- since nothing reaches them anymore
+    once their own Verneed node is spliced out of the list; a Verneed
+    entry's own vn_file (the only thing this function reads from each
+    entry) must always name one of the host's own *direct* DT_NEEDED
+    entries per the ELF ABI (a version can only ever be required from a
+    library the host itself directly depends on), so this is only ever
+    called for a direct import -- see this method's one call site."""
+    verneed_tag = next(dyn.iter_tags("DT_VERNEED"), None)
+    verneednum_tag = next(dyn.iter_tags("DT_VERNEEDNUM"), None)
+    strtab_tag = next(dyn.iter_tags("DT_STRTAB"), None)
+    if verneed_tag is None or verneednum_tag is None or strtab_tag is None:
+        return
+    count = verneednum_tag.entry.d_val
+    if count == 0:
+        return
+    strtab_vaddr = strtab_tag.entry.d_val
+
+    def _cstr_at(vaddr: int) -> str:
+        off = vaddr_to_offset(vaddr, 1)
+        end = raw.index(b"\x00", off)
+        return raw[off:end].decode("ascii")
+
+    # Walk the chain, recording each entry's own (vaddr, file offset,
+    # resolved vn_file name) -- vn_next entries are threaded by byte
+    # offset *from each entry's own vaddr*, not a flat array, so this
+    # can't just iterate `count` fixed-size slots directly.
+    entries = []
+    cur_vaddr = verneed_tag.entry.d_val
+    for _ in range(count):
+        off = vaddr_to_offset(cur_vaddr, _VERNEED_ENTRY_SIZE)
+        _, _, vn_file, _, vn_next = struct.unpack_from(_VERNEED_FMT, raw, off)
+        name = _cstr_at(strtab_vaddr + vn_file)
+        entries.append({"vaddr": cur_vaddr, "offset": off, "name": name})
+        if vn_next == 0:
+            break
+        cur_vaddr += vn_next
+
+    kept = [e for e in entries if e["name"] != needed_name]
+    if len(kept) == len(entries):
+        return  # this host has no Verneed entry for `needed_name` at all
+
+    # Re-thread vn_next across only the kept entries (last one's becomes
+    # 0, the "no more entries" terminator) and update DT_VERNEEDNUM/the
+    # head DT_VERNEED tag's own d_val in place -- same append-nothing,
+    # edit-existing-fields-in-place pattern as _remove_needed/
+    # _set_dyn_tag_value, since nothing here needs new file content, just
+    # different field values at already-existing offsets.
+    for i, e in enumerate(kept):
+        new_next = 0 if i == len(kept) - 1 else kept[i + 1]["vaddr"] - e["vaddr"]
+        struct.pack_into("<I", raw, e["offset"] + 12, new_next & 0xFFFFFFFF)
+    if kept:
+        _set_dyn_tag_value(dyn, raw, ptr_size, "DT_VERNEED", kept[0]["vaddr"])
+    _set_dyn_tag_value(dyn, raw, ptr_size, "DT_VERNEEDNUM", len(kept))
 
 
 def _find_dyn_tag_file_offset(dyn, ptr_size: int, tag_name: str) -> Optional[int]:
@@ -320,10 +403,46 @@ class ElfEmbedder:
     def _search_dirs(self) -> List[Path]:
         if self.lib_dir is not None:
             return [self.lib_dir]
-        return [
+        dirs = [
             self.input_path.parent,
             Path("/lib"), Path("/usr/lib"), Path("/lib64"), Path("/usr/lib64"),
         ]
+        # Debian/Ubuntu-style "multiarch" layout: real shared objects live
+        # in an architecture-qualified subdirectory (e.g. the real
+        # libc.so.6 at /usr/lib/x86_64-linux-gnu/libc.so.6), never directly
+        # under /usr/lib itself -- discovered against real system binaries
+        # (Task 10b): without this, lib_dir=None (every resolvable import
+        # is a candidate, per this method's own docstring) silently
+        # resolved *zero* real dependencies on any such system, even
+        # libc.so.6, making the whole lib_dir=None/"full closure" path
+        # dead code there. /lib is a symlink to /usr/lib on these systems,
+        # so checking both costs nothing and also covers non-symlinked
+        # layouts (e.g. a system where only one of the two is qualified).
+        #
+        # Deliberately only the two *exact* triplets this module's own
+        # `_SUPPORTED_MACHINES` ever allows (EM_X86_64/EM_386) -- NOT a
+        # wildcard glob over every "*-linux-gnu*" directory present. An
+        # earlier version of this fix used such a glob and broke for
+        # real on a host that also had a foreign-architecture multiarch
+        # directory installed (e.g. aarch64-linux-gnu, from an unrelated
+        # cross-compilation/container toolchain already on the system):
+        # resolve_elf's own plain by-name file search has no architecture
+        # awareness at all, so a same-named file (e.g. "libc.so.6") in
+        # the *wrong*-architecture directory could get resolved first
+        # purely by directory sort order, pulling in a whole
+        # foreign-architecture dependency subtree that then failed this
+        # method's own (correct) architecture-mismatch check several
+        # steps later -- confirmed for real against a real multi-
+        # toolchain WSL box while building this fix. Hardcoding exactly
+        # the two supported triplets sidesteps that regardless of
+        # whatever *other* architectures' multiarch directories happen
+        # to also be installed.
+        for triplet in ("x86_64-linux-gnu", "i386-linux-gnu"):
+            for base in (Path("/usr/lib"), Path("/lib")):
+                candidate = base / triplet
+                if candidate.is_dir():
+                    dirs.append(candidate)
+        return dirs
 
     def embed(self) -> None:
         """Embed every embeddable dependency (per Task 1's dependency
@@ -503,7 +622,30 @@ class ElfEmbedder:
 
         new_sections: List[Tuple[int, bytes]] = []  # (vaddr, data), contiguous in placement order
         new_reloc_entries: List[Tuple[int, int]] = []  # (host vaddr, value) -> new R_*_RELATIVE entries
-        combined_exports: Dict[str, Tuple[int, int]] = {}  # export name -> (X, offset-within-dep)
+        combined_exports: Dict[str, Tuple[int, int, int]] = {}  # export name -> (X, offset-within-dep, st_size)
+        # Each embedded dependency's own blob bytes, keyed by its own `X`
+        # (the same key `combined_exports` values' first element uses) --
+        # needed only for a host R_*_COPY relocation's data (see the
+        # R_COPY handling in the patch_specs loop, further down): at that
+        # point `raw` doesn't contain any embedded dependency's bytes yet
+        # (everything in `new_sections`/`fixed_base_segments` is only
+        # actually appended into `raw` by the "lay everything out" block,
+        # well after this), so a COPY relocation's source bytes have to
+        # come from here instead.
+        dep_blob_by_base: Dict[int, bytes] = {}
+        # (host vaddr, bytes-to-write) pairs for R_*_COPY relocations (see
+        # the R_COPY handling in the patch_specs loop) -- writing has to
+        # be deferred until after the "lay everything out" block, further
+        # down: a COPY relocation's target is frequently inside the
+        # host's own *BSS* (confirmed for real against bash/libtinfo.so.6
+        # on real Linux, WSL -- its `UP` symbol lands there), which has no
+        # file bytes at all yet at the point the patch_specs loop runs
+        # (the host's own `ext` PT_LOAD segment's filesz only grows to
+        # cover its full memsz -- backfilling that BSS gap with explicit
+        # zero bytes -- once "lay everything out" actually extends `raw`;
+        # see `ext_skew`'s own declaration, and this list's one other use
+        # further down, for exactly where/why).
+        deferred_copy_writes: List[Tuple[int, bytes]] = []
         # A symbol an embedded dependency itself still references
         # externally (through its own, now-dead PT_DYNAMIC/PLT) that no
         # embedded dependency's own exports satisfy -- e.g. `malloc`,
@@ -648,6 +790,41 @@ class ElfEmbedder:
             (i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_GNU_EH_FRAME"), None
         )
 
+        # Every symbol name the HOST's own dynamic relocation table already
+        # has an R_*_COPY entry for, mapped to that entry's own target
+        # vaddr -- pre-scanned up front, before any dependency is
+        # processed, because of what an R_*_COPY relocation actually
+        # *means* per the ELF ABI: once ld.so processes it, the copied-to
+        # address in the *executable* becomes THE one true storage for
+        # that global, and every other module's own access to it --
+        # including the *defining* shared object's own internal GOT-
+        # indirect accesses to its own global, exactly the same
+        # same-module-but-interposable pattern this method's own
+        # `_resolve_dep_reference` docstring already discusses for a
+        # plain exported mutable data symbol -- has to be redirected
+        # there too, not left pointing at the shared object's own
+        # original (now dead) storage. Confirmed for real (a `bash`/
+        # `libtinfo.so.6` embed on real Linux, WSL, crashing deep inside
+        # bash's own `parse_and_execute` with a garbage pointer) before
+        # this fix: libtinfo's own internal reference to its "UP" global
+        # (copy-relocated into bash itself, since old-style termcap
+        # globals like UP/PC/BC are always accessed this way) was being
+        # resolved to libtinfo's own embedded-blob-local copy instead,
+        # silently diverging from the value anything else (bash itself,
+        # or libtinfo's own tgetent()-equivalent setup code) reads/writes
+        # through the host's copy -- needed *before* the per-dependency
+        # loop below so a dependency's own self-reference to such a
+        # symbol (processed inline, during that very loop) already
+        # redirects correctly, not just cross-dependency references
+        # resolved via `combined_exports`.
+        host_copy_targets: Dict[str, int] = {}
+        for copy_reloc in host_reloc_tables[dyn_table_key].iter_relocations():
+            if copy_reloc["r_info_type"] != R_COPY:
+                continue
+            copy_sym = host_dyn.get_symbol(copy_reloc["r_info_sym"])
+            if copy_sym.name:
+                host_copy_targets[copy_sym.name] = copy_reloc["r_offset"]
+
         def _resolve_dep_reference(sym, blob: bytearray, blob_offset: int, X: int, dep_base: int,
                                     node_name: str, addend: int) -> None:
             """Resolve a dependency's own reference to `sym` (anything
@@ -673,8 +850,17 @@ class ElfEmbedder:
                 R_*_GLOB_DAT entry, not RELATIVE, since the real address
                 is only known at load time, via ld.so's own by-name
                 lookup, not something this module resolves itself)."""
+            if sym.name and sym.name in host_copy_targets:
+                # Takes priority over everything else below, including a
+                # same-dependency self-reference to its own defined
+                # symbol (the `new_val = X + ...` fallback at the bottom)
+                # -- see `host_copy_targets`'s own declaration for why.
+                new_val = (host_copy_targets[sym.name] + addend) & ptr_mask
+                _write_int(blob, blob_offset, ptr_size, new_val)
+                new_reloc_entries.append((X + blob_offset, new_val))
+                return
             if sym.name and sym.name in combined_exports:
-                exp_X, exp_off = combined_exports[sym.name]
+                exp_X, exp_off, _ = combined_exports[sym.name]
                 new_val = (exp_X + exp_off + addend) & ptr_mask
                 _write_int(blob, blob_offset, ptr_size, new_val)
                 new_reloc_entries.append((X + blob_offset, new_val))
@@ -846,7 +1032,7 @@ class ElfEmbedder:
                         and sym["st_info"]["type"] in ("STT_FUNC", "STT_OBJECT")
                         and sym["st_info"]["bind"] in ("STB_GLOBAL", "STB_WEAK")
                     ):
-                        combined_exports[sym.name] = (X, sym["st_value"] - dep_base)
+                        combined_exports[sym.name] = (X, sym["st_value"] - dep_base, sym["st_size"])
 
                 # This dependency's own .init_array constructors -- already
                 # relocated to their final absolute addresses in `blob` by
@@ -906,7 +1092,9 @@ class ElfEmbedder:
                 if node.name in host_direct_import_names:
                     if not _remove_needed(host_dyn, raw, ptr_size, node.name):
                         raise ValueError(f"expected DT_NEEDED entry for '{node.name}' not found in host")
+                    _remove_verneed_entry(host_dyn, raw, ptr_size, vaddr_to_offset, node.name)
 
+                dep_blob_by_base[X] = bytes(blob)
                 if is_fixed_base:
                     fixed_base_segments.append((X, bytes(blob)))
                 else:
@@ -985,12 +1173,58 @@ class ElfEmbedder:
             _, table_file_offset = host_dyn.get_table_offset(tag_name)
             entry_size = table.entry_size
             for idx, reloc in enumerate(table.iter_relocations()):
-                if reloc["r_info_type"] not in (R_JUMP_SLOT, R_GLOB_DAT, R_ABS_PLUS_ADDEND):
+                rtype = reloc["r_info_type"]
+                if rtype == R_COPY:
+                    # A direct-data-symbol import (e.g. ncurses/termcap's
+                    # legacy `extern char *UP;`-style globals, confirmed
+                    # against a real `bash`/`libtinfo.so.6` embed on real
+                    # Linux (WSL) -- none of this project's own fixtures
+                    # exercise a copy relocation at all): the *value*
+                    # (`st_size` raw bytes, copied verbatim from the
+                    # definition) has to be written into the host's own
+                    # reserved space at `r_offset` right now, since ld.so
+                    # itself would normally do this copy at load time by
+                    # looking up the defining module by name -- which no
+                    # longer exists once that dependency is embedded,
+                    # otherwise reproducing exactly the undefined-symbol
+                    # load failure this fix was written against.
+                    sym = host_dyn.get_symbol(reloc["r_info_sym"])
+                    if not sym.name or sym.name not in combined_exports:
+                        continue
+                    X, offset_in_dep, dep_size = combined_exports[sym.name]
+                    size = sym["st_size"] or dep_size
+                    src = dep_blob_by_base[X][offset_in_dep:offset_in_dep + size]
+                    target_vaddr = reloc["r_offset"]
+                    if not (ext["p_vaddr"] <= target_vaddr < ext["p_vaddr"] + ext["p_memsz"]):
+                        raise ValueError(
+                            f"R_*_COPY target {hex(target_vaddr)} in '{self.input_path}' falls "
+                            "outside its own extendable PT_LOAD segment; not supported"
+                        )
+                    deferred_copy_writes.append((target_vaddr, bytes(src)))
+                    # If the copied value is itself a pointer-sized field
+                    # whose value lands inside this very same dependency's
+                    # own embedded blob range, it's one of *our* addresses
+                    # (e.g. a `char *` into the dependency's own relocated
+                    # .rodata) and needs the same ASLR-safety new
+                    # R_*_RELATIVE entry as every other such address this
+                    # method introduces -- unlike a NULL or an address
+                    # pointing somewhere else entirely (e.g. still-external
+                    # data), which needs no fixup at all.
+                    if size == ptr_size:
+                        copied_value = _read_int(src, 0, ptr_size)
+                        if X <= copied_value < X + len(dep_blob_by_base[X]):
+                            new_reloc_entries.append((reloc["r_offset"], copied_value))
+
+                    entry_off = table_file_offset + idx * entry_size
+                    raw[entry_off:entry_off + entry_size] = b"\x00" * entry_size
+                    continue
+
+                if rtype not in (R_JUMP_SLOT, R_GLOB_DAT, R_ABS_PLUS_ADDEND):
                     continue
                 sym = host_dyn.get_symbol(reloc["r_info_sym"])
                 if sym["st_shndx"] != "SHN_UNDEF" or not sym.name or sym.name not in combined_exports:
                     continue
-                X, offset_in_dep = combined_exports[sym.name]
+                X, offset_in_dep, _ = combined_exports[sym.name]
                 addend = reloc["r_addend"] if is_rela else 0
                 resolved = (X + offset_in_dep + addend) & ((1 << (ptr_size * 8)) - 1)
                 target_off = vaddr_to_offset(reloc["r_offset"], ptr_size)
@@ -1175,17 +1409,52 @@ class ElfEmbedder:
         # stay byte-for-byte untouched, so AT_PHDR's computation doesn't
         # change at all. Growing `ext`'s p_filesz/p_memsz all the way from
         # its own original p_offset up to the new end of file is always
-        # safe content-wise (anything in that span that isn't one of our
-        # new blobs is either `ext`'s own original content or inert
-        # trailing bytes -- e.g. a stale section header table -- that
-        # nothing else maps), *as long as* `ext` is confirmed above to
-        # also be the last segment's content in the file, so growing its
-        # filesz can't stomp on some other segment's bytes.
+        # safe *placement*-wise (nothing one of our new blobs writes can
+        # collide with some other segment's bytes), *as long as* `ext` is
+        # confirmed above to also be the last segment's content in the
+        # file -- but it is NOT safe *content*-wise to leave whatever was
+        # already sitting past `ext`'s own original filesz unchanged: an
+        # earlier version of this comment claimed those bytes (e.g. a
+        # stale section header table/.comment/.note content -- normal
+        # for any unstripped-of-everything binary) were "inert... that
+        # nothing else maps", which was true only in the *original* file,
+        # where `ext`'s filesz genuinely stopped short of them. The
+        # moment this method grows `ext`'s filesz to cover that same
+        # span, the kernel DOES map it -- as real, non-zero file content,
+        # not the zero-filled BSS the ABI promises for anything between
+        # p_filesz and p_memsz. Confirmed for real (a `bash`/
+        # `libtinfo.so.6` embed on real Linux, WSL) before this fix: a
+        # handful of bash's own ordinary BSS globals happened to fall
+        # inside that exact span (p_filesz..p_memsz, with real leftover
+        # trailing bytes already occupying the first ~2KB of it on a
+        # real, not-fully-stripped `/bin/bash`) and came up initialized
+        # to that garbage instead of zero, crashing deep inside bash's
+        # own `parse_and_execute` on first use. Zeroing that whole span
+        # -- from `ext`'s own original filesz end through whatever the
+        # file's actual length already is -- before growing filesz over
+        # it restores the zero-BSS guarantee for it; losing those inert
+        # bytes' own original content costs nothing, since nothing in
+        # the original file's own PT_LOAD segments ever mapped them
+        # either.
+        ext_filesz_end_offset = ext["p_offset"] + ext["p_filesz"]
+        if ext_filesz_end_offset < len(raw):
+            raw[ext_filesz_end_offset:len(raw)] = b"\x00" * (len(raw) - ext_filesz_end_offset)
+
         data_start_vaddr = new_sections[0][0]
         data_start_offset = data_start_vaddr - ext_skew
         if data_start_offset < len(raw):
             raise ValueError("internal error: new ELF content would overlap existing file content")
         raw.extend(b"\x00" * (data_start_offset - len(raw)))
+
+        # Now that `raw` covers `ext`'s whole original memsz as real file
+        # bytes (the backfill just above) -- not just its original,
+        # possibly-smaller filesz -- any deferred R_*_COPY write's target
+        # (validated above to be within `ext`) is guaranteed in range;
+        # see `deferred_copy_writes`'s own declaration for why this can't
+        # happen any earlier.
+        for copy_target_vaddr, copy_src in deferred_copy_writes:
+            copy_target_off = copy_target_vaddr - ext_skew
+            raw[copy_target_off:copy_target_off + len(copy_src)] = copy_src
 
         cursor_vaddr = data_start_vaddr
         for vaddr, data in new_sections:
