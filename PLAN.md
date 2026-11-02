@@ -15,11 +15,11 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 | 5 | PE non-PIC / no-reloc base-reservation | done — 1 fix round (filler-range conflict gap) |
 | 6 | ELF non-PIC / no-reloc base-reservation | done — 2 fix rounds (reservation-growth gap, doc) |
 | 7 | PE unwind preservation + Windows stub | done — approved with flagged risk |
-| 8 | ELF unwind preservation + Linux stub | implemented, review in progress (commit `221784a`) |
+| 8 | ELF unwind preservation + Linux stub | done — 1 fix round (stack-realignment overshoot, verified on real WSL twice) (commits `221784a`, `f274e01`) |
 | 9a | Scope/overlap tests — PE (`test_pe_scope.py`) | done — clean review (commit `fcb764a`) |
-| 9b | Scope/overlap tests — ELF (`test_elf_scope.py`) | blocked on Task 8 |
+| 9b | Scope/overlap tests — ELF (`test_elf_scope.py`) | done — clean review (commit `1bfc50b`) |
 | 10a | Real-world binaries — PE (cmd.exe/hostname.exe, curated+full-closure) | done — approved, 1 moderate + 1 minor finding, both fixed directly (commits `fefc758`, `6f7e58e`) |
-| 10b | Real-world binaries — ELF (bash/ls, curated+full-closure) | blocked on Task 8 |
+| 10b | Real-world binaries — ELF (bash/grep, curated+full-closure) | done — approved, 1 minor finding fixed directly (commits `49f4045`, `e11d8d1`) |
 | 11 | Packaging (drop lief, pefile+pyelftools+firstclass, README) | done — approved, 1 low non-blocking note |
 | 12 | CI (GitHub Actions, Windows+Linux matrix) | done |
 
@@ -153,23 +153,20 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
 
 ## What's next
 
-- Tasks 1-7, 11, 12 complete.
-- Task 8 (ELF unwind preservation + Linux stub) — in progress (background
-  implementer, resumed once after a stall; its own earlier WIP found a
-  real GLOB_DAT-relocation bug for self-referencing exported globals).
-- **Plan re-split for parallelism** (user request): Tasks 9 and 10 were
-  already OS-disjoint in file scope (`tests/windows/*` vs `tests/linux/*`,
-  no shared files beyond conftest.py helpers). Split each into a/b:
-  - 9a (PE scope: --exclude/--lib-dir/transitive-overlap) and 10a (PE real
-    binaries: cmd.exe/notepad.exe curated+full-closure) depend only on the
-    PE embedder (Task 7, done) — dispatched now, in parallel with each
-    other and with Task 8.
-  - 9b (ELF scope) and 10b (ELF real binaries: bash/ls) depend on the ELF
-    embedder being feature-complete (Task 8) — blocked until Task 8 lands,
-    then dispatch both in parallel (same file-disjoint reasoning).
-  Both dispatches told: if conftest.py needs new shared helpers, edit
-  additively only, re-diff immediately before committing, stage only own
-  files.
+**All 12 tasks complete** (9/10 split a/b for parallelism — see table above).
+Remaining per `subagent-driven-development`'s closing steps:
+- Dispatch final whole-branch code reviewer (most capable model).
+- Handle its findings: one fix wave + one scoped re-review, adjudicate
+  any residuals.
+- Collect every `Ruling:` line from the ledger into a final summary.
+- Delete this plan's SDD workspace directory.
+- Proceed to `superpowers:finishing-a-development-branch`.
+
+Note: `origin/dev` was pushed mid-session at the user's explicit request
+while Task 8's fix round was still in progress (commit `8715cd1`, flagged
+WIP in its own message) — superseded by the completed fix (`f274e01`).
+Current branch has diverged further since (Tasks 9b/10b + fix-round
+commits) and has NOT been re-pushed yet.
 - CI/CD done (Task 12): GitHub Actions Windows+Linux matrix, MSVC via
   ilammy/msvc-dev-cmd, builds C test fixtures with system compiler at
   test-setup time, runs pytest. `pefile`/`pyelftools` now declared as real
