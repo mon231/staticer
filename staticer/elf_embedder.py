@@ -623,10 +623,12 @@ class ElfEmbedder:
         #    just extend `ext` like everything above this point does) --
         #    placed as one more piece of `ext`'s own extension, same as the
         #    relocation table just above, so it shares the extension's skew
-        #    and keeps AT_PHDR's computation (which assumes e_phoff always
-        #    falls inside a segment sharing the *first* PT_LOAD segment's
-        #    skew -- see the comment further down, by `data_start_vaddr`)
-        #    correct even though e_phoff is about to move. Its *content*
+        #    and keeps AT_PHDR's computation correct even though e_phoff is
+        #    about to move (empirically confirmed via LD_SHOW_AUXV=1
+        #    against a real host while building this mechanism -- see the
+        #    comment further down, by `data_start_vaddr`, for exactly what
+        #    that showed and how it corrects this file's own older claim
+        #    about how the kernel derives AT_PHDR). Its *content*
         #    can't be filled in yet -- it needs to record `ext`'s own
         #    final, grown p_filesz/p_memsz, which isn't known until after
         #    this whole extension (including this array's own reserved
@@ -648,23 +650,29 @@ class ElfEmbedder:
         #
         # The straightforward-looking alternative -- append everything at
         # the end of the file in a brand new PT_LOAD segment of its own --
-        # is wrong: the Linux kernel computes AT_PHDR as
-        # `load_bias + e_phoff`, where `load_bias` is derived once, from
-        # matching the *first* PT_LOAD segment's own p_vaddr/p_offset skew
-        # against where the kernel actually mapped it -- it does not
-        # re-derive a skew per segment, and it never re-translates e_phoff
-        # through address_offsets()-style segment lookup. That formula is
-        # only correct for a given e_phoff when the segment that e_phoff
-        # physically falls inside shares the *first* segment's skew. A
-        # brand new segment, placed at a freshly chosen vaddr/offset pair
-        # with no particular reason to share that skew, breaks this the
-        # moment e_phoff is moved into it: AT_PHDR then lands on
-        # `original_skew + new_e_phoff`, a bogus address still inside the
-        # *original* image's range, not the new segment at all. glibc's
-        # `_dl_aux_init`/`__libc_start_main` walk that (garbage) phdr array
-        # looking for PT_TLS/PT_GNU_RELRO/PT_GNU_STACK for the main
-        # executable -- silently skipping TLS/RELRO/stack-flag setup, or
-        # segfaulting outright if the bogus address isn't even mapped.
+        # is risky: AT_PHDR's value is derived from e_phoff through a
+        # translation that depends on *some* segment's own p_vaddr/
+        # p_offset skew. An earlier version of this comment claimed that
+        # skew always comes from the *first* PT_LOAD segment specifically,
+        # with the kernel never re-deriving one per segment -- empirical
+        # testing while building the fixed-base mechanism further up in
+        # this method (LD_SHOW_AUXV=1 against a real host) contradicts
+        # that: `ext` (the segment e_phoff gets moved into, there) does
+        # *not* share the first PT_LOAD segment's skew for that host, yet
+        # AT_PHDR still came out correct relative to *ext's own* skew. So
+        # the precise mechanism this comment used to assert isn't right --
+        # what's still true, and still the reason to prefer extending an
+        # existing segment over adding a new one, is that *some*
+        # segment-specific skew is involved, and there's no particular
+        # reason a brand new segment, placed at a freshly chosen vaddr/
+        # offset pair, would happen to share whatever skew that
+        # translation actually keys off. Moving e_phoff into one without
+        # knowing that risks AT_PHDR landing on a bogus address the moment
+        # it happens. glibc's `_dl_aux_init`/`__libc_start_main` walk that
+        # (potentially garbage) phdr array looking for PT_TLS/
+        # PT_GNU_RELRO/PT_GNU_STACK for the main executable -- silently
+        # skipping TLS/RELRO/stack-flag setup, or segfaulting outright if
+        # the bogus address isn't even mapped.
         #
         # Extending an *existing* segment in place sidesteps this
         # completely: e_phoff/e_phnum (and every other segment's entry)
