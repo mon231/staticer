@@ -1,12 +1,15 @@
 """PE (Windows) dependency embedding.
 
-Implements the reloc-bearing ("PIC path") case: a dependency DLL that
+Implements both the reloc-bearing ("PIC") case -- a dependency DLL that
 carries a base relocation table is appended into the host EXE/DLL as new
-section(s), its own relocations are applied against the new addresses, the
-host's references to it are patched to the embedded addresses, and its
-import-table entry is removed. Non-PIC/no-relocation-data handling,
-unwind-metadata preservation, and the real generated entrypoint stub are
-later tasks; see ``embed()`` docstring for exactly what's simplified here.
+section(s), its own relocations are applied against the new addresses --
+and the no-relocation-data ("fixed-base"/non-PIC) case -- the dependency is
+instead placed at the fixed address its own preferred ImageBase demands,
+reserved against the host's own image and every other such dependency.
+Either way, the host's references to it are patched to the embedded
+addresses and its import-table entry is removed. Unwind-metadata
+preservation and the real generated entrypoint stub are later tasks; see
+``embed()`` docstring for exactly what's simplified here.
 """
 
 import os
@@ -27,6 +30,7 @@ _IMAGE_DIRECTORY_ENTRY_BASERELOC = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY
 
 _SCN_CODE_RWX = 0x60000020 | 0x80000000  # CNT_CODE|MEM_EXECUTE|MEM_READ|MEM_WRITE
 _SCN_DATA_R = 0x40000040  # CNT_INITIALIZED_DATA|MEM_READ
+_SCN_UNINIT_RW = 0xC0000080  # CNT_UNINITIALIZED_DATA|MEM_READ|MEM_WRITE (".bss"-style)
 
 
 def list_pe_imports(path: Path) -> List[str]:
@@ -181,6 +185,17 @@ class PortableExecutableEmbedder:
              (DllMain-style init) into a generated stub that runs before the
              host's original entrypoint.
 
+        For a dependency that carries no relocation data at all (a fixed-
+        base/non-PIC build), step 1's placement differs: instead of
+        appending it at the next free RVA, it's placed at the one RVA that
+        makes ``host ImageBase + RVA`` exactly equal to that dependency's
+        own preferred ``ImageBase`` -- so none of its hardcoded absolute
+        addresses need step 2's relocation-application at all. That address
+        range is checked first against the host's own image (and anything
+        already placed there) and against every other dependency reserved
+        the same way, raising ``ValueError`` on any overlap. Steps 3-6
+        proceed identically either way.
+
         Simplification for this task (explicitly deferred, see Task 7):
         step 6's stub is a flat, unconditional call sequence -- one call per
         embedded node, in dependencies-first order, then a tail-jump to the
@@ -226,11 +241,17 @@ class PortableExecutableEmbedder:
                 s.PointerToRawData for s in pe.sections if s.PointerToRawData
             )
 
-            new_sections: List[tuple] = []  # (name, data, rva, characteristics)
+            new_sections: List[tuple] = []  # (name, data, rva, characteristics, virtual_size)
             new_reloc_entries: List[tuple] = []  # (host_rva, type)
             dep_entry_calls: List[tuple] = []  # (hinst_va, entry_va), in embed order
             removed_dll_names_lower: Set[str] = set()
             merged_descriptors: List[Dict[str, int]] = []
+            # (start_rva, end_rva, name) of the host's own image and every
+            # dependency (reloc-bearing or not) placed so far, host-relative
+            # -- used to attribute a base-address conflict to whichever of
+            # those a no-reloc dependency's reserved range collides with.
+            occupied_ranges: List[tuple] = [(0, next_rva, self.input_path.name)]
+            reserved_base_ranges: List[tuple] = []
 
             for node in order:
                 dep = pefile.PE(str(node.path))
@@ -254,16 +275,18 @@ class PortableExecutableEmbedder:
                         n = min(len(raw), blob_size - start)
                         blob[start:start + n] = raw[:n]
 
-                    X = next_rva
-                    delta = (image_base + X) - dep_image_base
+                    has_reloc = bool(getattr(dep, "DIRECTORY_ENTRY_BASERELOC", None))
 
-                    def apply_delta(offset: int, size: int) -> None:
-                        mask = (1 << (size * 8)) - 1
-                        val = int.from_bytes(blob[offset:offset + size], "little")
-                        val = (val + delta) & mask
-                        blob[offset:offset + size] = val.to_bytes(size, "little")
+                    if has_reloc:
+                        X = next_rva
+                        delta = (image_base + X) - dep_image_base
 
-                    if getattr(dep, "DIRECTORY_ENTRY_BASERELOC", None):
+                        def apply_delta(offset: int, size: int) -> None:
+                            mask = (1 << (size * 8)) - 1
+                            val = int.from_bytes(blob[offset:offset + size], "little")
+                            val = (val + delta) & mask
+                            blob[offset:offset + size] = val.to_bytes(size, "little")
+
                         for block in dep.DIRECTORY_ENTRY_BASERELOC:
                             for entry in block.entries:
                                 if entry.type == IMAGE_REL_BASED_ABSOLUTE:
@@ -280,19 +303,45 @@ class PortableExecutableEmbedder:
                                 new_reloc_entries.append((X + entry.rva, entry.type))
                     else:
                         # No relocation data at all means this dependency is
-                        # fixed-base/non-PIC: it can only be embedded
-                        # correctly via base-address reservation, which is a
-                        # later task (see design doc's non-PIC handling).
-                        # Embedding it verbatim here would silently bake in
-                        # stale build-time absolute addresses -- exactly the
-                        # "looks like it built but crashes at runtime"
-                        # anti-goal -- so fail loudly instead.
-                        raise ValueError(
-                            f"dependency '{node.name}' ({node.path}) carries no "
-                            f"relocation data; embedding fixed-base/non-PIC "
-                            f"dependencies isn't supported yet (base-address "
-                            f"reservation is a later task)"
-                        )
+                        # fixed-base/non-PIC: none of its internal absolute
+                        # addresses can be fixed up, so it can only be
+                        # embedded by reserving its own preferred ImageBase
+                        # as a fixed RVA within the host's image (such that
+                        # image_base + X == dep_image_base exactly, making
+                        # every one of its hardcoded addresses already
+                        # correct). Fail loudly if that address range is
+                        # already claimed by the host's own image (plus
+                        # anything already placed there) or by another
+                        # dependency reserved the same way -- rather than
+                        # silently overlapping two live mappings.
+                        X = dep_image_base - image_base
+                        if X < 0:
+                            raise ValueError(
+                                f"cannot reserve base address 0x{dep_image_base:x} for "
+                                f"dependency '{node.name}': it is below the host "
+                                f"image's own base 0x{image_base:x}"
+                            )
+                        for other_start, other_end, other_name in occupied_ranges:
+                            if X < other_end and other_start < X + blob_size:
+                                raise ValueError(
+                                    f"base address conflict at 0x{dep_image_base:x} "
+                                    f"between '{node.name}' and '{other_name}'"
+                                )
+                        reserved_base_ranges.append((X, X + blob_size, node.name))
+
+                        if X > next_rva:
+                            # The Windows PE loader requires sections to
+                            # cover the image's RVA space contiguously (no
+                            # gaps between them), so bridge the distance
+                            # between the append cursor and this
+                            # dependency's reserved address with a
+                            # ".bss"-style filler section: no raw file
+                            # backing needed, just a VirtualSize claiming
+                            # that range.
+                            new_sections.append((
+                                f".sgap{len(new_sections)}".encode("ascii"), b"", next_rva,
+                                _SCN_UNINIT_RW, X - next_rva,
+                            ))
 
                     exports_by_name = {}
                     if hasattr(dep, "DIRECTORY_ENTRY_EXPORT"):
@@ -367,8 +416,19 @@ class PortableExecutableEmbedder:
                     if entry_rva:
                         dep_entry_calls.append((image_base + X, image_base + X + entry_rva))
 
-                    new_sections.append((f".sdep{len(new_sections)}".encode("ascii"), bytes(blob), X, _SCN_CODE_RWX))
-                    next_rva = X + blob_size
+                    new_sections.append((
+                        f".sdep{len(new_sections)}".encode("ascii"), bytes(blob), X, _SCN_CODE_RWX, len(blob),
+                    ))
+                    occupied_ranges.append((X, X + blob_size, node.name))
+                    # For the reloc-bearing path X == next_rva always, so
+                    # this is equivalent to the old unconditional
+                    # `next_rva = X + blob_size`. For a no-reloc dependency,
+                    # X can be far from (and even behind) the append
+                    # cursor's previous value; never move the cursor
+                    # backwards, so later appended structures (merged
+                    # imports, the init stub, the combined reloc table)
+                    # keep landing past every reservation made so far.
+                    next_rva = max(next_rva, X + blob_size)
                 finally:
                     dep.close()
 
@@ -394,7 +454,9 @@ class PortableExecutableEmbedder:
                 import_bytes += struct.pack("<IIIII", 0, 0, 0, 0, 0)  # null terminator
 
                 import_rva = next_rva
-                new_sections.append((b".sidata2", bytes(import_bytes), import_rva, _SCN_DATA_R))
+                new_sections.append((
+                    b".sidata2", bytes(import_bytes), import_rva, _SCN_DATA_R, len(import_bytes),
+                ))
                 next_rva = _align_up(import_rva + len(import_bytes), section_alignment)
             else:
                 import_rva = None
@@ -418,7 +480,9 @@ class PortableExecutableEmbedder:
                     new_reloc_entries.append((stub_rva + len(stub_bytes) + off, reloc_type))
                 stub_bytes += tail_block
 
-                new_sections.append((b".sstub", bytes(stub_bytes), stub_rva, _SCN_CODE_RWX))
+                new_sections.append((
+                    b".sstub", bytes(stub_bytes), stub_rva, _SCN_CODE_RWX, len(stub_bytes),
+                ))
                 next_rva = _align_up(stub_rva + len(stub_bytes), section_alignment)
             else:
                 stub_rva = None
@@ -448,7 +512,9 @@ class PortableExecutableEmbedder:
 
                 combined_reloc_bytes = bytes(original_reloc_bytes) + bytes(new_blocks)
                 reloc_rva = next_rva
-                new_sections.append((b".sreloc2", combined_reloc_bytes, reloc_rva, _SCN_DATA_R))
+                new_sections.append((
+                    b".sreloc2", combined_reloc_bytes, reloc_rva, _SCN_DATA_R, len(combined_reloc_bytes),
+                ))
                 next_rva = _align_up(reloc_rva + len(combined_reloc_bytes), section_alignment)
             else:
                 reloc_rva = None
@@ -463,20 +529,45 @@ class PortableExecutableEmbedder:
                     f"{len(new_sections)} new section(s)"
                 )
 
-            for i, (name, data, rva, characteristics) in enumerate(new_sections):
-                file_offset = _align_up(len(output), file_alignment)
-                output.extend(b"\x00" * (file_offset - len(output)))
-                size_of_raw_data = _align_up(len(data), file_alignment)
-                output.extend(data)
-                output.extend(b"\x00" * (size_of_raw_data - len(data)))
+            for i, (name, data, rva, characteristics, virtual_size) in enumerate(new_sections):
+                size_of_raw_data = _align_up(len(data), file_alignment) if data else 0
+                if data:
+                    file_offset = _align_up(len(output), file_alignment)
+                    output.extend(b"\x00" * (file_offset - len(output)))
+                    output.extend(data)
+                    output.extend(b"\x00" * (size_of_raw_data - len(data)))
+                else:
+                    # No raw file backing at all (a ".bss"-style filler
+                    # section) -- PointerToRawData is conventionally 0 for
+                    # these, and nothing needs to be appended to the file.
+                    file_offset = 0
 
                 header_offset = section_table_offset + (existing_section_count + i) * 40
-                header = _pack_section_header(name, len(data), rva, size_of_raw_data, file_offset, characteristics)
+                header = _pack_section_header(name, virtual_size, rva, size_of_raw_data, file_offset, characteristics)
                 output[header_offset:header_offset + 40] = header
 
             new_section_count = existing_section_count + len(new_sections)
             noff = pe.FILE_HEADER.get_field_absolute_offset("NumberOfSections")
             output[noff:noff + 2] = struct.pack("<H", new_section_count)
+
+            if reserved_base_ranges:
+                # At least one embedded dependency has no relocation data
+                # of its own, which means its internal absolute-address
+                # references are only correct *as written* when this image
+                # loads at exactly its declared ImageBase (that's the
+                # entire point of reserving its address range there) --
+                # relocating the final image elsewhere (ASLR) would shift
+                # those unlisted absolute references without any
+                # relocation-table entry to fix them back up. Disable
+                # dynamic-base/high-entropy-VA so the loader only ever maps
+                # this image at its preferred base (or fails outright,
+                # rather than silently corrupting it).
+                dllcoff = pe.OPTIONAL_HEADER.get_field_absolute_offset("DllCharacteristics")
+                cur_dllc = struct.unpack_from("<H", output, dllcoff)[0]
+                IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA = 0x0020
+                IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = 0x0040
+                cur_dllc &= ~(IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)
+                output[dllcoff:dllcoff + 2] = struct.pack("<H", cur_dllc)
 
             new_size_of_image = next_rva
             szoff = pe.OPTIONAL_HEADER.get_field_absolute_offset("SizeOfImage")
