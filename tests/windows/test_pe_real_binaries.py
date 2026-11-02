@@ -46,11 +46,15 @@ Known, NOT fixed, open gap -- see ``test_second_real_binary_full_closure``:
 embedding a real CRT-class system DLL (``msvcrt.dll``) and manually
 invoking its own ``DllMain`` via the project's generated entrypoint stub
 (as full-closure embedding does for every embedded dependency with an
-entry point) causes the resulting process to fail at startup with
-``STATUS_ENTRYPOINT_NOT_FOUND`` -- even though ``embed()`` itself succeeds
-and the output loads fine via ``LoadLibrary`` (so it is not an import-table
-corruption; it reproduces specifically when the real process entry stub
-runs and calls msvcrt's own process-attach path out of band). This is
+entry point) causes the resulting process to fail at startup with a
+loader-related STATUS error (observed to vary -- STATUS_ENTRYPOINT_NOT_FOUND
+when msvcrt.dll alone is embedded in isolation, STATUS_ACCESS_VIOLATION in
+the full 6-DLL closure this test actually exercises, likely depending on
+which embedded DLL's DllMain faults first) -- even though ``embed()`` itself
+succeeds and the output loads fine via ``LoadLibrary`` (so it is not an
+import-table corruption; it reproduces specifically when the real process
+entry stub runs and calls a real system DLL's own process-attach path out
+of band). This is
 architecturally the same simplification ``staticer/stubs/windows/pe_stub.py``
 already documents (the stub is a flat DllMain-call sequence, not a full
 loader emulation) -- making arbitrary real system DLLs' own startup paths
@@ -175,8 +179,11 @@ def test_second_real_binary_curated_subset(tmp_path):
         "as it does for every embedded dependency with an entry point). "
         "embed() itself succeeds and the output loads fine via "
         "LoadLibrary, but running it as a process fails at startup with "
-        "STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) -- msvcrt's own "
-        "process-attach path doesn't tolerate being called this way. "
+        "a loader-related STATUS error (observed to vary by environment "
+        "-- e.g. STATUS_ENTRYPOINT_NOT_FOUND or STATUS_ACCESS_VIOLATION, "
+        "depending on which embedded DLL's DllMain faults first) -- a "
+        "real system DLL's own process-attach path doesn't tolerate "
+        "being called this way. "
         "Making arbitrary real system CRT/loader-adjacent DLLs' own "
         "startup paths safe to invoke out of band is a substantially "
         "bigger undertaking than this task's scope (it's the same kind "
