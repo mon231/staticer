@@ -98,22 +98,34 @@ def build_linux_stub(
     function, and both found to matter only by actually running the
     result and hitting a real SIGSEGV, not by static reasoning alone:
 
-    1. Stack realignment. The kernel/ld.so hand control to e_entry with
-       %rsp/%esp at the System V ABI's *process-entry* alignment (16-byte
-       aligned), not the ordinary *call-site* alignment every `call`
-       instruction assumes (aligned only *after* the implicit
-       return-address push). A bare `call` straight off the
-       kernel-provided pointer therefore hands every callee a stack
-       mis-aligned by one pointer width -- no symptom until something
-       deep in that callee's own call graph (observed: well past the
-       init calls themselves, inside glibc's own exit-handling, long
-       after this stub has already tail-jumped away) executes an
-       alignment-sensitive SSE/AVX instruction against it and faults.
-       Fixed by saving the kernel-provided pointer in a callee-saved
-       register, realigning %rsp/%esp for the calls, and restoring the
-       exact original value before the tail-jump -- original_entry
-       (crt1's `_start`) needs that one unmodified, not just "some
-       16-aligned value", since it reads argc/argv/envp directly off it.
+    1. Stack realignment. The ABI requires %rsp/%esp to be a clean
+       multiple of 16 immediately *before* a `call` instruction -- the
+       kernel/ld.so already hand e_entry a 16-aligned %rsp/%esp (the
+       System V ABI's *process-entry* guarantee), which happens to
+       satisfy this directly, with no adjustment needed at all; this
+       function went through two wrong states before landing there. The
+       first emitted a bare `call` straight off that pointer with *no*
+       realignment, which is actually fine on x86-64 (already 16-aligned)
+       but wrong on i386 wherever the loader doesn't give that same
+       guarantee -- see the fixture-driven regression test this was
+       caught by for specifics. A later revision "fixed" that by adding
+       an extra `and $-16`-then-`sub $8`/`sub $4`, which *overshoots*: it
+       produces exactly the one-pointer-width misalignment it was meant
+       to remove, on both architectures. Neither mistake has any symptom
+       until something deep in the affected call's own call graph
+       (observed for the rtld_fini bug below: well past the init calls
+       themselves, inside glibc's own exit-handling, long after this
+       stub has already tail-jumped away; for the alignment bug itself:
+       directly, inside any constructor that executes an
+       alignment-sensitive SSE/AVX instruction of its own, such as
+       `tests/fixtures/ctor_sse_align.c`'s) executes an
+       alignment-sensitive instruction against the mis-aligned stack and
+       faults. The correct fix is the plain `and $-16, %rsp`/`and $-16,
+       %esp` below, with nothing further -- saving the kernel-provided
+       pointer in a callee-saved register first, and restoring the exact
+       original value before the tail-jump, since original_entry (crt1's
+       `_start`) needs that one unmodified, not just "some 16-aligned
+       value" -- it reads argc/argv/envp directly off it.
 
     2. Preserving ld.so's own incoming "rtld_fini" pointer. On entry to
        a dynamically-linked ELF, ld.so hands e_entry a function pointer
@@ -134,12 +146,14 @@ def build_linux_stub(
        second callee-saved register, restored immediately before the
        tail-jump.
 
-    Both fixes were found and confirmed by actually building and running
-    this task's own fixtures on real Linux (WSL) -- an earlier version of
-    this function lacked both, looked correct under static review, and
-    reliably crashed at runtime on every embedded dependency that had
-    more than a single, do-nothing init_array entry, on both 32- and
-    64-bit.
+    All of the above were found and confirmed by actually building and
+    running real fixtures on real Linux (WSL), never by static review
+    alone -- including the stack-alignment *overcorrection* bug itself
+    (see point 1), caught only once a regression fixture that actually
+    executes an aligned SSE/AVX instruction in a called constructor
+    existed; none of this task's other fixtures (timestamp-recording
+    constructors, a plain C++ throw/catch) happen to touch alignment-
+    sensitive instructions at all, so they could not have caught it.
     """
     if hooked_names:
         raise NotImplementedError(
