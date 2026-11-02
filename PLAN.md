@@ -114,7 +114,6 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   Task 10's job, needs Tasks 5-8 first). Reviewed, approved as a sound call.
 - Task 3 stub is flat/unconditional: no LoadLibrary/dlopen hooking yet, only
   HIGHLOW/DIR64 reloc types, no ordinal imports. Deferred to Task 7+.
-- `setup.py` still lists `lief` pending removal (Task 11).
 - Task 12's CI yaml itself is approved but unverified on a real GitHub
   runner (no access from this session) — first real CI run may surface
   issues the local pytest pass can't catch.
@@ -151,6 +150,17 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   Not yet investigated — revisit when Task 7 or Task 10 touches TLS-bearing
   binaries.
 
+- **Final whole-branch review fix wave (2026-11-02)**: a final whole-branch
+  reviewer (most capable model) ran after all 12 tasks were marked complete
+  and found B1-B6 blocking issues plus several moderate/minor findings.
+  Being fixed in parallel across 3 tracks — PE embedder, ELF embedder, and
+  packaging/CLI/docs/CI (this track). Full detail lives in the ledger
+  (`.superpowers/sdd/2026-11-01-staticer-core/progress.md`), not duplicated
+  here. One finding (dependency-name path-traversal hardening in the
+  PE/ELF import/dependency resolver) was identified but intentionally left
+  for the PE/ELF track owners since the vulnerable code lives in their
+  files.
+
 ## What's next
 
 **All 12 tasks complete** (9/10 split a/b for parallelism — see table above).
@@ -175,4 +185,5 @@ commits) and has NOT been re-pushed yet.
 ## Commit discipline
 
 Small, single-purpose commits per implementer, no amending, no push until
-asked. Current HEAD: `62b5f1a`.
+asked. Current HEAD: see `git log -1` (this SHA goes stale immediately
+otherwise; as of the final-review fix wave starting, HEAD was `26e2294`).
