@@ -61,3 +61,43 @@ def test_base_address_conflict_fails_loudly(tmp_path, c_compiler, bits):
 
     with pytest.raises(ValueError):
         PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), tmp_path).embed()
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_base_address_conflict_inside_alignment_gap_filler_fails_loudly(tmp_path, c_compiler, bits):
+    """Regression test: a no-reloc dependency placed far from the host's
+    own sections is bridged by a ".bss"-style filler section covering the
+    RVA gap in between (see embed()'s comments on why -- the Windows PE
+    loader rejects an image whose sections don't cover its RVA space
+    contiguously). That filler section is a real entry in the final
+    section table and physically claims its RVA range, exactly like any
+    other section -- so a *second*, independent no-reloc dependency whose
+    own reserved address falls inside that filler's range (not inside the
+    host's own range, and not inside the first dependency's own data
+    range) is just as real a collision as any other, and must be rejected
+    the same way.
+
+    `main_two_libs.c` calls `lib_value()` then `lib_b_value()`, but
+    `list_pe_imports`/`embed_order` process `lib_b.dll` before `lib.dll`
+    for this fixture (confirmed empirically) -- so `lib_b.dll` gets the
+    far address (creating the wide filler) and `lib.dll` gets the address
+    that lands inside it.
+    """
+    dll_a = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=False, bits=bits, strip_relocs=True)
+    dll_b = build_shared_lib(tmp_path, FIXTURES / "lib_b.c", "lib_b.dll", pic=False, bits=bits, strip_relocs=True)
+    exe = build_exe(tmp_path, FIXTURES / "main_two_libs.c", "main_two_libs.exe", [dll_a, dll_b], pic=True, bits=bits)
+
+    exe_pe = pefile.PE(str(exe))
+    exe_image_base = exe_pe.OPTIONAL_HEADER.ImageBase
+    exe_pe.close()
+
+    # lib_b.dll (processed first) gets a far address -- wide enough that
+    # the gap between the host's own sections and it needs a filler --
+    # and lib.dll (processed second) gets an address inside that filler's
+    # range, well clear of both the host's own range and lib_b.dll's own
+    # data range.
+    _set_pe_image_base(dll_b, exe_image_base + 0x40000000)
+    _set_pe_image_base(dll_a, exe_image_base + 0x20000000)
+
+    with pytest.raises(ValueError):
+        PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), tmp_path).embed()
