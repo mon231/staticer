@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from elftools.elf.elffile import ELFFile
 
 from .common.depgraph import build_dependency_graph, embed_order
+from .stubs.linux.elf_stub import build_linux_stub
 
 # -- ELF constants pyelftools doesn't expose as plain ints for our needs --
 # (it hands back Enum-mapped strings for e.g. p_type/d_tag, which is fine
@@ -39,6 +40,7 @@ from .common.depgraph import build_dependency_graph, embed_order
 
 PT_LOAD = 1
 PT_PHDR = 6
+PT_GNU_EH_FRAME = 0x6474E550
 PF_X, PF_W, PF_R = 1, 2, 4
 
 DT_DEBUG = 21  # harmless/ignored by every runtime linker; see _remove_needed
@@ -54,6 +56,18 @@ R_RELATIVE = 8
 _SUPPORTED_MACHINES = ("EM_X86_64", "EM_386")
 
 _PAGE = 0x1000
+
+# -- DWARF exception-handling pointer-encoding bits (DW_EH_PE_*), just the
+# ones GCC's own default .eh_frame_hdr layout actually uses -- see
+# _parse_eh_frame_hdr/_build_eh_frame_hdr.
+_DW_EH_PE_UDATA4 = 0x03
+_DW_EH_PE_SDATA4 = 0x0B
+_DW_EH_PE_PCREL = 0x10
+_DW_EH_PE_DATAREL = 0x30
+_DW_EH_PE_OMIT = 0xFF
+
+STB_GLOBAL = 1
+STT_FUNC = 2
 
 
 def list_elf_imports(path: Path) -> List[str]:
@@ -165,6 +179,134 @@ def _pack_relative_entries(entries: List[Tuple[int, int]], is64: bool, is_rela: 
                 out += struct.pack("<III", vaddr, R_RELATIVE, value & 0xFFFFFFFF)
             else:
                 out += struct.pack("<II", vaddr, R_RELATIVE)
+    return bytes(out)
+
+
+def _pack_glob_dat_entries(entries: List[Tuple[int, int]], is64: bool, is_rela: bool) -> bytes:
+    """Pack (slot_vaddr, sym_index) pairs as new R_*_GLOB_DAT REL/RELA
+    entries -- used to forward an embedded dependency's remaining
+    external symbol references (functions/data it calls via its own,
+    now-dead PT_DYNAMIC that no embedded dependency provides -- e.g.
+    `malloc`, `__cxa_throw`) into the host's own dynamic section, so
+    ld.so resolves them normally, by name, at load time -- exactly as it
+    would if the host had referenced them directly -- rather than the
+    value being something *this module* computes (unlike
+    _pack_relative_entries' RELATIVE entries, which always encode an
+    address this module already resolved itself; a GLOB_DAT entry here
+    instead carries a *symbol index* for ld.so's own lookup to resolve,
+    since the real address -- e.g. malloc's -- isn't known until load
+    time and isn't ours to compute). Addend is always 0: the whole
+    resolved value replaces the slot's content outright, there's nothing
+    to add it to."""
+    out = bytearray()
+    for vaddr, sym_idx in entries:
+        if is64:
+            r_info = (sym_idx << 32) | R_GLOB_DAT
+            if is_rela:
+                out += struct.pack("<QQq", vaddr, r_info, 0)
+            else:
+                out += struct.pack("<QQ", vaddr, r_info)
+        else:
+            r_info = (sym_idx << 8) | R_GLOB_DAT
+            if is_rela:
+                out += struct.pack("<IIi", vaddr, r_info, 0)
+            else:
+                out += struct.pack("<II", vaddr, r_info)
+    return bytes(out)
+
+
+def _pack_undef_sym(is64: bool, name_off: int) -> bytes:
+    """A new Elf32_Sym/Elf64_Sym entry for a symbol this module itself
+    never defines (SHN_UNDEF, st_value/st_size 0) -- used only so ld.so's
+    relocation processing has a name to look up for a forwarded external
+    reference (see _pack_glob_dat_entries); STB_GLOBAL/STT_FUNC matches
+    what a real external function import's own symbol table entry would
+    normally carry (ld.so's lookup doesn't actually care about the type
+    for OUR copy of it -- only the *name* and the fact that it's
+    undefined here -- but matching convention costs nothing)."""
+    st_info = (STB_GLOBAL << 4) | STT_FUNC
+    if is64:
+        # st_name, st_info, st_other, st_shndx, st_value, st_size
+        return struct.pack("<IBBHQQ", name_off, st_info, 0, 0, 0, 0)
+    # Elf32_Sym has a different field order: st_value/st_size come right
+    # after st_name, with st_info/st_other/st_shndx packed at the end.
+    return struct.pack("<IIIBBH", name_off, 0, 0, st_info, 0, 0)
+
+
+def _decode_eh_pe_sdata4(encoding: int, raw: int, field_vaddr: int, hdr_vaddr: int) -> int:
+    """Decode one DW_EH_PE-encoded 4-byte field from .eh_frame_hdr, as
+    used by every encoding GCC's own default layout actually emits for
+    this structure's fields: `sdata4`/`udata4` format (this module
+    doesn't need to tell those apart -- both are 4 bytes, and the
+    unsigned-vs-signed distinction only matters for a value that could
+    legitimately be negative *before* adding a base, which none of
+    these are once decoded) combined with either a `pcrel` base
+    (relative to this field's own vaddr) or a `datarel` base (relative
+    to the start of .eh_frame_hdr itself). Raises for anything else --
+    failing loudly rather than silently misinterpreting unwind data
+    matches this module's existing architecture-mismatch/unsupported-
+    relocation-type precedent elsewhere."""
+    width_bits = encoding & 0x0F
+    if width_bits not in (_DW_EH_PE_UDATA4, _DW_EH_PE_SDATA4):
+        raise ValueError(f"unsupported .eh_frame_hdr value encoding {hex(encoding)}")
+    base_bits = encoding & 0x70
+    if base_bits == _DW_EH_PE_PCREL:
+        return field_vaddr + raw
+    if base_bits == _DW_EH_PE_DATAREL:
+        return hdr_vaddr + raw
+    raise ValueError(f"unsupported .eh_frame_hdr base encoding {hex(encoding)}")
+
+
+def _parse_eh_frame_hdr(hdr_bytes: bytes, hdr_vaddr: int) -> List[Tuple[int, int]]:
+    """-> [(initial_loc, fde_addr), ...] -- absolute vaddrs, decoded from
+    a .eh_frame_hdr's binary-search table per whatever DW_EH_PE_*
+    encodings its own 4-byte encoding header declares (see
+    _decode_eh_pe_sdata4), not any one hardcoded scheme. This is the
+    *only* thing ever read from a dependency's .eh_frame/.eh_frame_hdr --
+    the FDE/CIE bytes themselves never need touching at all (see
+    ElfEmbedder.embed()'s docstring for why: every PC-relative offset a
+    FDE encodes -- to its own function, to its CIE, to its LSDA -- stays
+    numerically correct under a uniform shift, and a dependency's whole
+    mapped image, .eh_frame included, is always relocated as one single
+    uniform shift by this module)."""
+    version, eh_frame_ptr_enc, fde_count_enc, table_enc = hdr_bytes[0:4]
+    if version != 1:
+        raise ValueError(f"unsupported .eh_frame_hdr version {version}")
+    pos = 4
+    if eh_frame_ptr_enc != _DW_EH_PE_OMIT:
+        pos += 4  # eh_frame_ptr itself is never needed by this module
+    if fde_count_enc == _DW_EH_PE_OMIT:
+        return []
+    if (fde_count_enc & 0x0F) != _DW_EH_PE_UDATA4:
+        raise ValueError(f"unsupported .eh_frame_hdr fde_count encoding {hex(fde_count_enc)}")
+    fde_count = struct.unpack_from("<I", hdr_bytes, pos)[0]
+    pos += 4
+    entries = []
+    for i in range(fde_count):
+        off = pos + i * 8
+        iloc_raw, fde_raw = struct.unpack_from("<ii", hdr_bytes, off)
+        initial_loc = _decode_eh_pe_sdata4(table_enc, iloc_raw, hdr_vaddr + off, hdr_vaddr)
+        fde_addr = _decode_eh_pe_sdata4(table_enc, fde_raw, hdr_vaddr + off + 4, hdr_vaddr)
+        entries.append((initial_loc, fde_addr))
+    return entries
+
+
+def _build_eh_frame_hdr(hdr_vaddr: int, eh_frame_vaddr: int, entries: List[Tuple[int, int]]) -> bytes:
+    """Inverse of _parse_eh_frame_hdr, always emitting GCC's own default
+    encoding scheme (`pcrel`/`sdata4` for the eh_frame_ptr field,
+    `udata4` for fde_count, `datarel`/`sdata4` for the table -- the same
+    scheme _parse_eh_frame_hdr already knows how to read, so a hdr this
+    function builds is always itself re-parseable) regardless of what
+    encoding scheme the *input* entries were originally read with.
+    `entries` must already be sorted ascending by initial_loc -- the ABI
+    requires this for the binary search the table exists to support to
+    actually work."""
+    eh_frame_ptr_field_vaddr = hdr_vaddr + 4
+    out = bytearray([1, 0x1B, 0x03, 0x3B])
+    out += struct.pack("<i", eh_frame_vaddr - eh_frame_ptr_field_vaddr)
+    out += struct.pack("<I", len(entries))
+    for initial_loc, fde_addr in entries:
+        out += struct.pack("<ii", initial_loc - hdr_vaddr, fde_addr - hdr_vaddr)
     return bytes(out)
 
 
@@ -288,6 +430,13 @@ class ElfEmbedder:
             self.input_path, list_elf_imports, resolve_elf, search_dirs, self.lib_dir, self.exclude
         )
         order = embed_order(graph)
+        # Names the *host* itself directly lists in its own DT_NEEDED --
+        # as opposed to a node that's only reachable *transitively*
+        # (needed by some other embedded dependency, not by the host).
+        # Only a direct name has anything to neutralize in the host's own
+        # dynamic section at all; see its one use, further down, for why
+        # treating every node in `order` as if it had one is wrong.
+        host_direct_import_names = set(list_elf_imports(self.input_path))
 
         if not order:
             self.output_path.write_bytes(self.input_path.read_bytes())
@@ -328,6 +477,21 @@ class ElfEmbedder:
         dyn_sz_tag_name = "DT_RELASZ" if dyn_table_key == "RELA" else "DT_RELSZ"
         dyn_table = host_reloc_tables[dyn_table_key]
         dyn_is_rela = dyn_table.is_RELA()
+        ptr_mask = (1 << (ptr_size * 8)) - 1
+
+        def _host_dyn_tag_val(tag_name: str) -> Optional[int]:
+            tag = next(host_dyn.iter_tags(tag_name), None)
+            return tag.entry.d_val if tag is not None else None
+
+        # Needed only if some embedded dependency turns out to have a
+        # remaining external symbol reference to forward (see
+        # `external_symbol_index`, below) -- read unconditionally here
+        # since they're cheap dynamic-tag lookups, not real work.
+        host_symtab_count = host_dyn.num_symbols()
+        host_symtab_vaddr = _host_dyn_tag_val("DT_SYMTAB")
+        host_strtab_vaddr = _host_dyn_tag_val("DT_STRTAB")
+        host_strsz = _host_dyn_tag_val("DT_STRSZ")
+        host_versym_vaddr = _host_dyn_tag_val("DT_VERSYM")
 
         def vaddr_to_offset(vaddr: int, size: int) -> int:
             off = next(elf.address_offsets(vaddr, size), None)
@@ -340,6 +504,43 @@ class ElfEmbedder:
         new_sections: List[Tuple[int, bytes]] = []  # (vaddr, data), contiguous in placement order
         new_reloc_entries: List[Tuple[int, int]] = []  # (host vaddr, value) -> new R_*_RELATIVE entries
         combined_exports: Dict[str, Tuple[int, int]] = {}  # export name -> (X, offset-within-dep)
+        # A symbol an embedded dependency itself still references
+        # externally (through its own, now-dead PT_DYNAMIC/PLT) that no
+        # embedded dependency's own exports satisfy -- e.g. `malloc`,
+        # `__cxa_throw` (C++ exceptions always need at least the former,
+        # even in the simplest possible throw/catch: __cxa_allocate_
+        # exception calls it internally -- there's no way to support
+        # unwind-metadata preservation's own flagship scenario, an
+        # exception crossing the embedding boundary, without this).
+        # Forwarded into the host's own dynamic section (new DT_SYMTAB/
+        # DT_STRTAB/DT_VERSYM entries, further down, past the per-
+        # dependency loop) as a brand new, genuinely-external,
+        # R_*_GLOB_DAT-resolved import -- exactly as if the *host* had
+        # referenced it directly -- rather than something this module
+        # tries to resolve itself (unlike `combined_exports`, there's no
+        # static address to resolve here at all: the real provider, e.g.
+        # libc, is loaded and relocated by ld.so at a load-time-chosen
+        # address this module can't know). Keyed by name; value is this
+        # symbol's index in the *grown* host .dynsym (assigned in
+        # insertion order, starting right after the host's existing
+        # entries -- see where it's grown, further down).
+        external_symbol_index: Dict[str, int] = {}
+        new_glob_dat_entries: List[Tuple[int, int]] = []  # (slot vaddr, symbol index) -> new R_*_GLOB_DAT entries
+        # (initial_loc, fde_addr) pairs, absolute vaddrs already shifted
+        # by each dependency's own delta -- collected so the host's own
+        # .eh_frame_hdr binary-search table can be grown to cover them
+        # too (see the merge block past the per-dependency loop, and
+        # ElfEmbedder.embed()'s docstring, for why nothing here ever
+        # needs to touch the FDE/CIE bytes themselves).
+        collected_eh_entries: List[Tuple[int, int]] = []
+        # Resolved absolute VAs of every embedded dependency's own
+        # DT_INIT_ARRAY entries (its .init_array constructors -- already
+        # relocated to their final addresses by the time they're read,
+        # since .init_array slots are themselves normal R_*_RELATIVE
+        # targets processed like any other), flattened in
+        # dependencies-first order, for the generated stub to call.
+
+        init_array_calls: List[int] = []
 
         # -- base-address reservation for fixed-base (non-PIC) dependencies --
         # A dependency whose own ELF header says ET_EXEC (not ET_DYN) was
@@ -439,6 +640,63 @@ class ElfEmbedder:
         min_vaddr_for_eof = len(raw) + ext_skew
         next_vaddr = _align_up(max(min_vaddr_for_memsz, min_vaddr_for_eof), ext_align)
 
+        # The host's own PT_GNU_EH_FRAME entry (if any), found the same
+        # way as `ext_idx`/`phdr_idx` -- needed only if some embedded
+        # dependency turns out to have unwind info to merge (see the
+        # merge block past the per-dependency loop).
+        host_gnu_eh_frame_idx = next(
+            (i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_GNU_EH_FRAME"), None
+        )
+
+        def _resolve_dep_reference(sym, blob: bytearray, blob_offset: int, X: int, dep_base: int,
+                                    node_name: str, addend: int) -> None:
+            """Resolve a dependency's own reference to `sym` (anything
+            that isn't a plain load-bias-only R_*_RELATIVE entry, which
+            callers handle inline themselves without needing this) and
+            record whatever new *host*-level relocation entry keeps it
+            correct, exactly mirroring how the embedded dependency's own
+            relocation would have been processed had it still been
+            independently loaded:
+              - a self-reference, or a reference to an *earlier*
+                dependency's own export (dependencies-first order means
+                those are already in `combined_exports` by the time a
+                later dependency is processed) -- resolve directly, same
+                as step 3's host GOT/PLT patch further down (a new
+                R_*_RELATIVE entry).
+              - a weak, still-unresolved reference -- zero it, exactly
+                as ld.so itself would (see the long-standing comment
+                this mirrors, in the RELA/REL loop below).
+              - anything else undefined -- a genuinely external
+                reference no embedded dependency provides -- forward it
+                into the host's own dynamic section instead (see
+                `external_symbol_index`'s own declaration for why; a new
+                R_*_GLOB_DAT entry, not RELATIVE, since the real address
+                is only known at load time, via ld.so's own by-name
+                lookup, not something this module resolves itself)."""
+            if sym.name and sym.name in combined_exports:
+                exp_X, exp_off = combined_exports[sym.name]
+                new_val = (exp_X + exp_off + addend) & ptr_mask
+                _write_int(blob, blob_offset, ptr_size, new_val)
+                new_reloc_entries.append((X + blob_offset, new_val))
+                return
+            if sym["st_shndx"] == "SHN_UNDEF":
+                if sym["st_info"]["bind"] == "STB_WEAK":
+                    _write_int(blob, blob_offset, ptr_size, 0)
+                    return
+                if not sym.name:
+                    raise ValueError(
+                        f"dependency '{node_name}' has an unresolved, unnamed external "
+                        "symbol reference; can't forward it to the host"
+                    )
+                if sym.name not in external_symbol_index:
+                    external_symbol_index[sym.name] = host_symtab_count + len(external_symbol_index)
+                _write_int(blob, blob_offset, ptr_size, 0)
+                new_glob_dat_entries.append((X + blob_offset, external_symbol_index[sym.name]))
+                return
+            new_val = (X + (sym["st_value"] - dep_base) + addend) & ptr_mask
+            _write_int(blob, blob_offset, ptr_size, new_val)
+            new_reloc_entries.append((X + blob_offset, new_val))
+
         # -- per-dependency: copy, relocate, and remove its DT_NEEDED -----
         for node in order:
             with open(node.path, "rb") as depf:
@@ -483,12 +741,6 @@ class ElfEmbedder:
                     raise ValueError(f"dependency '{node.name}' has no PT_DYNAMIC segment")
 
                 dep_reloc_tables = dep_dyn.get_relocation_tables()
-                if "JMPREL" in dep_reloc_tables and dep_reloc_tables["JMPREL"].num_relocations() > 0:
-                    raise ValueError(
-                        f"dependency '{node.name}' itself calls external functions through "
-                        "its own PLT; embedding dependencies with further external "
-                        "requirements isn't supported yet"
-                    )
 
                 for key in ("RELA", "REL"):
                     table = dep_reloc_tables.get(key)
@@ -510,42 +762,81 @@ class ElfEmbedder:
                             base_value = (
                                 reloc["r_addend"] if is_rela else _read_int(blob, blob_offset, ptr_size)
                             )
-                            new_val = base_value + delta
-                        else:
-                            sym = dep_dyn.get_symbol(reloc["r_info_sym"])
-                            if sym["st_shndx"] == "SHN_UNDEF":
-                                if sym["st_info"]["bind"] == "STB_WEAK":
-                                    # Every GCC-built shared object links in
-                                    # crtstuff's weak references to
-                                    # __cxa_finalize/__gmon_start__/the
-                                    # _ITM_*TMCloneTable hooks via
-                                    # R_*_GLOB_DAT, regardless of what the
-                                    # user's own code does -- this isn't a
-                                    # dependency-specific "further external
-                                    # requirement", it's unconditional
-                                    # toolchain boilerplate. A weak
-                                    # undefined symbol left unresolved is
-                                    # normal ELF semantics: ld.so itself
-                                    # just resolves it to NULL when nothing
-                                    # provides it (callers are required to
-                                    # null-check before using it), so
-                                    # explicitly zero the slot and move on
-                                    # -- exactly what ld.so would have done.
-                                    _write_int(blob, blob_offset, ptr_size, 0)
-                                    continue
-                                raise ValueError(
-                                    f"dependency '{node.name}' has an unresolved external "
-                                    f"symbol reference ('{sym.name}'); embedding dependencies "
-                                    "with further external requirements isn't supported yet"
-                                )
-                            if rtype != R_ABS_PLUS_ADDEND:
-                                raise ValueError(
-                                    f"unsupported relocation type {rtype} in dependency '{node.name}'"
-                                )
-                            addend = reloc["r_addend"] if is_rela else 0
-                            new_val = X + (sym["st_value"] - dep_base) + addend
-                        _write_int(blob, blob_offset, ptr_size, new_val)
-                        new_reloc_entries.append((X + blob_offset, new_val & ((1 << (ptr_size * 8)) - 1)))
+                            new_val = (base_value + delta) & ptr_mask
+                            _write_int(blob, blob_offset, ptr_size, new_val)
+                            new_reloc_entries.append((X + blob_offset, new_val))
+                            continue
+                        if rtype not in (R_ABS_PLUS_ADDEND, R_GLOB_DAT):
+                            raise ValueError(
+                                f"unsupported relocation type {rtype} in dependency '{node.name}'"
+                            )
+                        sym = dep_dyn.get_symbol(reloc["r_info_sym"])
+                        addend = reloc["r_addend"] if is_rela else 0
+                        # See _resolve_dep_reference's own docstring for
+                        # the self/earlier-dependency-export vs. weak vs.
+                        # genuinely-external cases it handles -- R_*_GLOB_DAT
+                        # here (rather than the more usual
+                        # R_*_ABS_PLUS_ADDEND) for a symbol *defined* within
+                        # this same dependency means it's one of its own
+                        # exports (default/global visibility): GCC can't
+                        # assume a reference to a global-bound, exported
+                        # mutable data symbol is necessarily *its own*
+                        # definition (another loaded object could preempt/
+                        # interpose it), so even a same-module reference
+                        # goes through the GOT, resolved via symbol lookup
+                        # rather than a plain load-bias-only fixup. Confirmed
+                        # by a real crash (ValueError, not a silent
+                        # miscompute) building this task's own
+                        # `lib_ctor_b.c` fixture, whose non-`static`
+                        # `b_ctor_ran` global triggers exactly this -- with
+                        # no actual interposition happening here (this
+                        # dependency's own copy is the only one ever
+                        # loaded), resolving it to its own address is
+                        # correct either way.
+                        _resolve_dep_reference(sym, blob, blob_offset, X, dep_base, node.name, addend)
+
+                # A dependency's own PLT entries (DT_JMPREL) are always
+                # R_*_JUMP_SLOT, always against an undefined (external)
+                # symbol by construction -- *unless* it's a symbol some
+                # earlier-processed (dependencies-first order) embedded
+                # dependency itself exports, which _resolve_dep_reference
+                # also handles. An earlier version of this method rejected
+                # a dependency with *any* JMPREL entries outright ("further
+                # external requirements aren't supported yet"); unwind-
+                # metadata preservation's own flagship scenario -- a C++
+                # exception crossing the embedding boundary -- makes that
+                # genuinely unworkable to keep: even the simplest possible
+                # `throw` calls `__cxa_throw`, which calls `malloc`
+                # internally, through the dependency's own PLT. Verified by
+                # actually forwarding a synthetic external import this way
+                # and running the result on real Linux (WSL) before wiring
+                # this in, for both 32- and 64-bit -- including the
+                # .gnu.version/DT_VERSYM-array-growth part, which silent
+                # static reasoning alone couldn't settle (ld.so's relocation
+                # processing indexes it by the *same* symbol-table index as
+                # the new symbol, so leaving it ungrown risks an out-of-
+                # bounds read deciding a bogus required symbol version).
+                jmprel = dep_reloc_tables.get("JMPREL")
+                if jmprel is not None:
+                    is_rela = jmprel.is_RELA()
+                    for reloc in jmprel.iter_relocations():
+                        rtype = reloc["r_info_type"]
+                        if rtype == R_NONE:
+                            continue
+                        if rtype not in (R_JUMP_SLOT, R_ABS_PLUS_ADDEND, R_GLOB_DAT):
+                            raise ValueError(
+                                f"unsupported PLT relocation type {rtype} in dependency '{node.name}'"
+                            )
+                        target_vaddr = reloc["r_offset"]
+                        blob_offset = target_vaddr - dep_base
+                        if blob_offset < 0 or blob_offset + ptr_size > blob_size:
+                            raise ValueError(
+                                f"PLT relocation target {hex(target_vaddr)} in dependency "
+                                f"'{node.name}' falls outside its own PT_LOAD segments"
+                            )
+                        sym = dep_dyn.get_symbol(reloc["r_info_sym"])
+                        addend = reloc["r_addend"] if is_rela else 0
+                        _resolve_dep_reference(sym, blob, blob_offset, X, dep_base, node.name, addend)
 
                 for i in range(dep_dyn.num_symbols()):
                     sym = dep_dyn.get_symbol(i)
@@ -557,18 +848,126 @@ class ElfEmbedder:
                     ):
                         combined_exports[sym.name] = (X, sym["st_value"] - dep_base)
 
-                # Deliberately not collecting/calling this dependency's own
-                # DT_INIT/DT_INIT_ARRAY entries -- see embed()'s docstring
-                # for why (verified-unsafe on x86).
+                # This dependency's own .init_array constructors -- already
+                # relocated to their final absolute addresses in `blob` by
+                # the RELA/REL loop above, since each slot is itself a
+                # normal R_*_RELATIVE target -- for the generated stub
+                # (build_linux_stub) to call. Deliberately *not* collecting/
+                # calling DT_INIT (legacy `_init`, a single crtstuff-
+                # provided entry point, separate from DT_INIT_ARRAY): on a
+                # modern GCC/glibc toolchain it's boilerplate with an empty
+                # body for a plain `-shared` build (DT_INIT_ARRAY -- what
+                # `__attribute__((constructor))` actually populates, and
+                # what this task's own fixtures exercise -- carries every
+                # real constructor instead), and Task 4's own docstring
+                # already found calling *other* crtstuff-provided init
+                # machinery directly, cold, to be unsafe on x86 -- no
+                # reason to take on that same risk for a part no fixture
+                # here needs.
+                dep_init_array_vaddr = next(
+                    (t.entry.d_val for t in dep_dyn.iter_tags("DT_INIT_ARRAY")), None
+                )
+                dep_init_array_sz = next(
+                    (t.entry.d_val for t in dep_dyn.iter_tags("DT_INIT_ARRAYSZ")), None
+                )
+                if dep_init_array_vaddr is not None and dep_init_array_sz:
+                    for i in range(dep_init_array_sz // ptr_size):
+                        off = (dep_init_array_vaddr - dep_base) + i * ptr_size
+                        init_array_calls.append(_read_int(blob, off, ptr_size))
 
-                if not _remove_needed(host_dyn, raw, ptr_size, node.name):
-                    raise ValueError(f"expected DT_NEEDED entry for '{node.name}' not found in host")
+                # This dependency's own unwind info, if it has any -- see
+                # _parse_eh_frame_hdr's docstring for why only these two
+                # numbers per FDE (never the FDE/CIE bytes themselves) ever
+                # need reading, and the merge block past this loop for how
+                # they get folded into the host's own .eh_frame_hdr.
+                dep_eh_hdr_seg = next(dep.iter_segments(type="PT_GNU_EH_FRAME"), None)
+                if dep_eh_hdr_seg is not None:
+                    hdr_vaddr = dep_eh_hdr_seg["p_vaddr"]
+                    hdr_off_in_blob = hdr_vaddr - dep_base
+                    hdr_bytes = bytes(blob[hdr_off_in_blob: hdr_off_in_blob + dep_eh_hdr_seg["p_filesz"]])
+                    for initial_loc, fde_addr in _parse_eh_frame_hdr(hdr_bytes, hdr_vaddr):
+                        collected_eh_entries.append((initial_loc + delta, fde_addr + delta))
+
+                # Only a node the *host* directly lists in its own
+                # DT_NEEDED has anything to neutralize there at all -- a
+                # transitive-only node (needed by some other embedded
+                # dependency, e.g. this task's own lib_ctor_a->lib_ctor_b
+                # fixture) has no entry of its own in the host's dynamic
+                # section to begin with; its DT_NEEDED edge lives inside
+                # *that other dependency's* own (already-copied-into-
+                # `blob`, now-inert) PT_DYNAMIC segment instead, which
+                # nothing ever reads again once that dependency is no
+                # longer independently loaded as a module -- so there's
+                # nothing to do here for it, and treating its absence as
+                # an error (as an earlier version of this method did)
+                # was itself the bug: it assumed every embedded node is
+                # always a *direct* host import, which a real transitive
+                # chain disproves.
+                if node.name in host_direct_import_names:
+                    if not _remove_needed(host_dyn, raw, ptr_size, node.name):
+                        raise ValueError(f"expected DT_NEEDED entry for '{node.name}' not found in host")
 
                 if is_fixed_base:
                     fixed_base_segments.append((X, bytes(blob)))
                 else:
                     new_sections.append((X, bytes(blob)))
                     next_vaddr = _align_up(X + blob_size, _PAGE)
+
+        # -- forward embedded dependencies' remaining external symbol
+        #    references into the host's own dynamic section (see
+        #    `external_symbol_index`'s own declaration for the full "why")
+        #    -- grow .dynsym/.dynstr (and .gnu.version/DT_VERSYM, if the
+        #    host has one, kept in lockstep since ld.so's relocation
+        #    processing indexes it by the very same symbol-table index) as
+        #    brand new, bigger combined tables, same append-past-the-end-
+        #    and-repoint-the-DT_*-tag pattern already used for the combined
+        #    relocation table just below (and PE's own import-directory
+        #    rebuild) -- growing any of these three in place isn't
+        #    generally safe either, for the same reason.
+        if external_symbol_index:
+            if host_symtab_vaddr is None or host_strtab_vaddr is None or host_strsz is None:
+                raise ValueError(
+                    f"'{self.input_path}' is missing DT_SYMTAB/DT_STRTAB/DT_STRSZ; can't "
+                    "forward an embedded dependency's external symbol references into it"
+                )
+            sym_entry_size = 24 if is64 else 16
+            old_dynsym_off = vaddr_to_offset(host_symtab_vaddr, host_symtab_count * sym_entry_size)
+            old_dynsym_bytes = bytes(raw[old_dynsym_off: old_dynsym_off + host_symtab_count * sym_entry_size])
+            old_dynstr_off = vaddr_to_offset(host_strtab_vaddr, host_strsz)
+            old_dynstr_bytes = bytes(raw[old_dynstr_off: old_dynstr_off + host_strsz])
+
+            new_dynstr_bytes = bytearray(old_dynstr_bytes)
+            new_dynsym_bytes = bytearray(old_dynsym_bytes)
+            for name in external_symbol_index:  # dict preserves insertion order == assigned index order
+                name_off = len(new_dynstr_bytes)
+                new_dynstr_bytes += name.encode("ascii") + b"\x00"
+                new_dynsym_bytes += _pack_undef_sym(is64, name_off)
+
+            dynsym_vaddr = next_vaddr
+            new_sections.append((dynsym_vaddr, bytes(new_dynsym_bytes)))
+            next_vaddr = _align_up(dynsym_vaddr + len(new_dynsym_bytes), ptr_size)
+
+            dynstr_vaddr = next_vaddr
+            new_sections.append((dynstr_vaddr, bytes(new_dynstr_bytes)))
+            next_vaddr = _align_up(dynstr_vaddr + len(new_dynstr_bytes), _PAGE)
+
+            _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_SYMTAB", dynsym_vaddr)
+            _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_STRTAB", dynstr_vaddr)
+            _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_STRSZ", len(new_dynstr_bytes))
+
+            if host_versym_vaddr is not None:
+                old_versym_off = vaddr_to_offset(host_versym_vaddr, host_symtab_count * 2)
+                old_versym_bytes = bytes(raw[old_versym_off: old_versym_off + host_symtab_count * 2])
+                # 0 (VER_NDX_LOCAL) per new entry: "no version requirement"
+                # for this (our own, newly forwarded) reference -- an
+                # ordinary unversioned lookup, verified end-to-end against
+                # a real `malloc` import on real Linux (WSL, both 32- and
+                # 64-bit) before wiring this in; see this method's docstring.
+                new_versym_bytes = old_versym_bytes + b"\x00\x00" * len(external_symbol_index)
+                versym_vaddr = next_vaddr
+                new_sections.append((versym_vaddr, new_versym_bytes))
+                next_vaddr = _align_up(versym_vaddr + len(new_versym_bytes), _PAGE)
+                _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_VERSYM", versym_vaddr)
 
         # -- patch the host's GOT/PLT references to embedded exports -----
         patch_specs = [(dyn_table_key, dyn_tag_name)]
@@ -601,15 +1000,48 @@ class ElfEmbedder:
                 entry_off = table_file_offset + idx * entry_size
                 raw[entry_off:entry_off + entry_size] = b"\x00" * entry_size
 
+        # -- generated entrypoint stub (calls each embedded dependency's
+        #    own .init_array constructors, in dependencies-first order,
+        #    then jumps to the original entry) -- see build_linux_stub's
+        #    own docstring for exactly what it does and doesn't do (the
+        #    dlopen/dlsym hook `hooked_names` implies isn't implemented
+        #    yet). Only installed when there's actually something for it
+        #    to do (`init_array_calls` non-empty) -- e_entry is otherwise
+        #    left completely untouched, exactly as before this task,
+        #    rather than installing a stub that would just immediately
+        #    tail-jump with no other effect. Must run *before* the
+        #    combined relocation table just below, since the stub's own
+        #    embedded absolute-VA immediates need new R_*_RELATIVE entries
+        #    of their own (for ASLR-safety -- see build_linux_stub's
+        #    docstring), and that table is built once, from whatever's in
+        #    `new_reloc_entries` at that point.
+        if init_array_calls:
+            original_entry_va = elf["e_entry"]
+            stub_vaddr = next_vaddr
+            stub_bytes, stub_reloc_offsets = build_linux_stub(
+                [node.name for node in order],
+                set(),
+                is64=is64,
+                init_calls=init_array_calls,
+                original_entry=original_entry_va,
+            )
+            new_sections.append((stub_vaddr, stub_bytes))
+            next_vaddr = _align_up(stub_vaddr + len(stub_bytes), _PAGE)
+            for off in stub_reloc_offsets:
+                new_reloc_entries.append((stub_vaddr + off, _read_int(stub_bytes, off, ptr_size)))
+        else:
+            stub_vaddr = None
+
         # -- combined relocation table -------------------------------------
-        if new_reloc_entries:
+        if new_reloc_entries or new_glob_dat_entries:
             _, orig_table_offset = host_dyn.get_table_offset(dyn_tag_name)
             orig_size_tag = next(host_dyn.iter_tags(dyn_sz_tag_name), None)
             orig_table_size = orig_size_tag.entry.d_val if orig_size_tag is not None else 0
             orig_table_bytes = bytes(raw[orig_table_offset:orig_table_offset + orig_table_size])
 
             new_entries_bytes = _pack_relative_entries(new_reloc_entries, is64, dyn_is_rela)
-            combined_bytes = orig_table_bytes + new_entries_bytes
+            new_glob_dat_bytes = _pack_glob_dat_entries(new_glob_dat_entries, is64, dyn_is_rela)
+            combined_bytes = orig_table_bytes + new_entries_bytes + new_glob_dat_bytes
 
             reloc_table_vaddr = next_vaddr
             new_sections.append((reloc_table_vaddr, combined_bytes))
@@ -617,6 +1049,69 @@ class ElfEmbedder:
 
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_tag_name, reloc_table_vaddr)
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_sz_tag_name, len(combined_bytes))
+
+        # -- merge embedded dependencies' unwind info into the host's own
+        #    .eh_frame_hdr binary-search table --
+        #
+        # Once a dependency is embedded, it no longer has a PT_GNU_EH_FRAME
+        # segment -- or module -- of its own: dl_iterate_phdr (what
+        # _Unwind_Find_FDE actually walks to find unwind info for a given
+        # PC) only ever sees the *host's* program headers now, so an
+        # unwind through a PC that's now inside embedded dependency code
+        # only succeeds if the *host's* own .eh_frame_hdr table has an
+        # entry covering it. The dependency's FDEs themselves need no
+        # changes at all to stay valid (see _parse_eh_frame_hdr's
+        # docstring) -- only the table of (initial_loc, fde_addr) pairs
+        # that lets the unwinder *find* them needs to grow to list them,
+        # each already shifted by its own dependency's `delta` (collected
+        # into `collected_eh_entries` during the per-dependency loop
+        # above). A brand new, bigger table is built here (same append-
+        # and-repoint pattern as everything else in this method) rather
+        # than growing the existing one in place, and the host's *existing*
+        # PT_GNU_EH_FRAME program-header entry is overwritten in place to
+        # point at it -- unlike the phdr-array-growth case further down,
+        # this only ever *edits* an already-existing entry, never adds a
+        # new one, so it's needed in both the fixed_base_segments and
+        # non-fixed_base_segments branches below alike.
+        eh_hdr_update: Optional[bytes] = None
+        if collected_eh_entries:
+            if host_gnu_eh_frame_idx is None:
+                raise ValueError(
+                    f"'{self.input_path}' has no PT_GNU_EH_FRAME segment to merge "
+                    "an embedded dependency's unwind info into"
+                )
+            host_eh_hdr_seg = all_host_segments[host_gnu_eh_frame_idx]
+            host_hdr_vaddr = host_eh_hdr_seg["p_vaddr"]
+            host_hdr_size = host_eh_hdr_seg["p_filesz"]
+            host_hdr_file_off = vaddr_to_offset(host_hdr_vaddr, host_hdr_size)
+            host_hdr_bytes = bytes(raw[host_hdr_file_off: host_hdr_file_off + host_hdr_size])
+            host_eh_entries = _parse_eh_frame_hdr(host_hdr_bytes, host_hdr_vaddr)
+            # The host's own .eh_frame start never moves (nothing in this
+            # method ever relocates the host's *own*, pre-existing
+            # content) -- re-derive it from the host's own hdr rather than
+            # hardcoding anything, and keep using it as the regenerated
+            # hdr's own eh_frame_ptr field too (that field is otherwise
+            # unused by the dl_iterate_phdr/hdr-table-based unwind path
+            # this relies on; see _build_eh_frame_hdr).
+            eh_frame_ptr_enc = host_hdr_bytes[1]
+            if eh_frame_ptr_enc == _DW_EH_PE_OMIT:
+                raise ValueError(
+                    f"'{self.input_path}': its .eh_frame_hdr has no eh_frame_ptr field"
+                )
+            host_eh_frame_vaddr = _decode_eh_pe_sdata4(
+                eh_frame_ptr_enc, struct.unpack_from("<i", host_hdr_bytes, 4)[0], host_hdr_vaddr + 4, host_hdr_vaddr
+            )
+
+            combined_entries = sorted(host_eh_entries + collected_eh_entries, key=lambda e: e[0])
+            new_hdr_vaddr = next_vaddr
+            new_hdr_bytes = _build_eh_frame_hdr(new_hdr_vaddr, host_eh_frame_vaddr, combined_entries)
+            new_sections.append((new_hdr_vaddr, new_hdr_bytes))
+            next_vaddr = _align_up(new_hdr_vaddr + len(new_hdr_bytes), _PAGE)
+
+            eh_hdr_update = _pack_phdr(
+                is64, PT_GNU_EH_FRAME, host_eh_hdr_seg["p_flags"], new_hdr_vaddr - ext_skew, new_hdr_vaddr,
+                new_hdr_vaddr, len(new_hdr_bytes), len(new_hdr_bytes), host_eh_hdr_seg["p_align"],
+            )
 
         # -- reserve room for a grown program header array, if any fixed-
         #    base dependency needs its own new PT_LOAD entry (see the large
@@ -736,6 +1231,9 @@ class ElfEmbedder:
         if not fixed_base_segments:
             entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
             raw[entry_off:entry_off + len(extended_entry)] = extended_entry
+            if eh_hdr_update is not None:
+                eh_entry_off = elf["e_phoff"] + host_gnu_eh_frame_idx * elf["e_phentsize"]
+                raw[eh_entry_off:eh_entry_off + len(eh_hdr_update)] = eh_hdr_update
         else:
             # Grow the program header array itself: copy the *original*
             # array byte-for-byte (still untouched, at its original
@@ -756,6 +1254,8 @@ class ElfEmbedder:
             old_array_bytes = bytes(raw[elf["e_phoff"]: elf["e_phoff"] + old_phnum * entsize])
             new_array = bytearray(old_array_bytes)
             new_array[ext_idx * entsize:(ext_idx + 1) * entsize] = extended_entry
+            if eh_hdr_update is not None:
+                new_array[host_gnu_eh_frame_idx * entsize:(host_gnu_eh_frame_idx + 1) * entsize] = eh_hdr_update
 
             placeholder_file_offset = phdr_array_vaddr - ext_skew
 
@@ -820,6 +1320,14 @@ class ElfEmbedder:
             _write_int(raw, e_phoff_off, ptr_size, placeholder_file_offset)
             _write_int(raw, e_phnum_off, 2, old_phnum + len(fixed_base_segments))
 
-        # e_entry is deliberately never touched -- see embed()'s docstring.
+        # e_entry is overwritten to point at the generated stub only when
+        # one was actually built (`stub_vaddr` set above, by the
+        # init_array_calls-gated block); otherwise it's left completely
+        # untouched. e_entry is a fixed, ptr-sized field immediately
+        # following e_ident/e_type/e_machine/e_version in every ELF32/
+        # ELF64 header alike.
+        if stub_vaddr is not None:
+            e_entry_off = 16 + 2 + 2 + 4
+            _write_int(raw, e_entry_off, ptr_size, stub_vaddr)
 
         self.output_path.write_bytes(bytes(raw))

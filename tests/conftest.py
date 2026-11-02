@@ -147,8 +147,19 @@ def build_shared_lib(
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
-        lang_flags = (["/TP"] if cpp else []) + list(extra_flags or [])
-        _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"] + lang_flags)
+        if cpp:
+            # /TP ("treat every file on this command line as C++ source")
+            # applies to *every* argument, not just the primary source --
+            # mixing it into the same invocation as /LD's link inputs
+            # (extra_flags may contain more .lib/.obj paths) makes cl.exe
+            # try to *compile* those too, producing garbage syntax errors.
+            # Compile-only first (plain object file, no /LD -- that flag's
+            # DLL-building behavior belongs to the link step), then link
+            # separately with no /TP in sight.
+            _run([cl_path, "/nologo", "/c", "/TP", str(source), f"/Fo{obj}"])
+            _run([cl_path, "/nologo", "/LD", str(obj), f"/Fe{out}"] + list(extra_flags or []))
+        else:
+            _run([cl_path, "/nologo", "/LD", str(source), f"/Fe{out}", f"/Fo{obj}"] + list(extra_flags or []))
         if strip_relocs:
             _strip_pe_relocations(out)
         return out
@@ -215,12 +226,22 @@ def build_exe(
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
-        lang_flags = (["/TP"] if cpp else []) + list(extra_flags or [])
         link_libs = [_msvc_import_lib_for(lib) for lib in libs]
-        _run(
-            [cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}"]
-            + [str(lib) for lib in link_libs] + lang_flags
-        )
+        if cpp:
+            # See build_shared_lib's identical comment: /TP applies to
+            # every argument on the command line, so it can't be mixed
+            # into the same invocation as the .lib link inputs below --
+            # compile-only first, then link with no /TP at all.
+            _run([cl_path, "/nologo", "/c", "/TP", str(source), f"/Fo{obj}"])
+            _run(
+                [cl_path, "/nologo", str(obj), f"/Fe{out}"]
+                + [str(lib) for lib in link_libs] + list(extra_flags or [])
+            )
+        else:
+            _run(
+                [cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}"]
+                + [str(lib) for lib in link_libs] + list(extra_flags or [])
+            )
         return out
 
     compiler = _gnu_cpp_compiler_for_bits(bits) if cpp else _gnu_compiler_for_bits(bits)
