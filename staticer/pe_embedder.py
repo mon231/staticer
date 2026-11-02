@@ -342,6 +342,15 @@ class PortableExecutableEmbedder:
                                 f".sgap{len(new_sections)}".encode("ascii"), b"", next_rva,
                                 _SCN_UNINIT_RW, X - next_rva,
                             ))
+                            # The filler's own bridging range is now a real
+                            # section in the final section table too (it
+                            # physically claims those RVAs even though it
+                            # has no raw content) -- a later dependency
+                            # landing inside it would be just as malformed
+                            # a collision as landing inside the host's or
+                            # another dependency's actual data, so it must
+                            # be checked against too.
+                            occupied_ranges.append((next_rva, X, f"{node.name}'s alignment-gap filler"))
 
                     exports_by_name = {}
                     if hasattr(dep, "DIRECTORY_ENTRY_EXPORT"):
