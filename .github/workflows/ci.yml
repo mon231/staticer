@@ -38,7 +38,13 @@ jobs:
       if: runner.os == 'Windows'
       uses: ilammy/msvc-dev-cmd@v1
 
-    # ubuntu-latest already provides gcc and clang, so no extra setup is needed.
+    # ubuntu-latest ships gcc/clang for 64-bit builds, but not the 32-bit
+    # multilib support the test suite's [32]-parametrized ELF fixtures
+    # need (-m32); without it those fail with a RuntimeError from the
+    # build helper instead of skipping cleanly.
+    - name: Install 32-bit build support (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
 
     - name: Run tests
       run: pytest -v
