@@ -142,6 +142,13 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   task's scope per the brief; such dependencies fail loudly instead). Both are
   explicit, documented scope calls, not oversights — flagging for review.
 
+- **Flagged by user for a future task**: a `_tls_index` problem (PE TLS directory
+  handling — likely relevant wherever a dependency or host uses
+  `__declspec(thread)`/`_tls_index`-based thread-local storage, intersecting
+  with Task 7's stub/entrypoint work or Task 10's real-binary embedding).
+  Not yet investigated — revisit when Task 7 or Task 10 touches TLS-bearing
+  binaries.
+
 ## What's next
 
 - Tasks 4, 5, 6 all complete, reviews closed.
