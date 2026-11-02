@@ -21,6 +21,8 @@ And use the correct version of pip for python3.
 staticer <input> -o <output> [--exclude NAME[,NAME...]] [--lib-dir PATH]
 ```
 
+**NOTE** `-o`/`--output` overwrites an existing file at that path without warning or backup.
+
 ## Goals & Parctice
 We want to get en executable-file and embed its dependencies recursively. <br />
 We need to patch the executable-file's import-table and prevent it from loading the dynamic libraries. <br />
@@ -36,3 +38,9 @@ Or make them call the original functions, if they try to access dynamic-librarie
 **NOTE** OS-based / C++ `exception` unwinding works across embedded-dependency boundaries (unwind metadata is preserved); a self-contained embedded module that both throws and catches internally may still hit compiler-specific personality-routine details beyond the documented ABI
 **NOTE** we currently do NOT support invoking `elf-destructor` / `DllMain` process-detach
 **NOTE** we might never support `DllMain` invoking for thread attach/detach reasons
+
+## Limitations
+- Explicit dynamic-loading from the executed code itself (`dlopen`+`dlsym` / `LoadLibraryW`+`GetProcAddress`) is not hooked yet; only dependencies resolved through the input's own import/dynamic-section table are embedded.
+- A "full closure" embed on ELF still bottoms out at glibc's own dynamic linker/loader internals, which stay dynamically linked rather than embedded.
+- Process-detach cleanup (`elf-destructor` / `DllMain` `DLL_PROCESS_DETACH`) is not invoked for embedded dependencies, and thread attach/detach notifications may never be supported.
+- `-o`/`--output` silently overwrites an existing file at that path (see Usage above).
