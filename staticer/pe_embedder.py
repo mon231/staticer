@@ -7,9 +7,14 @@ and the no-relocation-data ("fixed-base"/non-PIC) case -- the dependency is
 instead placed at the fixed address its own preferred ImageBase demands,
 reserved against the host's own image and every other such dependency.
 Either way, the host's references to it are patched to the embedded
-addresses and its import-table entry is removed. Unwind-metadata
-preservation and the real generated entrypoint stub are later tasks; see
-``embed()`` docstring for exactly what's simplified here.
+addresses and its import-table entry is removed. Each dependency's own
+``.pdata``/``.xdata`` (x64 unwind metadata) is merged into the host's own
+exception directory, and the generated entrypoint stub (see
+``staticer/stubs/windows/pe_stub.py``) runs each embedded dependency's own
+entry point before handing off to the host's original one; see
+``embed()``'s docstring for exactly what's simplified in the stub (it does
+not yet implement the design's LoadLibraryW/GetProcAddress-interception
+hook).
 """
 
 import os
@@ -20,6 +25,7 @@ from typing import Dict, List, Optional, Set
 import pefile
 
 from .common.depgraph import build_dependency_graph, embed_order
+from .stubs.windows.pe_stub import build_windows_stub
 
 IMAGE_REL_BASED_ABSOLUTE = 0
 IMAGE_REL_BASED_HIGHLOW = 3
@@ -27,6 +33,13 @@ IMAGE_REL_BASED_DIR64 = 10
 
 _IMAGE_DIRECTORY_ENTRY_IMPORT = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]
 _IMAGE_DIRECTORY_ENTRY_BASERELOC = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]
+_IMAGE_DIRECTORY_ENTRY_EXCEPTION = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXCEPTION"]
+
+# x64 UNWIND_INFO flags (IMAGE_DIRECTORY_ENTRY_EXCEPTION's RUNTIME_FUNCTION
+# entries point at one of these per function) -- see _adjust_unwind_info.
+_UNW_FLAG_EHANDLER = 0x1
+_UNW_FLAG_UHANDLER = 0x2
+_UNW_FLAG_CHAININFO = 0x4
 
 _SCN_CODE_RWX = 0x60000020 | 0x80000000  # CNT_CODE|MEM_EXECUTE|MEM_READ|MEM_WRITE
 _SCN_DATA_R = 0x40000040  # CNT_INITIALIZED_DATA|MEM_READ
@@ -71,76 +84,87 @@ def _pack_section_header(name: bytes, virtual_size: int, virtual_address: int,
     )
 
 
-# Each stub builder below returns (bytes, [relative offsets of embedded
-# absolute-VA immediates]). Those immediates are hardcoded addresses the
-# final image must keep correct if it's ever loaded somewhere other than
-# its preferred base (e.g. ASLR, which is on by default for these fixtures)
-# -- so every one of those offsets must become a new base relocation entry
-# in the host, exactly like any other hardcoded absolute address reference.
+def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int, _depth: int = 0) -> None:
+    """Patch the RVA-relative fields *inside* an x64 UNWIND_INFO structure
+    (and any chained UNWIND_INFO it references) by `shift`, in place
+    within `blob`, at the structure's *original* (pre-shift) offset.
+
+    Only two kinds of fields inside UNWIND_INFO are themselves RVAs (and
+    so need the same "+shift" treatment as the RUNTIME_FUNCTION entries
+    that point at them -- see _collect_and_patch_dep_unwind): a trailing
+    exception-handler RVA (present when UNW_FLAG_EHANDLER/UHANDLER is set
+    -- this is what the OS actually calls to run a C++ personality
+    routine/__except filter when an exception unwinds through the
+    function) and a chained RUNTIME_FUNCTION record (when
+    UNW_FLAG_CHAININFO is set, itself recursed into). Everything else --
+    the unwind-code array, and any language-specific exception data
+    following the handler RVA (e.g. GCC's LSDA/call-site table, which
+    encodes landing-pad offsets relative to the function itself, and type
+    pointers via a self-relative/pcrel encoding) -- is already correct
+    after a flat block move, needing no adjustment.
+    """
+    if unwind_rva == 0 or unwind_rva + 4 > len(blob) or _depth > 32:
+        return
+    version_flags = blob[unwind_rva]
+    flags = (version_flags >> 3) & 0x1F
+    count_of_codes = blob[unwind_rva + 2]
+    codes_size = ((count_of_codes + 1) & ~1) * 2
+    extra_off = unwind_rva + 4 + codes_size
+
+    if flags & _UNW_FLAG_CHAININFO:
+        if extra_off + 12 > len(blob):
+            return
+        cbegin, cend, cunwind = struct.unpack_from("<III", blob, extra_off)
+        _adjust_unwind_info(blob, cunwind, shift, _depth + 1)
+        struct.pack_into(
+            "<III", blob, extra_off,
+            cbegin + shift, cend + shift, (cunwind + shift) if cunwind else 0,
+        )
+    elif flags & (_UNW_FLAG_EHANDLER | _UNW_FLAG_UHANDLER):
+        if extra_off + 4 > len(blob):
+            return
+        (handler,) = struct.unpack_from("<I", blob, extra_off)
+        if handler:
+            struct.pack_into("<I", blob, extra_off, handler + shift)
 
 
-def _x64_call_dllmain(hinst_va: int, entry_va: int):
-    # Preserve the real entrypoint's incoming arg registers around our own
-    # call, then call dep_entry(hinstDLL=hinst_va, DLL_PROCESS_ATTACH=1, NULL).
-    prefix = (
-        b"\x51"  # push rcx
-        b"\x52"  # push rdx
-        b"\x41\x50"  # push r8
-        b"\x41\x51"  # push r9
-        b"\x48\x83\xEC\x28"  # sub rsp, 0x28
-    )
-    mov_rcx_op = b"\x48\xB9"  # mov rcx, imm64
-    hinst_off = len(prefix) + len(mov_rcx_op)
-    mid = (
-        b"\xBA\x01\x00\x00\x00"  # mov edx, 1
-        b"\x45\x31\xC0"  # xor r8d, r8d
-    )
-    mov_rax_op = b"\x48\xB8"  # mov rax, imm64
-    entry_off = hinst_off + 8 + len(mid) + len(mov_rax_op)
-    tail = (
-        b"\xFF\xD0"  # call rax
-        b"\x48\x83\xC4\x28"  # add rsp, 0x28
-        b"\x41\x59"  # pop r9
-        b"\x41\x58"  # pop r8
-        b"\x5A"  # pop rdx
-        b"\x59"  # pop rcx
-    )
-    data = (
-        prefix + mov_rcx_op + hinst_va.to_bytes(8, "little") + mid
-        + mov_rax_op + entry_va.to_bytes(8, "little") + tail
-    )
-    return data, [hinst_off, entry_off]
+def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int) -> List[tuple]:
+    """Returns this dependency's own RUNTIME_FUNCTION entries (the
+    IMAGE_DIRECTORY_ENTRY_EXCEPTION/".pdata" table x64 PE images carry,
+    one per function with unwind info), each of the 3 RVA fields -- start,
+    end, unwind-info -- shifted by `shift` to match where `blob`'s bytes
+    end up once placed at host RVA `shift` (mirroring the reloc-delta
+    treatment applied to the dependency's own base relocations elsewhere
+    in embed(), but for these never-base-relocation-listed, pure-RVA
+    references -- see _adjust_unwind_info's docstring for why that's
+    needed at all). Also patches `blob`'s own copy of these fields (and
+    whatever _adjust_unwind_info finds past each UnwindInfoAddress) in
+    place, so `blob`'s internal .pdata/.xdata stay consistent too -- not
+    just the merged copy this returns, which the caller appends into the
+    host's own (combined) exception directory.
 
-
-def _x64_tail_jmp(target_va: int):
-    mov_rax_op = b"\x48\xB8"
-    data = mov_rax_op + target_va.to_bytes(8, "little") + b"\xFF\xE0"
-    return data, [len(mov_rax_op)]
-
-
-def _x86_call_dllmain(hinst_va: int, entry_va: int):
-    # __stdcall DllMain(hinstDLL, fdwReason, lpvReserved) - callee pops its
-    # own 3 args, so the stack is already balanced after `call`.
-    prefix = (
-        b"\x6A\x00"  # push 0            ; lpvReserved
-        b"\x6A\x01"  # push 1            ; DLL_PROCESS_ATTACH
-    )
-    push_op = b"\x68"  # push imm32
-    hinst_off = len(prefix) + len(push_op)
-    mov_eax_op = b"\xB8"  # mov eax, imm32
-    entry_off = hinst_off + 4 + len(mov_eax_op)
-    tail = b"\xFF\xD0"  # call eax
-    data = (
-        prefix + push_op + hinst_va.to_bytes(4, "little")
-        + mov_eax_op + entry_va.to_bytes(4, "little") + tail
-    )
-    return data, [hinst_off, entry_off]
-
-
-def _x86_tail_jmp(target_va: int):
-    mov_eax_op = b"\xB8"
-    data = mov_eax_op + target_va.to_bytes(4, "little") + b"\xFF\xE0"
-    return data, [len(mov_eax_op)]
+    No-op (returns []) for a dependency with no exception directory at
+    all -- the common case for x86 (32-bit) PE images, which don't use
+    this table-based unwind mechanism.
+    """
+    excdir = dep.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_EXCEPTION]
+    if not excdir.Size:
+        return []
+    entries = []
+    base = excdir.VirtualAddress
+    for i in range(excdir.Size // 12):
+        off = base + i * 12
+        if off + 12 > len(blob):
+            break
+        begin, end, unwind = struct.unpack_from("<III", blob, off)
+        if begin == 0 and end == 0 and unwind == 0:
+            continue
+        _adjust_unwind_info(blob, unwind, shift)
+        new_begin, new_end = begin + shift, end + shift
+        new_unwind = (unwind + shift) if unwind else 0
+        struct.pack_into("<III", blob, off, new_begin, new_end, new_unwind)
+        entries.append((new_begin, new_end, new_unwind))
+    return entries
 
 
 class PortableExecutableEmbedder:
@@ -181,9 +205,19 @@ class PortableExecutableEmbedder:
              imports into that same fresh combined import directory, so its
              own runtime needs (e.g. CRT startup calling KERNEL32/msvcrt)
              keep resolving correctly.
-          6. Append a tiny call to the dependency's own entry point
-             (DllMain-style init) into a generated stub that runs before the
-             host's original entrypoint.
+          6. Copy the dependency's own IMAGE_DIRECTORY_ENTRY_EXCEPTION
+             (".pdata"/x64 unwind-info) entries alongside its relocated
+             code, with every RVA field they (and the UNWIND_INFO
+             structures in ".xdata" they point at) carry rewritten to
+             match -- see ``_collect_and_patch_dep_unwind`` -- then merge
+             them into the host's own exception directory (combined with
+             its existing entries, sorted by start RVA, as the ABI
+             requires), so unwinding (a C++ exception, or SEH) still works
+             correctly across the newly embedded code.
+          7. Generate the new entrypoint stub (``build_windows_stub``):
+             one DllMain-style process-attach call per embedded dependency
+             with an entry point, in dependencies-first order, then a
+             tail-jump to the host's original entrypoint.
 
         For a dependency that carries no relocation data at all (a fixed-
         base/non-PIC build), step 1's placement differs: instead of
@@ -193,15 +227,18 @@ class PortableExecutableEmbedder:
         addresses need step 2's relocation-application at all. That address
         range is checked first against the host's own image (and anything
         already placed there) and against every other dependency reserved
-        the same way, raising ``ValueError`` on any overlap. Steps 3-6
-        proceed identically either way.
+        the same way, raising ``ValueError`` on any overlap. Steps 3-7
+        proceed identically either way (including step 6's +RVA-shift
+        unwind-info patching, which is independent of whether the
+        dependency's *other* references needed delta-relocation at all --
+        see ``_adjust_unwind_info``'s docstring).
 
-        Simplification for this task (explicitly deferred, see Task 7):
-        step 6's stub is a flat, unconditional call sequence -- one call per
-        embedded node, in dependencies-first order, then a tail-jump to the
-        original entry point. It does not implement the real generated
-        entrypoint/hook stub (LoadLibrary/GetProcAddress interception,
-        richer init-order semantics); Task 7 replaces it.
+        Simplification for this task (explicitly deferred, see
+        ``staticer/stubs/windows/pe_stub.py``'s module docstring): step 7's
+        stub does not implement the design doc's LoadLibraryW/
+        GetProcAddress interception goal -- ``hooked_names`` is threaded
+        through as an empty mechanism for interface compatibility, not
+        acted on.
         """
         search_dirs = self._search_dirs()
         graph = build_dependency_graph(
@@ -243,7 +280,8 @@ class PortableExecutableEmbedder:
 
             new_sections: List[tuple] = []  # (name, data, rva, characteristics, virtual_size)
             new_reloc_entries: List[tuple] = []  # (host_rva, type)
-            dep_entry_calls: List[tuple] = []  # (hinst_va, entry_va), in embed order
+            dep_entry_calls: List[tuple] = []  # (name, hinst_va, entry_va), in embed order
+            dep_pdata_entries: List[tuple] = []  # (begin_rva, end_rva, unwind_rva), host-relative
             removed_dll_names_lower: Set[str] = set()
             merged_descriptors: List[Dict[str, int]] = []
             # (start_rva, end_rva, name) of the host's own image and every
@@ -352,6 +390,19 @@ class PortableExecutableEmbedder:
                             # be checked against too.
                             occupied_ranges.append((next_rva, X, f"{node.name}'s alignment-gap filler"))
 
+                    # Unwind-metadata (.pdata/.xdata) preservation: collect
+                    # this dependency's own RUNTIME_FUNCTION entries,
+                    # shifted (and, where needed, their UNWIND_INFO's own
+                    # RVA fields patched) to match where `blob`'s bytes end
+                    # up once placed at host RVA X -- regardless of
+                    # whether this dependency's *other* references needed
+                    # has_reloc's delta-relocation treatment above, since
+                    # these are pure-RVA references no base relocation
+                    # entry ever covers (see _adjust_unwind_info's
+                    # docstring). No-op for a dependency with no exception
+                    # directory at all (e.g. any x86/32-bit dependency).
+                    dep_pdata_entries.extend(_collect_and_patch_dep_unwind(dep, blob, X))
+
                     exports_by_name = {}
                     if hasattr(dep, "DIRECTORY_ENTRY_EXPORT"):
                         for sym in dep.DIRECTORY_ENTRY_EXPORT.symbols:
@@ -423,7 +474,7 @@ class PortableExecutableEmbedder:
 
                     entry_rva = dep.OPTIONAL_HEADER.AddressOfEntryPoint
                     if entry_rva:
-                        dep_entry_calls.append((image_base + X, image_base + X + entry_rva))
+                        dep_entry_calls.append((node.name, image_base + X, image_base + X + entry_rva))
 
                     new_sections.append((
                         f".sdep{len(new_sections)}".encode("ascii"), bytes(blob), X, _SCN_CODE_RWX, len(blob),
@@ -471,30 +522,60 @@ class PortableExecutableEmbedder:
                 import_rva = None
                 import_bytes = b""
 
-            # -- generated init-call stub (placeholder; Task 7 replaces) --
+            # -- generated init-call stub (build_windows_stub, Task 7) -----
             if dep_entry_calls:
-                call_fn = _x64_call_dllmain if is64 else _x86_call_dllmain
-                tail_jmp_fn = _x64_tail_jmp if is64 else _x86_tail_jmp
                 reloc_type = IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW
+                init_order_names = [name for name, _, _ in dep_entry_calls]
+                dep_entry_vas = {name: (hinst, entry) for name, hinst, entry in dep_entry_calls}
 
                 stub_rva = next_rva
-                stub_bytes = bytearray()
-                for hinst, entry in dep_entry_calls:
-                    block, offs = call_fn(hinst, entry)
-                    for off in offs:
-                        new_reloc_entries.append((stub_rva + len(stub_bytes) + off, reloc_type))
-                    stub_bytes += block
-                tail_block, tail_offs = tail_jmp_fn(original_entry_va)
-                for off in tail_offs:
-                    new_reloc_entries.append((stub_rva + len(stub_bytes) + off, reloc_type))
-                stub_bytes += tail_block
+                stub_bytes, abs_va_offsets = build_windows_stub(
+                    init_order_names,
+                    # The design's LoadLibraryW/GetProcAddress-interception
+                    # goal is for every *embedded* dependency's own name to
+                    # resolve to its embedded address if something still
+                    # dynamically loads it by name at runtime -- not yet
+                    # acted on; see pe_stub.py's module docstring.
+                    set(init_order_names),
+                    is64=is64,
+                    dep_entry_vas=dep_entry_vas,
+                    original_entry_va=original_entry_va,
+                )
+                for off in abs_va_offsets:
+                    new_reloc_entries.append((stub_rva + off, reloc_type))
 
                 new_sections.append((
-                    b".sstub", bytes(stub_bytes), stub_rva, _SCN_CODE_RWX, len(stub_bytes),
+                    b".sstub", stub_bytes, stub_rva, _SCN_CODE_RWX, len(stub_bytes),
                 ))
                 next_rva = _align_up(stub_rva + len(stub_bytes), section_alignment)
             else:
                 stub_rva = None
+
+            # -- combined exception (.pdata) directory -----------------------
+            if dep_pdata_entries:
+                host_excdir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_EXCEPTION]
+                host_entries = []
+                if host_excdir.Size:
+                    raw = pe.get_data(host_excdir.VirtualAddress, host_excdir.Size)
+                    for i in range(host_excdir.Size // 12):
+                        host_entries.append(struct.unpack_from("<III", raw, i * 12))
+
+                # The x64 ABI requires RtlLookupFunctionEntry's table to be
+                # sorted ascending by start RVA (it binary-searches it) --
+                # combine the host's own (untouched, already-correct)
+                # entries with every dependency's (already shifted to
+                # host-relative RVAs above) and re-sort the whole thing,
+                # rather than just appending.
+                combined_pdata = sorted(host_entries + dep_pdata_entries, key=lambda t: t[0])
+                exc_bytes = b"".join(struct.pack("<III", *t) for t in combined_pdata)
+                exc_rva = next_rva
+                new_sections.append((
+                    b".sxcpt2", exc_bytes, exc_rva, _SCN_DATA_R, len(exc_bytes),
+                ))
+                next_rva = _align_up(exc_rva + len(exc_bytes), section_alignment)
+            else:
+                exc_rva = None
+                exc_bytes = b""
 
             # -- combined relocation table ----------------------------------
             if new_reloc_entries:
@@ -599,6 +680,13 @@ class PortableExecutableEmbedder:
                 sz_off = relocdir.get_field_absolute_offset("Size")
                 output[va_off:va_off + 4] = struct.pack("<I", reloc_rva)
                 output[sz_off:sz_off + 4] = struct.pack("<I", len(combined_reloc_bytes))
+
+            if exc_rva is not None:
+                excdir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_EXCEPTION]
+                va_off = excdir.get_field_absolute_offset("VirtualAddress")
+                sz_off = excdir.get_field_absolute_offset("Size")
+                output[va_off:va_off + 4] = struct.pack("<I", exc_rva)
+                output[sz_off:sz_off + 4] = struct.pack("<I", len(exc_bytes))
 
             self.output_path.write_bytes(bytes(output))
         finally:
