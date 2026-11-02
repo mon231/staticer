@@ -6,8 +6,14 @@
 // test_transitive_exclusion_overlap, which also has the host import
 // lib_y.dll directly -- Y must stay excluded on account of X's exclusion
 // even though it's independently a direct host import too.
+#if defined(_MSC_VER)
+#define STATICER_EXPORT __declspec(dllexport)
+#else
+#define STATICER_EXPORT
+#endif
+
 int lib_y_value(void);
 
-int lib_x_value(void) {
+STATICER_EXPORT int lib_x_value(void) {
     return lib_y_value() + 10;
 }
