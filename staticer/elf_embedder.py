@@ -403,8 +403,9 @@ class ElfEmbedder:
         # rather than as a new PT_LOAD segment of its own -- see the large
         # comment further down, right before this same `ext`/`ext_idx` pair
         # is used to actually grow it, for why a brand new segment (with a
-        # freshly chosen vaddr/offset pair, generally skewed differently
-        # from the host's first PT_LOAD segment) breaks AT_PHDR.
+        # freshly chosen vaddr/offset pair, with no particular reason to
+        # share whatever segment-specific skew AT_PHDR's derivation
+        # actually keys off) risks landing AT_PHDR on a bogus address.
         all_host_segments = [elf.get_segment(i) for i in range(elf.num_segments())]
         host_load_indices = [i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_LOAD"]
         ext_idx = max(host_load_indices, key=lambda i: all_host_segments[i]["p_vaddr"] + all_host_segments[i]["p_memsz"])
@@ -742,8 +743,9 @@ class ElfEmbedder:
             # updated), append one brand-new PT_LOAD entry per fixed-base
             # dependency, and write the result into the placeholder
             # reserved for it above (inside `ext`'s own just-finished
-            # extension, so it shares the first PT_LOAD segment's skew --
-            # see the comment by that placeholder for why that's what
+            # extension, so it shares whatever segment-specific skew
+            # AT_PHDR's derivation actually keys off -- see the comment
+            # by that placeholder for what that is and why it's what
             # keeps AT_PHDR correct here). The *original* array's bytes are
             # simply abandoned in place (dead, harmless bytes nothing reads
             # anymore once e_phoff is repointed) -- the same
