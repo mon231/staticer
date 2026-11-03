@@ -72,6 +72,7 @@ _DW_EH_PE_DATAREL = 0x30
 _DW_EH_PE_OMIT = 0xFF
 
 STB_GLOBAL = 1
+STB_WEAK = 2
 STT_FUNC = 2
 
 
@@ -98,6 +99,40 @@ def resolve_elf(name: str, search_dirs: List[Path]) -> Optional[Path]:
 
 def _dynamic_segment(elf: ELFFile):
     return next(elf.iter_segments(type="PT_DYNAMIC"), None)
+
+
+def _real_symtab_count(dyn, reloc_tables: dict) -> int:
+    """The true number of entries in `dyn`'s own DT_SYMTAB, more reliable
+    than pyelftools' own ``DynamicSegment.num_symbols()`` for a host that
+    exports no symbols at all (the common case for an ordinary
+    executable, which usually only *imports*).
+
+    ``num_symbols()`` derives its count from the DT_GNU_HASH table (or
+    DT_HASH), which only indexes *exported/defined* symbols -- GNU_HASH's
+    own lookup degrades, for a host with nothing hashed at all, to
+    returning its own `symoffset` bias value as if that were the total
+    symbol count (see pyelftools' ``GNUHashTable.get_number_of_symbols``:
+    ``if max_idx < self.params['symoffset']: return self.params['symoffset']``),
+    silently undercounting every purely-undefined symbol past that bias.
+    Confirmed empirically against a real `-fno-plt`/`-no-pie` host on
+    real WSL Linux: with `__cxa_finalize`/`_ITM_registerTMCloneTable`/
+    `_ITM_deregisterTMCloneTable` at dynsym indices 1-3 (all undefined,
+    all referenced by real relocations), `num_symbols()` reported 1 --
+    appending new symbol-table growth past that wrong, too-small index
+    silently overwrote/discarded those three real, already-occupied
+    entries, corrupting what their own pre-existing relocations' symbol
+    indices resolved to and segfaulting at process startup.
+
+    Falls back to one past the highest symbol index any of the host's
+    OWN existing relocations (main table + JMPREL, if present) already
+    reference, whenever that's larger than what `num_symbols()` reports
+    -- every such index is, by construction, a real, already-occupied
+    dynsym slot that must not be overwritten."""
+    count = dyn.num_symbols()
+    for table in reloc_tables.values():
+        for reloc in table.iter_relocations():
+            count = max(count, reloc["r_info_sym"] + 1)
+    return count
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -302,16 +337,26 @@ def _pack_glob_dat_entries(entries: List[Tuple[int, int]], is64: bool, is_rela: 
     return bytes(out)
 
 
-def _pack_undef_sym(is64: bool, name_off: int) -> bytes:
+def _pack_undef_sym(is64: bool, name_off: int, weak: bool = False) -> bytes:
     """A new Elf32_Sym/Elf64_Sym entry for a symbol this module itself
     never defines (SHN_UNDEF, st_value/st_size 0) -- used only so ld.so's
     relocation processing has a name to look up for a forwarded external
-    reference (see _pack_glob_dat_entries); STB_GLOBAL/STT_FUNC matches
-    what a real external function import's own symbol table entry would
-    normally carry (ld.so's lookup doesn't actually care about the type
-    for OUR copy of it -- only the *name* and the fact that it's
-    undefined here -- but matching convention costs nothing)."""
-    st_info = (STB_GLOBAL << 4) | STT_FUNC
+    reference (see _pack_glob_dat_entries); STT_FUNC matches what a real
+    external function import's own symbol table entry would normally
+    carry (ld.so's lookup doesn't actually care about the type for OUR
+    copy of it -- only the *name* and the fact that it's undefined here
+    -- but matching convention costs nothing).
+
+    `weak` preserves the ORIGINAL reference's own binding (STB_WEAK vs
+    STB_GLOBAL) rather than always hardcoding STB_GLOBAL -- this is what
+    makes a forwarded weak-undefined reference behave like real ld.so
+    semantics instead of this module's own: ld.so's symbol lookup
+    tolerates an unresolved STB_WEAK reference (silently leaves it at 0)
+    but raises a fatal "undefined symbol" error for an unresolved
+    STB_GLOBAL one, exactly matching what a dependency's own weak
+    reference (e.g. crtstuff's __cxa_finalize/__gmon_start__-style
+    optional hooks) would have done had it never been embedded at all."""
+    st_info = ((STB_WEAK if weak else STB_GLOBAL) << 4) | STT_FUNC
     if is64:
         # st_name, st_info, st_other, st_shndx, st_value, st_size
         return struct.pack("<IBBHQQ", name_off, st_info, 0, 0, 0, 0)
@@ -610,7 +655,7 @@ class ElfEmbedder:
         # remaining external symbol reference to forward (see
         # `external_symbol_index`, below) -- read unconditionally here
         # since they're cheap dynamic-tag lookups, not real work.
-        host_symtab_count = host_dyn.num_symbols()
+        host_symtab_count = _real_symtab_count(host_dyn, host_reloc_tables)
         host_symtab_vaddr = _host_dyn_tag_val("DT_SYMTAB")
         host_strtab_vaddr = _host_dyn_tag_val("DT_STRTAB")
         host_strsz = _host_dyn_tag_val("DT_STRSZ")
@@ -671,6 +716,16 @@ class ElfEmbedder:
         # insertion order, starting right after the host's existing
         # entries -- see where it's grown, further down).
         external_symbol_index: Dict[str, int] = {}
+        # Whether every occurrence seen so far of a given forwarded
+        # name was itself a *weak* undefined reference (STB_WEAK) --
+        # if ANY occurrence is a strong (STB_GLOBAL) reference, the
+        # forwarded symbol must behave like a strong one (ld.so must
+        # raise if nothing resolves it), so this is ANDed across every
+        # occurrence rather than just keyed off the first one seen. See
+        # _pack_undef_sym's own docstring for why this distinction is
+        # preserved at all, instead of hard-zeroing every weak-undefined
+        # reference the way an earlier version of this method did.
+        external_symbol_is_weak: Dict[str, bool] = {}
         new_glob_dat_entries: List[Tuple[int, int]] = []  # (slot vaddr, symbol index) -> new R_*_GLOB_DAT entries
         # (initial_loc, fde_addr) pairs, absolute vaddrs already shifted
         # by each dependency's own delta -- collected so the host's own
@@ -854,16 +909,25 @@ class ElfEmbedder:
                 later dependency is processed) -- resolve directly, same
                 as step 3's host GOT/PLT patch further down (a new
                 R_*_RELATIVE entry).
-              - a weak, still-unresolved reference -- zero it, exactly
-                as ld.so itself would (see the long-standing comment
-                this mirrors, in the RELA/REL loop below).
-              - anything else undefined -- a genuinely external
-                reference no embedded dependency provides -- forward it
-                into the host's own dynamic section instead (see
+              - a *named*, still-unresolved reference (weak or strong)
+                -- forward it into the host's own dynamic section (see
                 `external_symbol_index`'s own declaration for why; a new
                 R_*_GLOB_DAT entry, not RELATIVE, since the real address
                 is only known at load time, via ld.so's own by-name
-                lookup, not something this module resolves itself)."""
+                lookup, not something this module resolves itself),
+                preserving its original STB_WEAK/STB_GLOBAL binding (see
+                `_pack_undef_sym`) so ld.so's own real weak-symbol
+                semantics apply -- a weak reference that's genuinely
+                unresolved anywhere else, at the real process's load
+                time, stays silently 0 exactly as it would have if this
+                dependency had never been embedded, while a strong one
+                still raises a fatal "undefined symbol" error.
+              - an *unnamed* weak reference -- can't be forwarded (no
+                name to look up by), so it's zeroed directly, exactly as
+                ld.so itself would resolve a weak reference with nothing
+                defining it.
+              - an unnamed STRONG reference -- fails loudly; nothing
+                can resolve it and there's no name to even try."""
             if sym.name and sym.name in host_copy_targets:
                 # Takes priority over everything else below, including a
                 # same-dependency self-reference to its own defined
@@ -880,16 +944,20 @@ class ElfEmbedder:
                 new_reloc_entries.append((X + blob_offset, new_val))
                 return
             if sym["st_shndx"] == "SHN_UNDEF":
-                if sym["st_info"]["bind"] == "STB_WEAK":
-                    _write_int(blob, blob_offset, ptr_size, 0)
-                    return
+                is_weak = sym["st_info"]["bind"] == "STB_WEAK"
                 if not sym.name:
+                    if is_weak:
+                        _write_int(blob, blob_offset, ptr_size, 0)
+                        return
                     raise ValueError(
                         f"dependency '{node_name}' has an unresolved, unnamed external "
                         "symbol reference; can't forward it to the host"
                     )
                 if sym.name not in external_symbol_index:
                     external_symbol_index[sym.name] = host_symtab_count + len(external_symbol_index)
+                    external_symbol_is_weak[sym.name] = is_weak
+                else:
+                    external_symbol_is_weak[sym.name] = external_symbol_is_weak[sym.name] and is_weak
                 _write_int(blob, blob_offset, ptr_size, 0)
                 new_glob_dat_entries.append((X + blob_offset, external_symbol_index[sym.name]))
                 return
@@ -1196,7 +1264,9 @@ class ElfEmbedder:
                 for name in external_symbol_index:  # dict preserves insertion order == assigned index order
                     name_off = len(new_dynstr_bytes)
                     new_dynstr_bytes += name.encode("ascii") + b"\x00"
-                    new_dynsym_bytes += _pack_undef_sym(is64, name_off)
+                    new_dynsym_bytes += _pack_undef_sym(
+                        is64, name_off, weak=external_symbol_is_weak.get(name, False)
+                    )
 
                 dynsym_vaddr = next_vaddr
                 new_sections.append((dynsym_vaddr, bytes(new_dynsym_bytes)))
