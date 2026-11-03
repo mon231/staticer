@@ -1235,6 +1235,26 @@ class ElfEmbedder:
                 _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_VERSYM", versym_vaddr)
 
         # -- patch the host's GOT/PLT references to embedded exports -----
+        #
+        # B5: whether the HOST itself was built with eager (`-z now`/
+        # BIND_NOW) binding matters only for how a *PLT* (DT_JMPREL)
+        # relocation entry gets neutralized below -- see the JMPREL-
+        # specific branch, further down, for why. Checked via either of
+        # the two real-world ways a linker records it (DF_BIND_NOW in
+        # DT_FLAGS, or the more modern DF_1_NOW in DT_FLAGS_1 -- confirmed
+        # against real `readelf -d` output on this project's own toolchain,
+        # which emits the latter); the legacy, presence-only DT_BIND_NOW
+        # tag is deliberately not checked too -- no modern linker emits it
+        # (GNU ld hasn't since the mid-2000s), and a host that genuinely
+        # used only that legacy mechanism would, worst case, just take the
+        # (already-correct-today) eager-binding code path below instead of
+        # the lazy one, not silently corrupt anything.
+        DF_BIND_NOW = 0x8
+        DF_1_NOW = 0x1
+        host_bind_now = bool((_host_dyn_tag_val("DT_FLAGS") or 0) & DF_BIND_NOW) or bool(
+            (_host_dyn_tag_val("DT_FLAGS_1") or 0) & DF_1_NOW
+        )
+
         patch_specs = [(dyn_table_key, dyn_tag_name)]
         if "JMPREL" in host_reloc_tables:
             patch_specs.append(("JMPREL", "DT_JMPREL"))
@@ -1313,6 +1333,43 @@ class ElfEmbedder:
                 resolved = (X + offset_in_dep + addend) & ((1 << (ptr_size * 8)) - 1)
                 target_off = vaddr_to_offset(reloc["r_offset"], ptr_size)
                 _write_int(raw, target_off, ptr_size, resolved)
+
+                if key == "JMPREL" and rtype == R_JUMP_SLOT and not host_bind_now:
+                    # B5 fix: a lazy-bound host (the ABI default -- most
+                    # real-world ELF binaries, though this project's own
+                    # toolchain happens to default to BIND_NOW) still has
+                    # ld.so walk *every* DT_JMPREL entry at load time, via
+                    # a completely separate code path from the one that
+                    # processes the main DT_RELA/DT_REL table
+                    # (`elf_machine_lazy_rel`, not the generic relocation
+                    # dispatch `_remove_needed`'s own R_*_NONE-zeroing
+                    # trick already relies on elsewhere) -- its only job
+                    # for a R_*_JUMP_SLOT entry is to add the image's own
+                    # load bias to whatever's *already* sitting in the GOT
+                    # slot (deferring the real by-name symbol lookup to
+                    # the PLT0 trampoline on first call, under genuine
+                    # laziness) -- it does NOT consult the entry's own
+                    # symbol index to do this. Confirmed empirically (real
+                    # WSL Linux, both bitnesses): zeroing this entry to
+                    # R_*_NONE -- correct for the eager/BIND_NOW path,
+                    # where DT_JMPREL is instead processed through the
+                    # *generic* dispatch, which does tolerate R_*_NONE --
+                    # crashes a lazy-bound host at process startup with
+                    # "unexpected PLT reloc type 0x00", since
+                    # elf_machine_lazy_rel's own switch has no such
+                    # tolerance. The fix: leave this entry's bytes
+                    # completely untouched (still nominally R_*_JUMP_SLOT,
+                    # against its original, now-dead symbol -- never read
+                    # by elf_machine_lazy_rel for this type) and skip
+                    # adding a new host R_*_RELATIVE entry for the GOT slot
+                    # too, since `elf_machine_lazy_rel`'s own load-bias add
+                    # already does exactly that job for this specific slot
+                    # -- adding a second, independent bias-add via a new
+                    # RELATIVE entry in the *main* table would double-apply
+                    # the load bias on a PIE host (every fixture this
+                    # module is tested against), corrupting the address.
+                    continue
+
                 new_reloc_entries.append((reloc["r_offset"], resolved))
 
                 entry_off = table_file_offset + idx * entry_size

@@ -179,3 +179,38 @@ def test_embedded_deps_own_further_dependency_gets_host_dt_needed(tmp_path, c_co
     env = dict(os.environ, LD_LIBRARY_PATH=str(further_dir))
     result = subprocess.run([str(out)], capture_output=True, env=env)
     assert result.returncode == 8  # further_value()(7) + 1
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_embed_into_lazy_bound_host_with_plt_call(tmp_path, c_compiler, bits):
+    """B5 regression test: a host built WITHOUT eager/BIND_NOW binding
+    (most real-world ELF binaries -- lazy is the ABI default, though this
+    project's own toolchain/distro happens to default to `-z now` as a
+    hardening default, so `-Wl,-z,lazy` is passed explicitly here to get
+    a genuinely lazy-bound host) that reaches the embedded dependency's
+    exported function through the PLT (`lib_value()` is a plain function
+    *call*, not just a data access -- main.c's existing shape already
+    does this, it's the binding mode that was never exercised). The bug:
+    the host GOT/PLT patch loop zeroed the JMPREL entry (the .rela.plt
+    descriptor) to R_*_NONE after resolving it, which only glibc's
+    BIND_NOW relocation path tolerates gracefully -- the separate,
+    lazy-binding-specific fixup path ld.so otherwise also runs over
+    every DT_JMPREL entry at load (to PIE-bias-adjust the PLT trampoline
+    pointer still sitting in each GOT slot) aborts on an unrecognized
+    relocation type there, so a lazy-bound host crashes at process
+    startup, before any user code runs, even though `embed()` itself
+    succeeds."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.so", pic=True, bits=bits)
+    exe = build_exe(
+        tmp_path, FIXTURES / "main.c", "main", [so], pic=True, bits=bits,
+        extra_flags=["-Wl,-z,lazy"],
+    )
+    out = tmp_path / "static_lazy"
+
+    ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+    out.chmod(0o755)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 42, (
+        f"lazy-bound host crashed (code {result.returncode}); stderr={result.stderr!r}"
+    )
