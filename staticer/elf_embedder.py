@@ -39,9 +39,13 @@ from .stubs.linux.elf_stub import build_linux_stub
 # for reading but useless for re-packing bytes we write ourselves).
 
 PT_LOAD = 1
+PT_DYNAMIC = 2
 PT_PHDR = 6
 PT_GNU_EH_FRAME = 0x6474E550
 PF_X, PF_W, PF_R = 1, 2, 4
+
+DT_NULL = 0
+DT_NEEDED = 1
 
 DT_DEBUG = 21  # harmless/ignored by every runtime linker; see _remove_needed
 
@@ -782,6 +786,16 @@ class ElfEmbedder:
         min_vaddr_for_eof = len(raw) + ext_skew
         next_vaddr = _align_up(max(min_vaddr_for_memsz, min_vaddr_for_eof), ext_align)
 
+        # The host's own PT_DYNAMIC entry -- needed only if some embedded
+        # dependency turns out to have its own further, non-embedded
+        # DT_NEEDED import to forward into the host's own dynamic section
+        # (see the B2-fix block past the per-dependency loop, by
+        # `extra_needed_names`). Always exists (host_dyn above is None-
+        # checked already), found the same way as `ext_idx`/`phdr_idx`.
+        host_dynamic_idx = next(
+            i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_DYNAMIC"
+        )
+
         # The host's own PT_GNU_EH_FRAME entry (if any), found the same
         # way as `ext_idx`/`phdr_idx` -- needed only if some embedded
         # dependency turns out to have unwind info to merge (see the
@@ -1101,6 +1115,42 @@ class ElfEmbedder:
                     new_sections.append((X, bytes(blob)))
                     next_vaddr = _align_up(X + blob_size, _PAGE)
 
+        # -- B2 fix: every embedded dependency's OWN DT_NEEDED entries that
+        #    aren't themselves embedded need to become new entries in the
+        #    HOST's own DT_NEEDED, or ld.so never loads them at all --
+        #    even though `_resolve_dep_reference` already forwards the
+        #    dependency's remaining symbol references into the host's
+        #    dynamic section as plain by-name GLOB_DAT lookups (see its
+        #    own docstring), that only works if the library that actually
+        #    *defines* those symbols is also loaded. An embedded
+        #    dependency's own DT_NEEDED entry has no further use once it's
+        #    no longer independently loaded as a module (see the
+        #    `_remove_needed`-call comment just above) for an *embedded*
+        #    target -- but when that target was never resolved into the
+        #    graph at all (excluded, or simply outside `lib_dir`/
+        #    unresolvable), it's a real, still-needed runtime dependency
+        #    that this method must now take over advertising, since the
+        #    dependency that used to advertise it is gone. Order names are
+        #    deduplicated and kept in a deterministic (dependency, then
+        #    that dependency's own DT_NEEDED) order, skipping anything
+        #    that's itself embedded or that the host already has its own,
+        #    still-active DT_NEEDED entry for (no embedded node overlaps
+        #    this set, since those get neutralized above).
+        order_names = {node.name for node in order}
+        host_still_needed_names = host_direct_import_names - order_names
+        extra_needed_names: List[str] = []
+        _seen_extra_needed: Set[str] = set()
+        for node in order:
+            for needed in list_elf_imports(node.path):
+                if (
+                    needed in order_names
+                    or needed in host_still_needed_names
+                    or needed in _seen_extra_needed
+                ):
+                    continue
+                _seen_extra_needed.add(needed)
+                extra_needed_names.append(needed)
+
         # -- forward embedded dependencies' remaining external symbol
         #    references into the host's own dynamic section (see
         #    `external_symbol_index`'s own declaration for the full "why")
@@ -1111,39 +1161,61 @@ class ElfEmbedder:
         #    and-repoint-the-DT_*-tag pattern already used for the combined
         #    relocation table just below (and PE's own import-directory
         #    rebuild) -- growing any of these three in place isn't
-        #    generally safe either, for the same reason.
-        if external_symbol_index:
-            if host_symtab_vaddr is None or host_strtab_vaddr is None or host_strsz is None:
+        #    generally safe either, for the same reason. `extra_needed_names`'
+        #    own strings (see the B2-fix block just above) are folded into
+        #    this same .dynstr growth, since both need "append new strings
+        #    past the end of a brand-new, bigger .dynstr" -- even if
+        #    `external_symbol_index` itself is empty, needing room for a
+        #    new DT_NEEDED's own name string is reason enough to grow
+        #    .dynstr (but NOT .dynsym/.gnu.version, which a plain
+        #    DT_NEEDED name has no entry in at all).
+        needed_name_offsets: Dict[str, int] = {}
+        dynstr_vaddr = host_strtab_vaddr
+        if external_symbol_index or extra_needed_names:
+            if host_strtab_vaddr is None or host_strsz is None:
                 raise ValueError(
-                    f"'{self.input_path}' is missing DT_SYMTAB/DT_STRTAB/DT_STRSZ; can't "
-                    "forward an embedded dependency's external symbol references into it"
+                    f"'{self.input_path}' is missing DT_STRTAB/DT_STRSZ; can't forward an "
+                    "embedded dependency's external symbol/DT_NEEDED references into it"
                 )
-            sym_entry_size = 24 if is64 else 16
-            old_dynsym_off = vaddr_to_offset(host_symtab_vaddr, host_symtab_count * sym_entry_size)
-            old_dynsym_bytes = bytes(raw[old_dynsym_off: old_dynsym_off + host_symtab_count * sym_entry_size])
             old_dynstr_off = vaddr_to_offset(host_strtab_vaddr, host_strsz)
             old_dynstr_bytes = bytes(raw[old_dynstr_off: old_dynstr_off + host_strsz])
-
             new_dynstr_bytes = bytearray(old_dynstr_bytes)
-            new_dynsym_bytes = bytearray(old_dynsym_bytes)
-            for name in external_symbol_index:  # dict preserves insertion order == assigned index order
-                name_off = len(new_dynstr_bytes)
-                new_dynstr_bytes += name.encode("ascii") + b"\x00"
-                new_dynsym_bytes += _pack_undef_sym(is64, name_off)
 
-            dynsym_vaddr = next_vaddr
-            new_sections.append((dynsym_vaddr, bytes(new_dynsym_bytes)))
-            next_vaddr = _align_up(dynsym_vaddr + len(new_dynsym_bytes), ptr_size)
+            if external_symbol_index:
+                if host_symtab_vaddr is None:
+                    raise ValueError(
+                        f"'{self.input_path}' is missing DT_SYMTAB; can't forward an "
+                        "embedded dependency's external symbol references into it"
+                    )
+                sym_entry_size = 24 if is64 else 16
+                old_dynsym_off = vaddr_to_offset(host_symtab_vaddr, host_symtab_count * sym_entry_size)
+                old_dynsym_bytes = bytes(
+                    raw[old_dynsym_off: old_dynsym_off + host_symtab_count * sym_entry_size]
+                )
+                new_dynsym_bytes = bytearray(old_dynsym_bytes)
+                for name in external_symbol_index:  # dict preserves insertion order == assigned index order
+                    name_off = len(new_dynstr_bytes)
+                    new_dynstr_bytes += name.encode("ascii") + b"\x00"
+                    new_dynsym_bytes += _pack_undef_sym(is64, name_off)
+
+                dynsym_vaddr = next_vaddr
+                new_sections.append((dynsym_vaddr, bytes(new_dynsym_bytes)))
+                next_vaddr = _align_up(dynsym_vaddr + len(new_dynsym_bytes), ptr_size)
+
+            for name in extra_needed_names:
+                needed_name_offsets[name] = len(new_dynstr_bytes)
+                new_dynstr_bytes += name.encode("ascii") + b"\x00"
 
             dynstr_vaddr = next_vaddr
             new_sections.append((dynstr_vaddr, bytes(new_dynstr_bytes)))
             next_vaddr = _align_up(dynstr_vaddr + len(new_dynstr_bytes), _PAGE)
 
-            _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_SYMTAB", dynsym_vaddr)
+            if external_symbol_index:
+                _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_SYMTAB", dynsym_vaddr)
             _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_STRTAB", dynstr_vaddr)
             _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_STRSZ", len(new_dynstr_bytes))
 
-            if host_versym_vaddr is not None:
+            if external_symbol_index and host_versym_vaddr is not None:
                 old_versym_off = vaddr_to_offset(host_versym_vaddr, host_symtab_count * 2)
                 old_versym_bytes = bytes(raw[old_versym_off: old_versym_off + host_symtab_count * 2])
                 # 0 (VER_NDX_LOCAL) per new entry: "no version requirement"
@@ -1151,6 +1223,11 @@ class ElfEmbedder:
                 # ordinary unversioned lookup, verified end-to-end against
                 # a real `malloc` import on real Linux (WSL, both 32- and
                 # 64-bit) before wiring this in; see this method's docstring.
+                # Only grown when `external_symbol_index` itself is
+                # non-empty -- a plain new DT_NEEDED (see
+                # `extra_needed_names`) adds no new .dynsym entry at all,
+                # so .gnu.version (indexed 1:1 by .dynsym entry) needs no
+                # corresponding growth for it.
                 new_versym_bytes = old_versym_bytes + b"\x00\x00" * len(external_symbol_index)
                 versym_vaddr = next_vaddr
                 new_sections.append((versym_vaddr, new_versym_bytes))
@@ -1290,6 +1367,65 @@ class ElfEmbedder:
 
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_tag_name, reloc_table_vaddr)
             _set_dyn_tag_value(host_dyn, raw, ptr_size, dyn_sz_tag_name, len(combined_bytes))
+
+        # -- B2 fix, continued: grow the host's own dynamic array itself
+        #    with one new DT_NEEDED entry per name in `extra_needed_names`
+        #    (see that variable's own declaration, earlier, for the full
+        #    "why") --
+        #
+        # Must run *after* every other `_set_dyn_tag_value` call above
+        # (the external-symbol-forwarding block's DT_SYMTAB/DT_STRTAB/
+        # DT_STRSZ/DT_VERSYM, and this combined-relocation-table block's
+        # own DT_RELA/DT_RELASZ): those all edit the dynamic array's
+        # entries *in place*, at their ORIGINAL file location (via
+        # `host_dyn`, parsed once against the original bytes) -- reading
+        # that same, by-now-fully-updated array's current byte content
+        # here and copying it into a brand new, bigger array (rather than
+        # growing it in place, same reasoning as every other table this
+        # method grows) preserves every one of those edits. Doing this
+        # any earlier would mean a later `_set_dyn_tag_value` call writes
+        # into the OLD array's now-abandoned bytes instead of the new one
+        # ld.so will actually read via the updated PT_DYNAMIC program
+        # header entry below.
+        #
+        # New entries are spliced in just before the array's own
+        # terminating DT_NULL (which must stay last -- every real-world
+        # loader stops scanning at the first one), rather than appended
+        # past it, mirroring `_remove_needed`'s own "never disturb the
+        # DT_NULL terminator's position" rule for the same reason.
+        if extra_needed_names:
+            dyn_entry_size = 2 * ptr_size
+            old_dyn_count = host_dyn.num_tags()
+            old_dyn_bytes = bytes(raw[host_dyn["p_offset"]: host_dyn["p_offset"] + old_dyn_count * dyn_entry_size])
+            null_index = next(
+                (n for n in range(old_dyn_count) if host_dyn.get_tag(n).entry.d_tag == "DT_NULL"), None
+            )
+            if null_index is None:
+                raise ValueError(f"'{self.input_path}': its dynamic section has no DT_NULL terminator")
+
+            # d_val for a DT_NEEDED entry is a plain .dynstr *offset* (not
+            # an absolute vaddr), exactly like `needed_name_offsets` was
+            # already recorded as.
+            needed_fmt = "<QQ" if is64 else "<II"
+            new_entries = bytearray()
+            for name in extra_needed_names:
+                new_entries += struct.pack(needed_fmt, DT_NEEDED, needed_name_offsets[name])
+
+            head = old_dyn_bytes[: null_index * dyn_entry_size]
+            tail = old_dyn_bytes[null_index * dyn_entry_size:]
+            new_dyn_bytes = bytes(head) + bytes(new_entries) + bytes(tail)
+
+            dynamic_vaddr = next_vaddr
+            new_sections.append((dynamic_vaddr, new_dyn_bytes))
+            next_vaddr = _align_up(dynamic_vaddr + len(new_dyn_bytes), _PAGE)
+
+            host_dynamic_seg = all_host_segments[host_dynamic_idx]
+            dynamic_phdr_update = _pack_phdr(
+                is64, PT_DYNAMIC, host_dynamic_seg["p_flags"], dynamic_vaddr - ext_skew, dynamic_vaddr,
+                dynamic_vaddr, len(new_dyn_bytes), len(new_dyn_bytes), host_dynamic_seg["p_align"],
+            )
+        else:
+            dynamic_phdr_update = None
 
         # -- merge embedded dependencies' unwind info into the host's own
         #    .eh_frame_hdr binary-search table --
@@ -1510,6 +1646,9 @@ class ElfEmbedder:
             if eh_hdr_update is not None:
                 eh_entry_off = elf["e_phoff"] + host_gnu_eh_frame_idx * elf["e_phentsize"]
                 raw[eh_entry_off:eh_entry_off + len(eh_hdr_update)] = eh_hdr_update
+            if dynamic_phdr_update is not None:
+                dyn_entry_off = elf["e_phoff"] + host_dynamic_idx * elf["e_phentsize"]
+                raw[dyn_entry_off:dyn_entry_off + len(dynamic_phdr_update)] = dynamic_phdr_update
         else:
             # Grow the program header array itself: copy the *original*
             # array byte-for-byte (still untouched, at its original
@@ -1532,6 +1671,8 @@ class ElfEmbedder:
             new_array[ext_idx * entsize:(ext_idx + 1) * entsize] = extended_entry
             if eh_hdr_update is not None:
                 new_array[host_gnu_eh_frame_idx * entsize:(host_gnu_eh_frame_idx + 1) * entsize] = eh_hdr_update
+            if dynamic_phdr_update is not None:
+                new_array[host_dynamic_idx * entsize:(host_dynamic_idx + 1) * entsize] = dynamic_phdr_update
 
             placeholder_file_offset = phdr_array_vaddr - ext_skew
 
