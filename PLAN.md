@@ -177,26 +177,38 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   anywhere else. None of this project's own fixtures or the real system
   binaries (bash/libtinfo.so.6) exercised in Task 10b hit this (every
   real COPY-relocated symbol seen so far is pointer-sized or smaller).
-- **Final whole-branch review fix wave (2026-11-02)**: a final whole-branch
-  reviewer (most capable model) ran after all 12 tasks were marked complete
-  and found B1-B6 blocking issues plus several moderate/minor findings.
-  Being fixed in parallel across 3 tracks — PE embedder, ELF embedder, and
-  packaging/CLI/docs/CI (this track). Full detail lives in the ledger
-  (`.superpowers/sdd/2026-11-01-staticer-core/progress.md`), not duplicated
-  here. One finding (dependency-name path-traversal hardening in the
-  PE/ELF import/dependency resolver) was identified but intentionally left
-  for the PE/ELF track owners since the vulnerable code lives in their
-  files.
+- **Final whole-branch review fix wave (2026-11-02 — 2026-11-04): COMPLETE.**
+  A final whole-branch reviewer (most capable model) found B1-B6 blocking
+  issues plus several moderate/minor findings. Fixed in parallel across 3
+  tracks (PE, ELF, packaging/CLI/docs/CI), each independently reviewed and
+  approved (Track A: approved; Track B: approved with flagged risk — risk is
+  about review METHOD, no Linux execution access in the reviewer's own
+  sandbox, not an unresolved code concern; Track C: approved). One finding
+  (dependency-name path-traversal hardening, CWE-22) was dropped from both
+  track dispatches by mistake — caught and fixed separately afterward,
+  reviewed, approved. Full detail lives in the ledger
+  (`.superpowers/sdd/2026-11-01-staticer-core/progress.md`).
+  Remaining known, honestly-documented limitations (not blocking, see ledger
+  for full list): PE arch whitelist, PE no-reloc placement-order deviation,
+  unbounded-allocation check, output==input traceback (all deferred from
+  Track A); B5's narrow R_GLOB_DAT/R_IRELATIVE-under-lazy-binding gap inside
+  JMPREL (never seen in any real binary this project encountered); ELF
+  COPY-relocated objects >pointer-size get no RELATIVE entries for interior
+  pointers (architectural limit, documented); MSVC half of Task 7's original
+  self-contained-throw finding not re-tested after B4 (GCC/MinGW half
+  confirmed fixed, MSVC half unconfirmed either way).
+- A GitHub Actions PyPI publish workflow was added (`.github/workflows/publish.yml`,
+  adapted from the `firstclass` project's own release workflow), triggered on
+  `v*` tags. Needs a `PYPI_API_TOKEN` repo secret before a real publish can
+  run; not yet exercised end-to-end (no tag pushed).
 
 ## What's next
 
-**All 12 tasks complete** (9/10 split a/b for parallelism — see table above).
+**All 12 tasks complete, all final-review findings resolved or documented.**
 Remaining per `subagent-driven-development`'s closing steps:
-- Dispatch final whole-branch code reviewer (most capable model).
-- Handle its findings: one fix wave + one scoped re-review, adjudicate
-  any residuals.
-- Collect every `Ruling:` line from the ledger into a final summary.
+- Collect every `Ruling:` line from the ledger into a final summary for the user.
 - Delete this plan's SDD workspace directory.
+- Hand off to `finishing-a-development-branch`.
 - Proceed to `superpowers:finishing-a-development-branch`.
 
 Note: `origin/dev` was pushed mid-session at the user's explicit request
