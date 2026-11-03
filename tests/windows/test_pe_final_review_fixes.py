@@ -3,7 +3,10 @@ B1 (dependency-to-dependency imports must not stay dynamic), B3 (a
 TLS-carrying dependency must fail loudly, not silently corrupt), B4 (a
 dependency's own PE header region must be copied into its embedded blob),
 B6-PE (a DLL-as-output must not re-run dependency inits on thread
-attach/detach), and the --exclude case-sensitivity minor fix.
+attach/detach), the --exclude case-sensitivity minor fix, and the
+path-traversal (CWE-22) fix in `resolve_pe` itself -- a finding dropped
+from both the PE and ELF fix-wave dispatches and only caught at
+whole-branch close-out.
 """
 
 import ctypes
@@ -16,7 +19,7 @@ import pytest
 
 from conftest import FIXTURES, build_exe, build_shared_lib
 
-from staticer.pe_embedder import PortableExecutableEmbedder, list_pe_imports
+from staticer.pe_embedder import PortableExecutableEmbedder, list_pe_imports, resolve_pe
 
 pytestmark = pytest.mark.skipif(platform.system() != "Windows", reason="PE embedding is Windows-only")
 
@@ -94,6 +97,43 @@ def test_dependency_header_region_is_copied_into_blob(tmp_path, c_compiler):
 
     result = subprocess.run([str(out)], capture_output=True)
     assert result.returncode == 42
+
+
+def test_resolve_pe_rejects_path_traversal_name(tmp_path):
+    """Dropped-finding fix (CWE-22): `name` in `resolve_pe` comes straight
+    from the TARGET BINARY's own Import Directory -- attacker-controlled,
+    if the input binary being processed is untrusted. A crafted import
+    name carrying path-traversal components must not be allowed to escape
+    the search_dirs entry it's matched against; it must behave exactly
+    like "not found" (fall through to None / the next dir), never resolve
+    to a file genuinely sitting outside the intended directory, even
+    though such a file genuinely exists on disk at that escaped
+    location."""
+    search_dir = tmp_path / "libs"
+    search_dir.mkdir()
+
+    # A real file sitting OUTSIDE search_dir, at exactly the location the
+    # crafted traversal name points at.
+    outside = tmp_path / "evil.dll"
+    outside.write_bytes(b"not a real dll")
+
+    assert resolve_pe("..\\evil.dll", [search_dir]) is None
+    assert resolve_pe("../evil.dll", [search_dir]) is None
+    assert resolve_pe("..", [search_dir]) is None
+    assert resolve_pe(str(outside), [search_dir]) is None  # absolute path
+
+    # A legitimate same-directory match must still resolve normally --
+    # the fix must not break the ordinary, non-malicious case.
+    legit = search_dir / "lib.dll"
+    legit.write_bytes(b"legit")
+    assert resolve_pe("lib.dll", [search_dir]) == legit
+
+    # Falls through to a legitimate match in a LATER search dir when an
+    # earlier dir's candidate escapes it.
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    (other_dir / "legit2.dll").write_bytes(b"legit2")
+    assert resolve_pe("legit2.dll", [search_dir, other_dir]) == other_dir / "legit2.dll"
 
 
 def test_dll_as_output_runs_dep_init_once(tmp_path, c_compiler):

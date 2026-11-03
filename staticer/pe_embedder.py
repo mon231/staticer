@@ -84,9 +84,30 @@ class _CaseInsensitiveNameSet:
 
 
 def resolve_pe(name: str, search_dirs: List[Path]) -> Optional[Path]:
-    """Scan search_dirs in order for a file literally named `name`."""
+    """Scan search_dirs in order for a file literally named `name`.
+
+    `name` comes straight from the PE file being processed's own Import
+    Directory (an attacker-controlled DLL name, if the input binary is
+    untrusted) -- it must never be allowed to escape the `search_dirs`
+    entry it's being matched against via path-traversal components
+    (``..``) or an absolute path (CWE-22), or `--lib-dir`'s whole purpose
+    (scoping embedding to one chosen folder) is defeated. A `name` that
+    isn't a bare filename is rejected outright before any join is even
+    attempted (cheap first-line defense); as a second, independent check,
+    any resulting candidate that resolves outside `directory` is also
+    rejected. Either way this behaves exactly like "not found in this
+    directory" -- falling through to the next search_dirs entry, or
+    returning None if none match -- never a hard error."""
+    if not name or "/" in name or "\\" in name or name == ".." or Path(name).is_absolute():
+        return None
     for directory in search_dirs:
         candidate = directory / name
+        try:
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(directory.resolve()):
+                continue
+        except (OSError, ValueError):
+            continue
         if candidate.is_file():
             return candidate
     return None
