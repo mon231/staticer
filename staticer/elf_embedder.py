@@ -990,6 +990,38 @@ class ElfEmbedder:
                     blob[start:start + len(data)] = data
 
                 is_fixed_base = dep["e_type"] == "ET_EXEC"
+                if is_fixed_base and elf["e_type"] == "ET_DYN":
+                    # Moderate final-review finding: a fixed-base
+                    # dependency's own untracked absolute references
+                    # (see the big comment above, by `fixed_base_segments`,
+                    # for exactly what those are and why) only stay
+                    # correct if the final combined image's load address
+                    # never shifts as a whole -- true for a non-PIE
+                    # (ET_EXEC) host (the kernel always maps every PT_LOAD
+                    # segment at exactly its declared p_vaddr), but NOT for
+                    # an ET_DYN host (a PIE executable, or this method's
+                    # own B6-ELF .so-input case): under ASLR, the whole
+                    # image -- including the fixed-base dependency's own
+                    # untracked references -- moves together by the same
+                    # load bias, silently going stale by exactly that
+                    # amount. Unlike PE (pe_embedder.py can clear
+                    # DYNAMIC_BASE/HIGH_ENTROPY_VA on its own output to
+                    # neutralize this for a fixed-base DLL dependency),
+                    # ELF has no per-image "disable ASLR" flag this module
+                    # can set on its own output -- PIE-ness is baked into
+                    # e_type/the kernel's own ASLR policy, not a flag this
+                    # module could flip afterward. Rather than silently
+                    # producing an output that corrupts itself the moment
+                    # ASLR picks a non-zero load address (the exact
+                    # silent-corruption case the design spec's anti-goal
+                    # forbids), fail loudly here instead.
+                    raise ValueError(
+                        f"dependency '{node.name}' is a fixed-base (non-PIC) ELF object, but "
+                        f"'{self.input_path}' is a PIE/ET_DYN image; a fixed-base dependency's "
+                        "own untracked absolute references would silently go stale under ASLR "
+                        "once the combined image's load address shifts -- embedding a fixed-base "
+                        "dependency is only supported into a non-PIE (ET_EXEC) host"
+                    )
                 if is_fixed_base:
                     X = dep_base
                     lo, hi = X, X + blob_size

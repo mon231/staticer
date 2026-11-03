@@ -206,6 +206,25 @@ def test_embed_non_pic_so_without_relocs(tmp_path, c_compiler, bits):
     assert result.returncode == 42
 
 
+def test_fixed_base_dependency_into_pie_host_fails_loudly(tmp_path, c_compiler):
+    """Moderate final-review finding: unlike PE (which can clear
+    DYNAMIC_BASE/HIGH_ENTROPY_VA on its own output to neutralize ASLR
+    for a fixed-base DLL dependency), ELF has no per-image "disable
+    ASLR" flag embed() could set on its own output -- PIE-ness is baked
+    into e_type, not a flag this module can flip afterward. A fixed-base
+    dependency's own untracked absolute references only stay correct if
+    the combined image's load address never shifts as a whole, which
+    ASLR (the default for any PIE/ET_DYN host) breaks. embed() must fail
+    loudly here rather than silently producing an output that corrupts
+    itself the moment ASLR picks a non-zero load address."""
+    so = _build_rebased_so(tmp_path, FIXTURES / "lib.c", "lib.so", bits=64)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main", [so], pic=True, bits=64)
+    _force_fixed_base(so)
+
+    with pytest.raises(ValueError, match="PIE/ET_DYN"):
+        ElfEmbedder(exe, tmp_path / "out", exclude=set(), lib_dir=tmp_path).embed()
+
+
 def test_base_address_conflict_fails_loudly(tmp_path, c_compiler):
     # Two independent fixed-base dependencies, both left at the *same*
     # preferred base (`_build_fixed_base_so`'s default) -- guaranteed to
