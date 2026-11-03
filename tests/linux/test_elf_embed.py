@@ -288,3 +288,27 @@ def test_search_dirs_prefers_matching_bitness_multiarch_dir(tmp_path, c_compiler
     assert len(triplet_order) == 2
     expected_first = "x86_64-linux-gnu" if bits == 64 else "i386-linux-gnu"
     assert triplet_order[0] == expected_first
+
+
+def test_output_preserves_input_executable_bit(tmp_path, c_compiler):
+    """Moderate final-review finding: embed() wrote the output file's
+    bytes but never copied the input's own executable permission bit
+    onto it -- every OTHER test in this suite has had to work around
+    this by chmod()-ing the output itself right after calling embed(),
+    which would be unnecessary if embed() already did it. This test
+    deliberately does NOT call chmod() on the output, to pin that
+    embed() itself (not the test, not the CLI) is responsible for this."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.so", pic=True, bits=64)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main", [so], pic=True, bits=64)
+    out = tmp_path / "static"
+
+    ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+
+    import stat
+    mode = out.stat().st_mode
+    assert mode & stat.S_IXUSR, f"output isn't marked executable (mode {oct(mode)})"
+
+    # Confirm it's not just the permission *bit* but a genuinely runnable
+    # file too, with no chmod() of our own in between.
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 42

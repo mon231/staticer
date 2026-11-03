@@ -25,6 +25,7 @@ without disturbing) section headers at all.
 """
 
 import io
+import shutil
 import struct
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -653,6 +654,7 @@ class ElfEmbedder:
 
         if not order:
             self.output_path.write_bytes(self.input_path.read_bytes())
+            shutil.copymode(self.input_path, self.output_path)
             return
 
         raw = bytearray(self.input_path.read_bytes())
@@ -2040,3 +2042,15 @@ class ElfEmbedder:
             _write_int(raw, e_entry_off, ptr_size, entry_stub_vaddr)
 
         self.output_path.write_bytes(bytes(raw))
+        # Moderate final-review finding: write_bytes() alone creates the
+        # output file with the process's own default (umask-governed)
+        # permissions, losing the input's executable bit -- every test in
+        # this suite has had to work around this by calling
+        # `out.chmod(0o755)` itself right after `embed()` returns,
+        # strongly suggesting this was never actually handled here.
+        # Preserve the input's own full permission bits (not just force
+        # a fixed 0o755) so an input with unusual permissions (e.g. a
+        # setuid/setgid bit, or a more restrictive executable-only mode)
+        # round-trips the same way, matching the CLI's documented
+        # "produces a working replacement for the original binary" goal.
+        shutil.copymode(self.input_path, self.output_path)
