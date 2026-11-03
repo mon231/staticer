@@ -34,6 +34,23 @@ pytestmark = pytest.mark.skipif(platform.system() != "Windows", reason="PE embed
 # exercises exactly what *is* in scope: RtlVirtualUnwind must correctly
 # find and use the merged, embedded-and-relocated RUNTIME_FUNCTION entry
 # to unwind through call_through's (handler-free) frame at all.
+#
+# UPDATE (final-review fix wave, Track A, B4): the final review found that
+# dependency PE headers were never copied into the embedded blob at all
+# (only section contents were) -- HINSTANCE/self-referential header reads
+# for an embedded dependency saw zeros, and the reviewer suspected this,
+# not compiler personality-routine internals, was the *real* cause of the
+# GCC/MinGW half of the "self-contained throw/catch in an embedded frame
+# crashes" finding above. Re-tested below (test_self_contained_throw_in_
+# embedded_dll, exc_lib_selfcontained.c/exc_main_selfcontained.c) against
+# this worktree's GNU/MinGW toolchain (no cl.exe available here) now that
+# B4 is fixed: confirmed correct -- a self-contained throw+catch entirely
+# inside an embedded GCC/MinGW-built DLL now works. So the GCC/MinGW half
+# of the original finding above was indeed a B4 symptom, not a deeper
+# per-frame-exception-state gap. The MSVC half is NOT re-tested here (no
+# MSVC toolchain was available in this environment) and should not be
+# assumed fixed by this -- it may still stand on its own merits; re-verify
+# it specifically if/when an MSVC environment is available.
 
 
 def test_exception_crosses_embedded_boundary(tmp_path, c_compiler):
@@ -45,6 +62,26 @@ def test_exception_crosses_embedded_boundary(tmp_path, c_compiler):
 
     result = subprocess.run([str(out)], capture_output=True)
     assert result.returncode == 7
+
+
+def test_self_contained_throw_in_embedded_dll(tmp_path, c_compiler):
+    """B4 re-examination: a throw+catch entirely inside an embedded DLL
+    (not just a pass-through frame) now works once the dependency's own
+    PE header region is copied into its embedded blob -- see this
+    module's UPDATE note above. If this ever regresses back to a crash
+    (rather than returncode 42), B4 is the first thing to re-check."""
+    dll = build_shared_lib(
+        tmp_path, FIXTURES / "exc_lib_selfcontained.c", "exc_sc.dll", pic=True, bits=64, cpp=True,
+    )
+    exe = build_exe(
+        tmp_path, FIXTURES / "exc_main_selfcontained.c", "main_sc.exe", [dll], pic=True, bits=64, cpp=True,
+    )
+    out = tmp_path / "static_sc.exe"
+
+    PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 42
 
 
 def test_dependency_initializer_runs_before_dependent(tmp_path, c_compiler):
