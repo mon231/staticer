@@ -150,6 +150,33 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   Not yet investigated — revisit when Task 7 or Task 10 touches TLS-bearing
   binaries.
 
+- **B5 (fixed, Track B)**: `elf_embedder.py`'s host GOT/PLT patch loop
+  zeroed a resolved R_*_JUMP_SLOT entry to R_*_NONE unconditionally,
+  aborting any host built with lazy (non-BIND_NOW) PLT binding -- the
+  ABI default, and most real-world ELF binaries, though this project's
+  own toolchain/distro defaults to `-z now`, which is why this stayed
+  hidden through Tasks 4/6/10b. First flagged in Task 6's own review as
+  "worth a look for whichever task next touches that patch loop", then
+  missed by Task 10b when it touched this exact code for COPY-relocation
+  handling. Fixed in the final-review fix wave (see ledger) by detecting
+  the host's own binding mode and leaving a lazy-bound host's PLT entries
+  untouched instead.
+- **ELF COPY-relocated objects larger than pointer-size (known
+  architectural limitation, Track B)**: when a host's R_*_COPY
+  relocation copies a struct bigger than one pointer (e.g. one with its
+  own interior pointer field, not just scalar data) from an embedded
+  dependency, only the *whole* copied value gets a new R_*_RELATIVE
+  ASLR-safety entry, and only when its size is exactly one pointer
+  width. A >ptr_size COPY-relocated object's own interior pointer
+  field(s) get no such entry at all, even if they point into the
+  dependency's own embedded blob -- those would go stale under ASLR.
+  Not fixed: ELF carries no type/layout metadata for a COPY-relocated
+  symbol (just `st_size`, a byte count), so there's no way to tell,
+  from the raw bytes alone, which sub-offsets of a >ptr_size object are
+  even pointers at all without DWARF type info this module doesn't use
+  anywhere else. None of this project's own fixtures or the real system
+  binaries (bash/libtinfo.so.6) exercised in Task 10b hit this (every
+  real COPY-relocated symbol seen so far is pointer-sized or smaller).
 - **Final whole-branch review fix wave (2026-11-02)**: a final whole-branch
   reviewer (most capable model) ran after all 12 tasks were marked complete
   and found B1-B6 blocking issues plus several moderate/minor findings.

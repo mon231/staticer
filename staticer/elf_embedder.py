@@ -1030,6 +1030,25 @@ class ElfEmbedder:
                 blob_size = _align_up(
                     max(seg["p_vaddr"] + seg["p_memsz"] for seg in dep_load_segments) - dep_base, _PAGE
                 )
+                # Minor final-review finding: p_memsz is an attacker-
+                # controlled field (it's read directly from a dependency
+                # file this module doesn't otherwise trust) with no
+                # inherent upper bound of its own -- a crafted/malformed
+                # dependency could declare a multi-exabyte p_memsz,
+                # turning `bytearray(blob_size)` just below into an
+                # unbounded-allocation DoS before any other validation
+                # ever runs. Real shared objects never need anywhere
+                # close to this; failing loudly on an obviously-absurd
+                # size (comfortably above any legitimate real-world .so,
+                # by many orders of magnitude) costs nothing for a
+                # genuine dependency and avoids attempting the
+                # allocation at all for an adversarial one.
+                _MAX_SANE_BLOB_SIZE = 1 << 34  # 16 GiB
+                if blob_size > _MAX_SANE_BLOB_SIZE:
+                    raise ValueError(
+                        f"dependency '{node.name}' declares an implausibly large mapped "
+                        f"size ({blob_size} bytes); refusing to allocate it"
+                    )
                 blob = bytearray(blob_size)
                 for seg in dep_load_segments:
                     data = seg.data()
@@ -1463,6 +1482,28 @@ class ElfEmbedder:
                     # method introduces -- unlike a NULL or an address
                     # pointing somewhere else entirely (e.g. still-external
                     # data), which needs no fixup at all.
+                    #
+                    # Known architectural limitation (documented, not
+                    # fixed -- see PLAN.md's "Known problems" entry for
+                    # this): this only ever checks the copied value AS A
+                    # WHOLE, and only when it's exactly one pointer wide.
+                    # A larger COPY-relocated object (e.g. a struct with
+                    # its OWN interior pointer field, not just scalar
+                    # data) could have such a field pointing into the
+                    # dependency's own blob too, needing the exact same
+                    # fixup at that field's own offset -- but nothing
+                    # here can tell, from `size`/`src`'s raw bytes alone,
+                    # which sub-offsets of a >ptr_size object are even
+                    # pointers at all. ELF's own COPY-relocation symbol
+                    # info carries only `st_size` (a byte count), no
+                    # type/layout metadata; doing this correctly in
+                    # general needs DWARF type info this module doesn't
+                    # use anywhere else. Every real COPY-relocated symbol
+                    # this module has actually been tested against (this
+                    # project's own fixtures, and bash/libtinfo.so.6's
+                    # termcap globals in Task 10b) happens to be
+                    # pointer-sized or smaller, so this gap is currently
+                    # unexercised in practice.
                     if size == ptr_size:
                         copied_value = _read_int(src, 0, ptr_size)
                         if X <= copied_value < X + len(dep_blob_by_base[X]):

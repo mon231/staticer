@@ -1,9 +1,11 @@
 import os
 import platform
+import struct
 import subprocess
 from pathlib import Path
 
 import pytest
+from elftools.elf.elffile import ELFFile
 
 from conftest import FIXTURES, build_exe, build_shared_lib
 
@@ -66,6 +68,38 @@ def test_architecture_mismatch_fails_loudly(tmp_path, c_compiler, bits):
 
     with pytest.raises(ValueError):
         ElfEmbedder(exe, tmp_path / "out", set(), lib_dir=tmp_path).embed()
+
+
+def test_adversarial_dependency_memsz_fails_loudly_not_oom(tmp_path, c_compiler):
+    """Minor final-review finding: a dependency's own PT_LOAD p_memsz is
+    attacker-controlled (this module reads it directly, with no inherent
+    upper bound) -- a crafted/malformed dependency declaring a
+    multi-exabyte p_memsz would otherwise make embed() attempt an
+    unbounded `bytearray(blob_size)` allocation (a DoS) before any other
+    validation runs. Binary-surgery a real .so's own first PT_LOAD
+    segment's p_memsz up to an absurd value and confirm embed() raises a
+    clean ValueError instead of trying (and likely failing/hanging on)
+    that allocation."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.so", pic=True, bits=64)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main", [so], pic=True, bits=64)
+
+    with open(so, "rb") as f:
+        elf = ELFFile(f)
+        e_phoff = elf["e_phoff"]
+        e_phentsize = elf["e_phentsize"]
+        load_idx = next(
+            i for i in range(elf.num_segments()) if elf.get_segment(i)["p_type"] == "PT_LOAD"
+        )
+    # Elf64_Phdr field order: p_type, p_flags, p_offset, p_vaddr, p_paddr,
+    # p_filesz, p_memsz, p_align -- p_memsz is the 7th 8-byte-aligned
+    # field (after two 4-byte fields and four 8-byte fields).
+    p_memsz_off = e_phoff + load_idx * e_phentsize + 4 + 4 + 8 + 8 + 8 + 8
+    data = bytearray(so.read_bytes())
+    struct.pack_into("<Q", data, p_memsz_off, 1 << 62)
+    so.write_bytes(bytes(data))
+
+    with pytest.raises(ValueError, match="implausibly large"):
+        ElfEmbedder(exe, tmp_path / "out", exclude=set(), lib_dir=tmp_path).embed()
 
 
 @pytest.mark.parametrize("bits", [32, 64])
