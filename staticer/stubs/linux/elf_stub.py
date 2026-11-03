@@ -64,6 +64,84 @@ a non-empty set.
 from typing import List, Set, Tuple
 
 
+def build_linux_init_array_stub(*, is64: bool, init_calls: List[int]) -> Tuple[bytes, List[int]]:
+    """B6-ELF: the ``.so``-as-input counterpart of ``build_linux_stub``.
+
+    ``ld.so``/the dynamic linker never invokes ``e_entry`` for anything
+    other than the process's own main executable -- a shared object
+    loaded via ``dlopen`` (or as an ordinary ``DT_NEEDED`` dependency) has
+    its ``e_entry`` field completely ignored. Its *own* constructors run
+    instead via the completely separate ``DT_INIT_ARRAY`` mechanism,
+    called by ``_dl_init`` as ordinary functions (per glibc's own
+    convention, with ``(argc, argv, envp)`` arguments -- irrelevant here,
+    since this stub never uses them and every embedded dependency's own
+    ``.init_array`` entries are themselves plain zero-argument functions).
+    So, when the embedder's own input is a ``.so`` (not an executable),
+    this stub is installed as a brand-new, *additional* entry in the
+    host's own ``DT_INIT_ARRAY`` instead of as the new ``e_entry`` --
+    see ``ElfEmbedder.embed()`` for exactly how that's wired in.
+
+    Being called as an ordinary function (via a normal ``call``
+    instruction from ``_dl_init``, not handed control directly as a
+    process entrypoint) makes this much simpler than
+    ``build_linux_stub``: no stack-realignment-then-restore dance is
+    needed around the whole call sequence (the System V ABI already
+    guarantees call-site alignment at the point ``_dl_init`` calls this
+    stub, exactly the same guarantee any ordinary compiled function
+    relies on), and there's no ``rtld_fini`` register to preserve either
+    (that's an ``e_entry``-only concept -- this stub isn't the process
+    entrypoint, so ld.so never hands it anything like that at all). All
+    that's actually needed is the ordinary callee-saved-register
+    discipline any hand-written function must observe: one callee-saved
+    register (``r12``/``edi``) is pushed, used to remember the original,
+    correctly call-site-aligned stack pointer, clobbered to force
+    alignment for this stub's *own* outgoing calls (defensive -- a
+    well-behaved caller already guarantees it, but this costs nothing and
+    protects against any caller that doesn't), restored, and the saved
+    register is popped back before an ordinary ``ret``.
+
+    Returns ``(stub_bytes, reloc_offsets)`` exactly like
+    ``build_linux_stub`` -- see its own docstring for why a new host
+    ``R_*_RELATIVE`` entry is needed at each returned offset.
+    """
+    reloc_offsets: List[int] = []
+    out = bytearray()
+
+    def emit_call(addr: int) -> None:
+        if is64:
+            reloc_offsets.append(len(out) + 2)  # +2: past "mov rax," opcode bytes
+            out.extend(b"\x48\xB8")  # mov rax, imm64
+            out.extend(addr.to_bytes(8, "little"))
+            out.extend(b"\xFF\xD0")  # call rax
+        else:
+            reloc_offsets.append(len(out) + 1)  # +1: past "mov eax," opcode byte
+            out.extend(b"\xB8")  # mov eax, imm32
+            out.extend(addr.to_bytes(4, "little"))
+            out.extend(b"\xFF\xD0")  # call eax
+
+    if is64:
+        out.extend(b"\x41\x54")  # push r12  (save caller's r12 -- callee-saved under SysV x86-64)
+        out.extend(b"\x49\x89\xE4")  # mov r12, rsp  (remember our own restore point)
+        out.extend(b"\x48\x83\xE4\xF0")  # and rsp, -16  (defensive call-site realignment)
+    else:
+        out.extend(b"\x57")  # push edi  (save caller's edi -- callee-saved under cdecl)
+        out.extend(b"\x89\xE7")  # mov edi, esp  (remember our own restore point)
+        out.extend(b"\x83\xE4\xF0")  # and esp, -16  (defensive call-site realignment)
+
+    for addr in init_calls:
+        emit_call(addr)
+
+    if is64:
+        out.extend(b"\x4C\x89\xE4")  # mov rsp, r12  (restore our own restore point)
+        out.extend(b"\x41\x5C")  # pop r12  (restore caller's r12)
+    else:
+        out.extend(b"\x89\xFC")  # mov esp, edi  (restore our own restore point)
+        out.extend(b"\x5F")  # pop edi  (restore caller's edi)
+    out.extend(b"\xC3")  # ret  (ordinary return to _dl_init)
+
+    return bytes(out), reloc_offsets
+
+
 def build_linux_stub(
     init_order: List[str],
     hooked_names: Set[str],

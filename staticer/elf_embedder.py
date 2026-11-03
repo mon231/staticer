@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from elftools.elf.elffile import ELFFile
 
 from .common.depgraph import build_dependency_graph, embed_order
-from .stubs.linux.elf_stub import build_linux_stub
+from .stubs.linux.elf_stub import build_linux_init_array_stub, build_linux_stub
 
 # -- ELF constants pyelftools doesn't expose as plain ints for our needs --
 # (it hands back Enum-mapped strings for e.g. p_type/d_tag, which is fine
@@ -1375,24 +1375,111 @@ class ElfEmbedder:
                 entry_off = table_file_offset + idx * entry_size
                 raw[entry_off:entry_off + entry_size] = b"\x00" * entry_size
 
-        # -- generated entrypoint stub (calls each embedded dependency's
-        #    own .init_array constructors, in dependencies-first order,
-        #    then jumps to the original entry) -- see build_linux_stub's
-        #    own docstring for exactly what it does and doesn't do (the
-        #    dlopen/dlsym hook `hooked_names` implies isn't implemented
-        #    yet). Only installed when there's actually something for it
-        #    to do (`init_array_calls` non-empty) -- e_entry is otherwise
-        #    left completely untouched, exactly as before this task,
-        #    rather than installing a stub that would just immediately
+        # -- B6-ELF: is the INPUT itself a shared object, rather than an
+        #    executable? -- ld.so never calls e_entry for anything but the
+        #    process's own main executable; a .so loaded via dlopen (or as
+        #    an ordinary DT_NEEDED dependency) has e_entry completely
+        #    ignored, so installing the generated init-call stub as the
+        #    new e_entry (as the EXE-input branch just below does) would
+        #    silently never run it at all. ET_EXEC always means "the
+        #    input is an ordinary non-PIE executable" -- no ambiguity. An
+        #    ET_DYN input, though, is ambiguous by itself: a modern PIE
+        #    executable is ALSO ET_DYN, indistinguishable from a plain
+        #    shared library by e_type alone. The real-world disambiguator
+        #    GNU ld actually emits is DF_1_PIE in DT_FLAGS_1 (confirmed
+        #    against this project's own toolchain's `readelf -d` output on
+        #    one of its own PIE fixtures: "Flags: NOW PIE") -- set only
+        #    for an ET_DYN that's actually meant to be executed directly,
+        #    never for an ordinary .so. Its absence on an ET_DYN input is
+        #    this method's signal that the input is a genuine shared
+        #    object, and the e_entry-based mechanism isn't applicable.
+        DF_1_PIE = 0x08000000
+        host_is_pie_exe = (elf["e_type"] == "ET_DYN") and bool((_host_dyn_tag_val("DT_FLAGS_1") or 0) & DF_1_PIE)
+        host_is_so_input = (elf["e_type"] == "ET_DYN") and not host_is_pie_exe
+
+        # -- generated entrypoint/init-array stub (calls each embedded
+        #    dependency's own .init_array constructors, in dependencies-
+        #    first order) -- see build_linux_stub's/
+        #    build_linux_init_array_stub's own docstrings for exactly what
+        #    each does and doesn't do (the dlopen/dlsym hook
+        #    `hooked_names` implies isn't implemented yet, for the
+        #    EXE-input stub). Only installed when there's actually
+        #    something for it to do (`init_array_calls` non-empty) --
+        #    e_entry/DT_INIT_ARRAY are otherwise left completely
+        #    untouched, exactly as before this task, rather than
+        #    installing a stub that would just immediately return/
         #    tail-jump with no other effect. Must run *before* the
         #    combined relocation table just below, since the stub's own
         #    embedded absolute-VA immediates need new R_*_RELATIVE entries
         #    of their own (for ASLR-safety -- see build_linux_stub's
         #    docstring), and that table is built once, from whatever's in
         #    `new_reloc_entries` at that point.
-        if init_array_calls:
+        entry_stub_vaddr = None  # only set in the EXE/PIE-exe branch below
+        if init_array_calls and host_is_so_input:
+            init_array_stub_vaddr = next_vaddr
+            stub_bytes, stub_reloc_offsets = build_linux_init_array_stub(is64=is64, init_calls=init_array_calls)
+            new_sections.append((init_array_stub_vaddr, stub_bytes))
+            next_vaddr = _align_up(init_array_stub_vaddr + len(stub_bytes), _PAGE)
+            for off in stub_reloc_offsets:
+                new_reloc_entries.append((init_array_stub_vaddr + off, _read_int(stub_bytes, off, ptr_size)))
+
+            # Inject it as a brand-new, prepended entry in the host's own
+            # DT_INIT_ARRAY -- the dynamic linker's normal, built-in
+            # mechanism for calling a shared object's own constructors
+            # when it's loaded (unlike e_entry, which it never touches
+            # for anything but the main executable). Prepended (runs
+            # before the host's own pre-existing constructors) to match
+            # this method's own "dependencies-first" ordering convention
+            # elsewhere. Only the array's *content* needs to grow at a
+            # new location (re-pointing the already-existing DT_INIT_ARRAY/
+            # DT_INIT_ARRAYSZ tags' own d_val fields in place, same
+            # pattern as DT_SYMTAB/DT_STRTAB/DT_RELA growth elsewhere in
+            # this method) -- no new *tag* needs adding to the dynamic
+            # array itself, unlike B2's DT_NEEDED fix, since every
+            # GCC-built .so already carries crtstuff's own DT_INIT_ARRAY/
+            # DT_INIT_ARRAYSZ tags (frame_dummy/register_tm_clones) even
+            # with no user-written constructor at all. A .so genuinely
+            # built with neither tag at all (e.g. assembled by hand, or
+            # by a toolchain that omits crtstuff) is explicitly out of
+            # scope -- failing loudly here rather than also implementing
+            # "add two brand-new dynamic tags from scratch" for a case
+            # this project's own fixtures (and, empirically, every real
+            # GCC-built .so) never hits.
+            host_init_array_vaddr = _host_dyn_tag_val("DT_INIT_ARRAY")
+            host_init_array_sz = _host_dyn_tag_val("DT_INIT_ARRAYSZ")
+            if host_init_array_vaddr is None or not host_init_array_sz:
+                raise ValueError(
+                    f"'{self.input_path}' is a shared object with no existing DT_INIT_ARRAY "
+                    "of its own; injecting an embedded dependency's constructor call into "
+                    "a .so input with no constructors of its own isn't supported"
+                )
+            old_ia_off = vaddr_to_offset(host_init_array_vaddr, host_init_array_sz)
+            old_ia_bytes = bytes(raw[old_ia_off: old_ia_off + host_init_array_sz])
+            ptr_fmt = "<Q" if is64 else "<I"
+            new_ia_vaddr = next_vaddr
+            new_ia_bytes = struct.pack(ptr_fmt, init_array_stub_vaddr) + old_ia_bytes
+            new_sections.append((new_ia_vaddr, new_ia_bytes))
+            next_vaddr = _align_up(new_ia_vaddr + len(new_ia_bytes), ptr_size)
+
+            # Every slot in the new array -- our own new one AND each of
+            # the host's own original entries, now copied to a new
+            # location -- is itself a pointer value that needs the
+            # image's own load bias applied at load time, exactly like
+            # every other absolute-VA this method writes; the host's own
+            # original entries already had their OWN R_*_RELATIVE entries
+            # for their OLD location (left stale/dead in place, same
+            # pattern as every other abandoned old location in this
+            # method), which doesn't help them at their NEW one.
+            new_reloc_entries.append((new_ia_vaddr, init_array_stub_vaddr))
+            for i in range(host_init_array_sz // ptr_size):
+                old_val = _read_int(old_ia_bytes, i * ptr_size, ptr_size)
+                new_reloc_entries.append((new_ia_vaddr + ptr_size + i * ptr_size, old_val))
+
+            _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_INIT_ARRAY", new_ia_vaddr)
+            _set_dyn_tag_value(host_dyn, raw, ptr_size, "DT_INIT_ARRAYSZ", len(new_ia_bytes))
+        elif init_array_calls:
             original_entry_va = elf["e_entry"]
-            stub_vaddr = next_vaddr
+            entry_stub_vaddr = next_vaddr
             stub_bytes, stub_reloc_offsets = build_linux_stub(
                 [node.name for node in order],
                 set(),
@@ -1400,12 +1487,10 @@ class ElfEmbedder:
                 init_calls=init_array_calls,
                 original_entry=original_entry_va,
             )
-            new_sections.append((stub_vaddr, stub_bytes))
-            next_vaddr = _align_up(stub_vaddr + len(stub_bytes), _PAGE)
+            new_sections.append((entry_stub_vaddr, stub_bytes))
+            next_vaddr = _align_up(entry_stub_vaddr + len(stub_bytes), _PAGE)
             for off in stub_reloc_offsets:
-                new_reloc_entries.append((stub_vaddr + off, _read_int(stub_bytes, off, ptr_size)))
-        else:
-            stub_vaddr = None
+                new_reloc_entries.append((entry_stub_vaddr + off, _read_int(stub_bytes, off, ptr_size)))
 
         # -- combined relocation table -------------------------------------
         if new_reloc_entries or new_glob_dat_entries:
@@ -1795,13 +1880,16 @@ class ElfEmbedder:
             _write_int(raw, e_phnum_off, 2, old_phnum + len(fixed_base_segments))
 
         # e_entry is overwritten to point at the generated stub only when
-        # one was actually built (`stub_vaddr` set above, by the
-        # init_array_calls-gated block); otherwise it's left completely
-        # untouched. e_entry is a fixed, ptr-sized field immediately
-        # following e_ident/e_type/e_machine/e_version in every ELF32/
-        # ELF64 header alike.
-        if stub_vaddr is not None:
+        # one was actually built as an EXE/PIE-exe entrypoint stub
+        # (`entry_stub_vaddr` set above, by the init_array_calls-gated
+        # block's EXE/PIE-exe branch); otherwise -- including the B6-ELF
+        # .so-input case, where the init-array stub was installed via
+        # DT_INIT_ARRAY instead, never touching e_entry at all -- it's
+        # left completely untouched. e_entry is a fixed, ptr-sized field
+        # immediately following e_ident/e_type/e_machine/e_version in
+        # every ELF32/ELF64 header alike.
+        if entry_stub_vaddr is not None:
             e_entry_off = 16 + 2 + 2 + 4
-            _write_int(raw, e_entry_off, ptr_size, stub_vaddr)
+            _write_int(raw, e_entry_off, ptr_size, entry_stub_vaddr)
 
         self.output_path.write_bytes(bytes(raw))

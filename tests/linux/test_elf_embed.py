@@ -214,3 +214,34 @@ def test_embed_into_lazy_bound_host_with_plt_call(tmp_path, c_compiler, bits):
     assert result.returncode == 42, (
         f"lazy-bound host crashed (code {result.returncode}); stderr={result.stderr!r}"
     )
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_embed_into_so_input_runs_dependency_constructor(tmp_path, c_compiler, bits):
+    """B6-ELF regression test: the ElfEmbedder *input* is itself a shared
+    object (lib_so_host.c), not an executable. lib_ctor_a.so (which has a
+    real `__attribute__((constructor))`) gets embedded into it. The bug:
+    ld.so never calls e_entry for anything but the process's own main
+    executable, so a .so input's embedded dependency's constructor,
+    installed as the new e_entry (as for an EXE input), would never run
+    at all once the output .so is loaded via dlopen() -- confirmed by
+    actually dlopen()-ing the (pre-fix) output from a tiny throwaway host
+    program (dlopen_host.c) and observing host_seq_value() still return
+    -1 (lib_ctor_a.c's never-ran sentinel). The fix must hook the
+    constructor call into the .so's own DT_INIT_ARRAY instead."""
+    so_ctor = build_shared_lib(tmp_path, FIXTURES / "lib_ctor_a.c", "lib_ctor_a.so", pic=True, bits=bits)
+    host_so = build_shared_lib(
+        tmp_path, FIXTURES / "lib_so_host.c", "lib_so_host.so", pic=True, bits=bits,
+        extra_flags=[str(so_ctor)],
+    )
+    out = tmp_path / "static_so_host.so"
+
+    ElfEmbedder(host_so, out, exclude=set(), lib_dir=tmp_path).embed()
+
+    assert "lib_ctor_a.so" not in list_elf_imports(out)
+
+    driver = build_exe(tmp_path, FIXTURES / "dlopen_host.c", "dlopen_host", [], pic=True, bits=bits, extra_flags=["-ldl"])
+    result = subprocess.run([str(driver), str(out)], capture_output=True)
+    assert result.returncode == 0, (
+        f"embedded dependency's constructor didn't run; stderr={result.stderr!r}"
+    )
