@@ -34,6 +34,9 @@ IMAGE_REL_BASED_DIR64 = 10
 _IMAGE_DIRECTORY_ENTRY_IMPORT = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]
 _IMAGE_DIRECTORY_ENTRY_BASERELOC = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]
 _IMAGE_DIRECTORY_ENTRY_EXCEPTION = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXCEPTION"]
+_IMAGE_DIRECTORY_ENTRY_TLS = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_TLS"]
+_IMAGE_DIRECTORY_ENTRY_SECURITY = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
+_IMAGE_FILE_DLL = 0x2000  # FILE_HEADER.Characteristics bit: this image is a DLL
 
 # x64 UNWIND_INFO flags (IMAGE_DIRECTORY_ENTRY_EXCEPTION's RUNTIME_FUNCTION
 # entries point at one of these per function) -- see _adjust_unwind_info.
@@ -57,6 +60,27 @@ def list_pe_imports(path: Path) -> List[str]:
         return [entry.dll.decode("ascii") for entry in pe.DIRECTORY_ENTRY_IMPORT]
     finally:
         pe.close()
+
+
+class _CaseInsensitiveNameSet:
+    """A read-only, case-insensitive view over a set of DLL names, for
+    passing as ``build_dependency_graph``'s ``exclude`` argument from the
+    PE embedder only.
+
+    Windows filenames (and so DLL import names) are case-insensitive, but
+    ``build_dependency_graph`` itself (shared with the ELF embedder, where
+    filenames *are* case-sensitive) does a plain ``name in exclude`` set
+    membership test -- it can't be made case-insensitive for everyone
+    without changing ELF's correct case-sensitive semantics. Scoping the
+    fix to this wrapper, used only here, keeps that shared module
+    untouched. (``--exclude ws2_32.dll`` must exclude ``WS2_32.dll``.)
+    """
+
+    def __init__(self, names: Set[str]):
+        self._lower = {n.lower() for n in names}
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and name.lower() in self._lower
 
 
 def resolve_pe(name: str, search_dirs: List[Path]) -> Optional[Path]:
@@ -244,7 +268,8 @@ class PortableExecutableEmbedder:
         """
         search_dirs = self._search_dirs()
         graph = build_dependency_graph(
-            self.input_path, list_pe_imports, resolve_pe, search_dirs, self.lib_dir, self.exclude
+            self.input_path, list_pe_imports, resolve_pe, search_dirs, self.lib_dir,
+            _CaseInsensitiveNameSet(self.exclude),
         )
         order = embed_order(graph)
 
@@ -306,6 +331,32 @@ class PortableExecutableEmbedder:
             # dependency's raw export table (and X placement) is known --
             # see `global_raw_exports_by_dll` above.
             pending_host_iat_patches: List[tuple] = []
+            # Lowercased names of every dependency this embed() run is
+            # actually embedding (== every node in `order`) -- used below to
+            # tell whether one dependency's own import of another dependency
+            # must be patched out (see `pending_dep_iat_patches`) rather than
+            # merged into the combined dynamic import directory as-is (B1:
+            # leaving it dynamic would mean the final image both embeds the
+            # target DLL's code *and* still dynamically loads a second, disk-
+            # resident copy of it at runtime -- the duplicate-live-copy case
+            # the design spec's transitive-exclusion anti-goal forbids).
+            embedded_names_lower: Set[str] = {n.name.lower() for n in order}
+            # (dep_name_lower, slot_offset_in_dep_blob, target_dll_lower,
+            # name_or_ordinal) for every *dependency's own* import of another
+            # embedded dependency -- resolved in the same finalize pass as
+            # `pending_host_iat_patches` (a forward chain's ultimate target
+            # may not be known until every dependency has been placed), then
+            # patched directly into that dependency's own blob (looked up via
+            # `dep_blobs_by_name_lower`) rather than left as a live import
+            # descriptor.
+            pending_dep_iat_patches: List[tuple] = []
+            # Every embedded dependency's own blob (bytearray, mutable even
+            # once referenced from `new_sections`) and host RVA placement,
+            # keyed by lowercased name -- so the finalize pass above can
+            # patch a dependency's own IAT slot in place and compute the
+            # right host-relative RVA for the accompanying relocation entry.
+            dep_blobs_by_name_lower: Dict[str, bytearray] = {}
+            dep_X_by_name_lower: Dict[str, int] = {}
 
             for node in order:
                 dep = pefile.PE(str(node.path))
@@ -318,9 +369,55 @@ class PortableExecutableEmbedder:
                         )
 
                     dep.parse_data_directories()
+
+                    # B3: a dependency carrying its own TLS directory (any
+                    # __declspec(thread)/thread_local variable) cannot be
+                    # embedded correctly yet -- there's no code anywhere in
+                    # this module that merges TLS directories (allocates a
+                    # new `_tls_index` slot shared with the host, relocates
+                    # the dependency's TLS-relative data references, etc.),
+                    # so silently embedding it would either read garbage
+                    # through TLS slot 0 or silently alias onto the host's
+                    # own thread-local storage. Fail loudly (per the design
+                    # spec's anti-goal: silent corruption is the one
+                    # outcome worse than a loud failure) rather than ship
+                    # that. Full TLS-directory merging is future work.
+                    dep_tlsdir = dep.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_TLS]
+                    if dep_tlsdir.Size:
+                        raise ValueError(
+                            f"cannot embed dependency '{node.name}': it has its own "
+                            f"Thread Local Storage (TLS) directory (a "
+                            f"__declspec(thread)/thread_local variable), which "
+                            f"staticer does not yet support merging -- embedding it "
+                            f"would silently corrupt TLS access rather than fail "
+                            f"loudly"
+                        )
+
                     dep_image_base = dep.OPTIONAL_HEADER.ImageBase
                     blob_size = _align_up(dep.OPTIONAL_HEADER.SizeOfImage, section_alignment)
                     blob = bytearray(blob_size)
+
+                    # B4: the dependency's own PE header region (DOS header
+                    # through its section headers, i.e. everything before
+                    # its first section's raw data) is never covered by
+                    # `dep.sections`' own data -- without copying it too,
+                    # that region of the embedded blob stays all zeros, and
+                    # anything that reads its own module header via its own
+                    # HINSTANCE (which, once embedded, *is* this blob's
+                    # placement address) -- e.g. mingw's pseudo-relocation
+                    # startup check, or any lookup through its own DOS/PE
+                    # header -- finds zeros instead of a real header and
+                    # fails before any of the dependency's own code runs.
+                    # Every field in this region is either a plain RVA
+                    # (unaffected by where the blob is ultimately placed --
+                    # that's the entire point of an RVA) or not consulted at
+                    # all once we're not going through the real PE loader,
+                    # so a verbatim byte copy (no further patching) is
+                    # sufficient.
+                    dep_raw = node.path.read_bytes()
+                    size_of_headers = min(dep.OPTIONAL_HEADER.SizeOfHeaders, blob_size, len(dep_raw))
+                    blob[0:size_of_headers] = dep_raw[0:size_of_headers]
+
                     for sec in dep.sections:
                         raw = sec.get_data()
                         start = sec.VirtualAddress
@@ -505,6 +602,27 @@ class PortableExecutableEmbedder:
                     if hasattr(dep, "DIRECTORY_ENTRY_IMPORT"):
                         ordinal_flag = (1 << 63) if is64 else (1 << 31)
                         for entry in dep.DIRECTORY_ENTRY_IMPORT:
+                            entry_dll_lower = entry.dll.decode("ascii").lower()
+                            # B1: if this dependency's own import target is
+                            # itself one of the dependencies being embedded
+                            # in this same embed() run, merging this
+                            # descriptor into the combined dynamic import
+                            # directory as-is (the `else` branch below)
+                            # would leave the final image *both* embedding
+                            # the target's code *and* still dynamically
+                            # importing a second, disk-resident copy of it
+                            # at runtime -- the duplicate-live-copy case
+                            # (or `0xC0000135` if no disk copy exists) the
+                            # design spec's transitive-exclusion anti-goal
+                            # forbids. Instead, patch this dependency's own
+                            # IAT slots directly to the target's resolved
+                            # address (deferred to the finalize pass below,
+                            # mirroring `pending_host_iat_patches`, since
+                            # the target may not have its own placement/
+                            # export table yet) and drop the live
+                            # descriptor entirely.
+                            target_is_embedded = entry_dll_lower in embedded_names_lower
+
                             thunk_rvas = []
                             if entry.struct.OriginalFirstThunk:
                                 thunk_rvas.append(entry.struct.OriginalFirstThunk)
@@ -523,21 +641,59 @@ class PortableExecutableEmbedder:
                                         new_val = raw + X
                                         blob[off:off + ptr_size] = new_val.to_bytes(ptr_size, "little")
                                     idx += 1
-                            merged_descriptors.append({
-                                "name_rva": X + entry.struct.Name,
-                                "orig_first_thunk_rva": (
-                                    X + entry.struct.OriginalFirstThunk if entry.struct.OriginalFirstThunk else 0
-                                ),
-                                "first_thunk_rva": X + entry.struct.FirstThunk,
-                            })
+
+                            if target_is_embedded:
+                                for imp in entry.imports:
+                                    if imp.import_by_ordinal:
+                                        key = imp.ordinal
+                                    else:
+                                        if imp.name is None:
+                                            raise ValueError(
+                                                f"cannot embed '{node.name}': its own "
+                                                f"import of '{entry_dll_lower}' has an "
+                                                f"entry with neither a name nor an "
+                                                f"ordinal"
+                                            )
+                                        key = imp.name.decode("ascii")
+                                    # `imp.address` is the VA pefile computed
+                                    # for the FirstThunk (IAT) slot itself --
+                                    # the same slot this dependency's own
+                                    # compiled call sites read through --
+                                    # using dep's *own* (unrelocated)
+                                    # ImageBase, so subtracting that back
+                                    # out gives the slot's offset within
+                                    # `blob` (unaffected by X, which isn't
+                                    # known to have a final patch target
+                                    # yet -- see `pending_dep_iat_patches`).
+                                    slot_offset_in_blob = imp.address - dep_image_base
+                                    pending_dep_iat_patches.append(
+                                        (node.name.lower(), slot_offset_in_blob, entry_dll_lower, key)
+                                    )
+                            else:
+                                merged_descriptors.append({
+                                    "name_rva": X + entry.struct.Name,
+                                    "orig_first_thunk_rva": (
+                                        X + entry.struct.OriginalFirstThunk if entry.struct.OriginalFirstThunk else 0
+                                    ),
+                                    "first_thunk_rva": X + entry.struct.FirstThunk,
+                                })
 
                     entry_rva = dep.OPTIONAL_HEADER.AddressOfEntryPoint
                     if entry_rva:
                         dep_entry_calls.append((node.name, image_base + X, image_base + X + entry_rva))
 
+                    # Keep `blob` itself (not a `bytes()` snapshot) in
+                    # `new_sections` -- it's still a mutable bytearray, and
+                    # `pending_dep_iat_patches`'s finalize pass (after this
+                    # loop, before the actual file write-out below) patches
+                    # this same dependency's own IAT slots in place via
+                    # `dep_blobs_by_name_lower`, which must observe those
+                    # writes.
                     new_sections.append((
-                        f".sdep{len(new_sections)}".encode("ascii"), bytes(blob), X, _SCN_CODE_RWX, len(blob),
+                        f".sdep{len(new_sections)}".encode("ascii"), blob, X, _SCN_CODE_RWX, len(blob),
                     ))
+                    dep_blobs_by_name_lower[node.name.lower()] = blob
+                    dep_X_by_name_lower[node.name.lower()] = X
                     occupied_ranges.append((X, X + blob_size, node.name))
                     # For the reloc-bearing path X == next_rva always, so
                     # this is equivalent to the old unconditional
@@ -595,6 +751,27 @@ class PortableExecutableEmbedder:
                     (iat_slot_rva, IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW)
                 )
 
+            # -- finalize deferred dependency-to-dependency IAT patches (B1) --
+            # Mirrors the host-IAT finalize pass immediately above: every
+            # dependency in `order` now has an `X` placement and raw export
+            # table, so every other dependency's own import of an embedded
+            # dependency (`pending_dep_iat_patches`, recorded in the main
+            # loop above) can now be resolved and patched directly into
+            # that *importing* dependency's own blob -- `dep_blobs_by_name_
+            # lower` still holds the same mutable bytearray referenced from
+            # `new_sections`, so this write is visible when that section's
+            # bytes are actually laid out into `output` below.
+            for dep_name_lower, slot_offset_in_blob, dll_lower, key in pending_dep_iat_patches:
+                target_va = _resolve_raw_export(dll_lower, key)
+                dep_blob = dep_blobs_by_name_lower[dep_name_lower]
+                dep_blob[slot_offset_in_blob:slot_offset_in_blob + ptr_size] = target_va.to_bytes(
+                    ptr_size, "little"
+                )
+                dep_X = dep_X_by_name_lower[dep_name_lower]
+                new_reloc_entries.append(
+                    (dep_X + slot_offset_in_blob, IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW)
+                )
+
             # -- merged/combined import directory -------------------------
             if removed_dll_names_lower or merged_descriptors:
                 combined: List[Dict[str, int]] = []
@@ -632,6 +809,14 @@ class PortableExecutableEmbedder:
                 dep_entry_vas = {name: (hinst, entry) for name, hinst, entry in dep_entry_calls}
 
                 stub_rva = next_rva
+                # B6-PE: when the host (the file embed() is embedding
+                # *into*, not a dependency) is itself a DLL, this stub
+                # becomes its real DllEntryPoint/DllMain -- called by the
+                # OS on every thread attach/detach and process detach, not
+                # just once -- so build_windows_stub must guard the
+                # per-dependency init-call block to DLL_PROCESS_ATTACH
+                # only (see its own docstring on `host_is_dll`).
+                host_is_dll = bool(pe.FILE_HEADER.Characteristics & _IMAGE_FILE_DLL)
                 stub_bytes, abs_va_offsets = build_windows_stub(
                     init_order_names,
                     # The design's LoadLibraryW/GetProcAddress-interception
@@ -643,6 +828,7 @@ class PortableExecutableEmbedder:
                     is64=is64,
                     dep_entry_vas=dep_entry_vas,
                     original_entry_va=original_entry_va,
+                    host_is_dll=host_is_dll,
                 )
                 for off in abs_va_offsets:
                     new_reloc_entries.append((stub_rva + off, reloc_type))
@@ -790,6 +976,23 @@ class PortableExecutableEmbedder:
                 sz_off = excdir.get_field_absolute_offset("Size")
                 output[va_off:va_off + 4] = struct.pack("<I", exc_rva)
                 output[sz_off:sz_off + 4] = struct.pack("<I", len(exc_bytes))
+
+            # Authenticode (IMAGE_DIRECTORY_ENTRY_SECURITY) is left dangling
+            # otherwise: embed() always mutates the host's bytes once there
+            # is anything to embed (we're well past the early `if not
+            # order: return` above), which invalidates any existing
+            # Authenticode signature -- but the signature *directory entry*
+            # itself isn't touched by anything above, so it would still
+            # point at a (now-stale) WIN_CERTIFICATE blob, making the
+            # output look signed-but-tampered rather than plainly unsigned.
+            # A stale-but-present signature is more misleading than no
+            # signature at all, so strip the directory entry outright.
+            secdir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_SECURITY]
+            if secdir.Size:
+                va_off = secdir.get_field_absolute_offset("VirtualAddress")
+                sz_off = secdir.get_field_absolute_offset("Size")
+                output[va_off:va_off + 4] = struct.pack("<I", 0)
+                output[sz_off:sz_off + 4] = struct.pack("<I", 0)
 
             self.output_path.write_bytes(bytes(output))
         finally:

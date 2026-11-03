@@ -21,6 +21,36 @@ def test_parse_args_exclude_is_comma_split():
     assert ns.exclude == {"a.dll", "b.dll"}
 
 
+def test_parse_args_lib_dir_omitted_stays_none():
+    ns = parse_args(["in.exe", "-o", "out.exe"])
+    assert ns.lib_dir is None
+
+
+def test_parse_args_lib_dir_empty_string_is_rejected(capsys):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["in.exe", "-o", "out.exe", "--lib-dir", ""])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--lib-dir" in err and "must not be empty" in err
+
+
+def test_parse_args_lib_dir_nonexistent_is_rejected(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["in.exe", "-o", "out.exe", "--lib-dir", str(tmp_path / "missing")])
+    assert exc.value.code == 2
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_main_rejects_empty_lib_dir_cleanly(tmp_path, capsys):
+    out = tmp_path / "out.exe"
+    with pytest.raises(SystemExit) as exc:
+        main([str(tmp_path / "in.exe"), "-o", str(out), "--lib-dir", ""])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--lib-dir" in err and "Traceback" not in err
+    assert not out.exists()
+
+
 # ---------------------------------------------------------------------------
 # sniff_format
 # ---------------------------------------------------------------------------

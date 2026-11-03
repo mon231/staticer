@@ -129,6 +129,35 @@ def _x86_tail_jmp(target_va: int) -> Tuple[bytes, List[int]]:
     return data, [len(mov_eax_op)]
 
 
+_DLL_PROCESS_ATTACH = 1
+
+
+def _x64_process_attach_guard(skip_len: int) -> bytes:
+    # cmp edx, 1 ; jne +skip_len -- this stub's entrypoint *is* the host's
+    # real DllEntryPoint/DllMain when the host being embedded into is
+    # itself a DLL (see build_windows_stub's `host_is_dll`), so it's called
+    # by the OS loader not just once at process-attach but also on every
+    # thread attach/detach and on process-detach, each time with a
+    # different `fdwReason` (the Windows x64 calling convention's 2nd
+    # integer argument, in EDX) -- B6-PE: without this guard, every
+    # embedded dependency's own process-attach-style init would spuriously
+    # re-run on every one of those too. `skip_len` is the length of the
+    # per-dependency init-call block immediately following this guard (the
+    # `jne` lands exactly at the tail-jump to `original_entry_va`, which
+    # must always run regardless of `fdwReason` so the host's own real
+    # DllMain still sees every notification it's supposed to).
+    return b"\x83\xFA\x01" + b"\x0F\x85" + skip_len.to_bytes(4, "little", signed=True)
+
+
+def _x86_process_attach_guard(skip_len: int) -> bytes:
+    # cmp dword [esp+8], 1 ; jne +skip_len -- same guard as the x64
+    # version above, but fdwReason is __stdcall's 2nd stack argument here
+    # ([esp+0]=return address, [esp+4]=hinstDLL, [esp+8]=fdwReason) rather
+    # than a register, since this stub's entrypoint hasn't pushed anything
+    # of its own yet at this point.
+    return b"\x83\x7C\x24\x08\x01" + b"\x0F\x85" + skip_len.to_bytes(4, "little", signed=True)
+
+
 def build_windows_stub(
     init_order: List[str],
     hooked_names: Set[str],
@@ -136,6 +165,7 @@ def build_windows_stub(
     is64: bool,
     dep_entry_vas: Dict[str, Tuple[int, int]],
     original_entry_va: int,
+    host_is_dll: bool = False,
 ) -> Tuple[bytes, List[int]]:
     """Machine code for the host's new entrypoint: one DllMain-style
     process-attach call per name in `init_order` (in that order), using
@@ -149,20 +179,46 @@ def build_windows_stub(
     `hooked_names` is accepted for interface compatibility with the
     design's LoadLibraryW/GetProcAddress interception goal but is not yet
     acted on -- see this module's docstring ("Hook mechanism").
+
+    `host_is_dll` (B6-PE): when the host being embedded into is itself a
+    DLL (not an EXE), this stub becomes the module's real
+    DllEntryPoint/DllMain, which the OS loader calls on *every*
+    DLL_PROCESS_ATTACH/_THREAD_ATTACH/_THREAD_DETACH/_PROCESS_DETACH
+    notification -- not just once. Per the design spec's existing
+    non-goal (thread notifications and detach are not required to be
+    forwarded to each embedded dependency), the per-dependency init-call
+    block must only run on DLL_PROCESS_ATTACH; every other notification
+    must skip straight to the tail-jump so the host's own real DllMain
+    still receives it untouched. When false (the EXE-host case), no guard
+    is emitted at all -- behavior is unchanged from before this parameter
+    existed.
     """
     del hooked_names  # deferred -- see module docstring
 
     call_fn = _x64_call_dllmain if is64 else _x86_call_dllmain
     tail_jmp_fn = _x64_tail_jmp if is64 else _x86_tail_jmp
+    guard_fn = _x64_process_attach_guard if is64 else _x86_process_attach_guard
 
-    stub_bytes = bytearray()
-    abs_va_offsets: List[int] = []
+    init_calls_bytes = bytearray()
+    init_call_abs_offsets: List[int] = []
     for name in init_order:
         hinst_va, entry_va = dep_entry_vas[name]
         block, offs = call_fn(hinst_va, entry_va)
         for off in offs:
-            abs_va_offsets.append(len(stub_bytes) + off)
-        stub_bytes += block
+            init_call_abs_offsets.append(len(init_calls_bytes) + off)
+        init_calls_bytes += block
+
+    stub_bytes = bytearray()
+    abs_va_offsets: List[int] = []
+
+    if host_is_dll:
+        guard_bytes = guard_fn(len(init_calls_bytes))
+        stub_bytes += guard_bytes
+
+    base_offset = len(stub_bytes)
+    for off in init_call_abs_offsets:
+        abs_va_offsets.append(base_offset + off)
+    stub_bytes += init_calls_bytes
 
     tail_block, tail_offs = tail_jmp_fn(original_entry_va)
     for off in tail_offs:
