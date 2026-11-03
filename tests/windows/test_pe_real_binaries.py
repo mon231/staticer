@@ -43,24 +43,28 @@ mechanism):
     dependencies-first embed loop.
 
 Known, NOT fixed, open gap -- see ``test_second_real_binary_full_closure``:
-embedding a real CRT-class system DLL (``msvcrt.dll``) and manually
-invoking its own ``DllMain`` via the project's generated entrypoint stub
-(as full-closure embedding does for every embedded dependency with an
-entry point) causes the resulting process to fail at startup with a
-loader-related STATUS error (observed to vary -- STATUS_ENTRYPOINT_NOT_FOUND
-when msvcrt.dll alone is embedded in isolation, STATUS_ACCESS_VIOLATION in
-the full 6-DLL closure this test actually exercises, likely depending on
-which embedded DLL's DllMain faults first) -- even though ``embed()`` itself
-succeeds and the output loads fine via ``LoadLibrary`` (so it is not an
-import-table corruption; it reproduces specifically when the real process
-entry stub runs and calls a real system DLL's own process-attach path out
-of band). This is
-architecturally the same simplification ``staticer/stubs/windows/pe_stub.py``
-already documents (the stub is a flat DllMain-call sequence, not a full
-loader emulation) -- making arbitrary real system DLLs' own startup paths
-safe to invoke this way is a materially bigger undertaking than this task's
-scope, so it's marked ``xfail`` rather than silently swallowed or papered
-over.
+embedding hostname.exe's full resolvable closure pulls in KERNELBASE.dll,
+which carries its own non-empty TLS directory (a real
+``__declspec(thread)`` variable) -- PortableExecutableEmbedder.embed() now
+refuses this loudly (ValueError, see the PE-track final-review fix wave's
+B3 item) rather than silently embedding it incorrectly.
+
+UPDATE (final-review fix wave, Track A): this xfail's reason text used to
+attribute the failure to manually invoking a real system DLL's own DllMain
+out of band (msvcrt.dll specifically). That was this test's *symptom* at
+the time, not its root cause -- re-run against the fixed embedder (after
+B1's dependency-to-dependency-import fix and B3's TLS guard both landed),
+the *actual* blocker surfacing first is KERNELBASE.dll's TLS directory
+(confirmed by real execution: embed() now raises ValueError naming
+KERNELBASE.dll before the stub/DllMain-invocation code path is ever
+reached). It's left xfail (same bottom line: full-closure embedding of
+this real system binary doesn't work yet) but for a different, now
+correctly-attributed reason -- TLS-directory merging is real future work
+(B3's docstring in pe_embedder.py), not stub/entrypoint work. Whether the
+DllMain-out-of-band concern is *also* real for some other real binary
+without a TLS-carrying dependency is still an open question this fix wave
+didn't need to resolve, since this particular xfail no longer reaches that
+code path at all.
 """
 
 import os
@@ -173,23 +177,16 @@ def test_second_real_binary_curated_subset(tmp_path):
 @pytest.mark.xfail(
     reason=(
         "Real, discovered gap (not papered over -- see this module's "
-        "docstring): embedding hostname.exe's full resolvable closure "
-        "pulls in msvcrt.dll, and embed()'s generated entrypoint stub "
-        "manually invokes msvcrt.dll's own DllMain out of band (exactly "
-        "as it does for every embedded dependency with an entry point). "
-        "embed() itself succeeds and the output loads fine via "
-        "LoadLibrary, but running it as a process fails at startup with "
-        "a loader-related STATUS error (observed to vary by environment "
-        "-- e.g. STATUS_ENTRYPOINT_NOT_FOUND or STATUS_ACCESS_VIOLATION, "
-        "depending on which embedded DLL's DllMain faults first) -- a "
-        "real system DLL's own process-attach path doesn't tolerate "
-        "being called this way. "
-        "Making arbitrary real system CRT/loader-adjacent DLLs' own "
-        "startup paths safe to invoke out of band is a substantially "
-        "bigger undertaking than this task's scope (it's the same kind "
-        "of simplification staticer/stubs/windows/pe_stub.py's own "
-        "module docstring already flags for its DllMain-call stub), so "
-        "this is left as an open, documented gap rather than a quick fix."
+        "docstring's UPDATE note): embedding hostname.exe's full "
+        "resolvable closure pulls in KERNELBASE.dll, which carries its "
+        "own TLS directory (a real __declspec(thread) variable) -- "
+        "embed() now correctly refuses this with a loud ValueError (the "
+        "PE-track final review's B3 fix) rather than silently embedding "
+        "it wrong. TLS-directory merging (a new shared _tls_index slot, "
+        "relocating TLS-relative references) is real future work, not "
+        "yet implemented, so this stays xfail -- but for this reason now, "
+        "not the previously-documented DllMain-out-of-band-invocation "
+        "theory, which this test no longer even reaches."
     ),
     strict=True,
 )
