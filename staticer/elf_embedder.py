@@ -135,6 +135,29 @@ def _real_symtab_count(dyn, reloc_tables: dict) -> int:
     return count
 
 
+_EI_CLASS_OFFSET = 4  # fixed byte offset in e_ident, identical for ELF32/ELF64
+_ELFCLASS64 = 2
+
+
+def _peek_elfclass64(path: Path) -> bool:
+    """Whether `path` is a 64-bit ELF file (ELFCLASS64), read directly
+    from the single e_ident[EI_CLASS] byte rather than a full ELF parse
+    -- used only to pick a same-bitness-first multiarch search-dir order
+    (see `ElfEmbedder._search_dirs`); any malformed/unreadable input
+    here is caught properly, with a real diagnostic, by the full parse
+    `embed()` already does right after, so this deliberately doesn't
+    duplicate that error handling -- a bool default of False (32-bit)
+    on a read failure just means the search order picked here doesn't
+    matter, since `embed()` is about to fail loudly on the same file
+    for an unrelated, more informative reason moments later."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(_EI_CLASS_OFFSET)
+            return f.read(1) == bytes([_ELFCLASS64])
+    except OSError:
+        return False
+
+
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 1:
         return value
@@ -486,7 +509,29 @@ class ElfEmbedder:
         # the two supported triplets sidesteps that regardless of
         # whatever *other* architectures' multiarch directories happen
         # to also be installed.
-        for triplet in ("x86_64-linux-gnu", "i386-linux-gnu"):
+        #
+        # Moderate final-review finding: an earlier version of this
+        # method always listed "x86_64-linux-gnu" before
+        # "i386-linux-gnu" unconditionally, regardless of the HOST's own
+        # bitness -- resolve_elf's by-name search (see its own docstring)
+        # has no architecture awareness either, so for a genuinely
+        # 32-bit host/full-closure embed, a same-named file (e.g.
+        # "libc.so.6") sitting in the wrong-architecture (64-bit)
+        # multiarch directory would get resolved FIRST, pulled into the
+        # dependency graph, and only THEN rejected by this method's own
+        # (correct) architecture-mismatch check -- making 32-bit
+        # lib_dir=None/"full closure" embedding unusable in practice
+        # whenever both multiarch directories happen to carry a
+        # same-named file (the ordinary case on any real multiarch-
+        # enabled distro). Peeking at the host's own ELFCLASS (a single
+        # byte, e_ident[EI_CLASS] at a fixed offset -- no need for a full
+        # ELF parse just to pick a search order) and listing the
+        # matching-bitness triplet first fixes this: a 32-bit host now
+        # finds its own real i386-linux-gnu libc.so.6 before the
+        # wrong-architecture x86_64-linux-gnu one could ever shadow it.
+        host_is64 = _peek_elfclass64(self.input_path)
+        triplets = ("x86_64-linux-gnu", "i386-linux-gnu") if host_is64 else ("i386-linux-gnu", "x86_64-linux-gnu")
+        for triplet in triplets:
             for base in (Path("/usr/lib"), Path("/lib")):
                 candidate = base / triplet
                 if candidate.is_dir():

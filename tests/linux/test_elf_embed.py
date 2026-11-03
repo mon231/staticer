@@ -245,3 +245,46 @@ def test_embed_into_so_input_runs_dependency_constructor(tmp_path, c_compiler, b
     assert result.returncode == 0, (
         f"embedded dependency's constructor didn't run; stderr={result.stderr!r}"
     )
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_search_dirs_prefers_matching_bitness_multiarch_dir(tmp_path, c_compiler, bits, monkeypatch):
+    """Moderate final-review finding: with lib_dir=None, `_search_dirs()`
+    used to always list the x86_64-linux-gnu multiarch directory before
+    i386-linux-gnu, regardless of the HOST's own bitness -- making a
+    32-bit lib_dir=None/"full closure" embed unusable in practice
+    whenever a same-named file exists in both (the ordinary case on any
+    real multiarch-enabled distro, since resolve_elf's by-name search
+    has no architecture awareness of its own and would resolve the
+    *first* match). Pin the fix directly at the unit level: the
+    bitness-matching triplet must now come first for a real host of
+    that bitness.
+
+    `Path.is_dir` is monkeypatched to claim BOTH multiarch directories
+    exist, rather than relying on the real filesystem having both --
+    this project's own CI/dev boxes (confirmed on this one too) often
+    only have the 64-bit multiarch directory for real, which would
+    otherwise make the 32-bit half of this test vacuously
+    unobservable."""
+    monkeypatch.setattr(Path, "is_dir", lambda self: self.name in ("x86_64-linux-gnu", "i386-linux-gnu"))
+
+    # A trivial, self-contained source (no fixture .so dependency needed
+    # at all) -- this test only cares about `_search_dirs()`'s own
+    # ordering, not anything embed()-related.
+    source = tmp_path / "standalone.c"
+    source.write_text("int main(void) { return 0; }\n")
+    exe = build_exe(tmp_path, source, "standalone", [], pic=True, bits=bits)
+    dirs = ElfEmbedder(exe, tmp_path / "out", exclude=set(), lib_dir=None)._search_dirs()
+    # /lib is conventionally a symlink to /usr/lib on a real multiarch
+    # distro, so the same real triplet directory can appear twice in
+    # `dirs` (once via each base) -- dedupe by name, in first-seen
+    # order, before checking which one this method actually listed first.
+    seen = set()
+    triplet_order = []
+    for d in dirs:
+        if d.name in ("x86_64-linux-gnu", "i386-linux-gnu") and d.name not in seen:
+            seen.add(d.name)
+            triplet_order.append(d.name)
+    assert len(triplet_order) == 2
+    expected_first = "x86_64-linux-gnu" if bits == 64 else "i386-linux-gnu"
+    assert triplet_order[0] == expected_first
