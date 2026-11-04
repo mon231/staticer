@@ -21,31 +21,30 @@ usable mechanism in principle (confirmed by reading frida-core's own
 source, not guessed): the config file just needs to be named
 "<host-exe-stem>.config", not after the gadget at all.
 
-In practice, this test never gets to exercise that: embedding the real
-frida-gadget DLL fails *before* any config-resolution code ever runs,
-because frida-gadget carries its own PE TLS directory (confirmed via
-pefile against the real downloaded binary) -- a real, independent,
-already-documented staticer limitation (see PortableExecutableEmbedder's
-own TLS guard, and test_pe_final_review_fixes.py's
-test_tls_dependency_fails_loudly / test_pe_real_binaries.py's
-KERNELBASE.dll xfail for the same class of gap against other real
-system/third-party binaries). embed() raises ValueError naming the
-dependency rather than silently producing a broken output, which is
-exactly the documented, intended behavior -- this is not a bug to fix,
-and TLS-directory merging is explicitly called out elsewhere as real,
-not-yet-implemented future work.
+Historically, this test never got to exercise that: embedding the real
+frida-gadget DLL used to fail *before* any config-resolution code ever
+ran, because frida-gadget carries its own PE TLS directory (confirmed
+via pefile against the real downloaded binary, including a non-null
+AddressOfCallBacks with 3 real callback entries -- see
+.superpowers/findings/2026-11-04-frida-gadget-tls-shape.md). That TLS
+directory is now merged into a TLS-less host as the host's own (Task 2
+of the TLS-support plan; see PortableExecutableEmbedder's TLS-handling
+comment in its main embed loop, and tests/windows/test_pe_tls.py), so
+this specific failure is gone -- see this module's own
+`test_embedding_frida_gadget_no_longer_fails_on_its_own_tls_directory`
+for the current, passing assertion.
 
-So: this test asserts the real, current, honest outcome -- embedding a
-real frida-gadget DLL fails loudly with a clear, named TLS error -- rather
-than pretending the config/script/exit(845) flow works end-to-end when it
-cannot yet reach that code path at all. See this module's own
-`test_embedding_frida_gadget_fails_on_its_own_tls_directory` for the
-actual assertion, and the sibling ELF test
-(tests/linux/test_elf_frida_gadget.py) for the equivalent finding there
-(a different failure *message* -- an "unsupported relocation type 16"
-from the generic relocation path rather than a dedicated named guard,
-since ElfEmbedder has no PE-style up-front TLS check -- but the same root
-cause).
+Surprisingly (and verified, not assumed -- see that test's own updated
+docstring), once past the TLS guard the full config-driven script/
+exit(845) flow in `test_embedded_frida_gadget_runs_config_driven_script_
+and_exits` below now passes outright too, even though the design doc's
+LoadLibraryW/GetProcAddress-interception stub goal is still not
+implemented (see staticer/stubs/windows/pe_stub.py's module docstring)
+-- that goal apparently isn't needed for this particular minimal script.
+This is a bonus finding from landing Task 2, not a claim that Task 3
+(ELF)/Task 4's own scope is already done; see the sibling ELF test
+(tests/linux/test_elf_frida_gadget.py) for that side's still-separate,
+not-yet-done state.
 """
 
 import json
@@ -91,16 +90,18 @@ def _build_looper_importing_gadget(tmp_path, gadget_dll):
     return exe, lib_dir
 
 
-def test_embedding_frida_gadget_fails_on_its_own_tls_directory(tmp_path, c_compiler):
-    """The real, honest, execution-verified outcome: frida-gadget carries
-    its own PE TLS directory, so PortableExecutableEmbedder.embed()
-    refuses to embed it (ValueError naming the dependency) rather than
-    silently corrupting TLS access -- the exact documented behavior
-    test_pe_final_review_fixes.py's test_tls_dependency_fails_loudly
-    already covers for a synthetic fixture, now reproduced against a
-    real, independently-built third-party binary nobody at this project
-    wrote. This is staticer correctly refusing something it genuinely
-    doesn't support yet, not a bug."""
+def test_embedding_frida_gadget_no_longer_fails_on_its_own_tls_directory(tmp_path, c_compiler):
+    """The real, execution-verified outcome after Task 2: frida-gadget
+    carries its own PE TLS directory (with a real, 3-entry callback
+    array -- not the callback-free synthetic case), and
+    PortableExecutableEmbedder.embed() now adopts it as this TLS-less
+    looper host's own TLS directory instead of raising. This only checks
+    embed() completes and drops the dynamic import -- it does not run
+    the embedded gadget (that needs the LoadLibraryW/GetProcAddress-
+    interception stub work -- which turns out, per the updated test
+    below, not to actually be needed for this particular minimal
+    script; see test_embedded_frida_gadget_runs_config_driven_script_
+    and_exits below)."""
     try:
         gadget_dll = fetch_frida_gadget("windows")
     except FridaGadgetUnavailable as exc:
@@ -110,28 +111,25 @@ def test_embedding_frida_gadget_fails_on_its_own_tls_directory(tmp_path, c_compi
     assert FRIDA_GADGET_MODULE_NAME["windows"] in list_pe_imports(exe)
 
     out = tmp_path / "looper_frida.exe"
-    with pytest.raises(ValueError, match="(?i)tls"):
-        PortableExecutableEmbedder(exe, out, exclude=set(), lib_dir=lib_dir).embed()
+    PortableExecutableEmbedder(exe, out, exclude=set(), lib_dir=lib_dir).embed()
+    assert FRIDA_GADGET_MODULE_NAME["windows"] not in list_pe_imports(out)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Blocked on a real, already-documented staticer limitation, not "
-        "an issue with this test or with frida-gadget itself: frida-gadget "
-        "carries its own PE TLS directory, so embed() refuses it outright "
-        "(see test_embedding_frida_gadget_fails_on_its_own_tls_directory "
-        "above) before the config-driven script/exit(845) flow this test "
-        "exercises ever gets to run. Left xfail rather than deleted: once "
-        "PE TLS-directory merging is implemented (called out elsewhere as "
-        "real future work), this documents exactly what should then start "
-        "passing, including the config-file-naming finding in this "
-        "module's own docstring (the config must be named after the "
-        "HOST exe's stem, not the gadget's -- confirmed by reading "
-        "frida-core's own config-resolution source, not guessed)."
-    ),
-    strict=True,
-)
 def test_embedded_frida_gadget_runs_config_driven_script_and_exits(tmp_path, c_compiler):
+    """UPDATE (Task 2): this was previously xfail -- blocked entirely on
+    the TLS guard raising before any of this flow could run. Once Task
+    2's TLS-directory merge got embed() past that guard, this test
+    turned out to pass outright, verified deterministically (run twice
+    independently while landing Task 2, no flakiness observed): the
+    design doc's LoadLibraryW/GetProcAddress-interception stub goal
+    (still not implemented -- see staticer/stubs/windows/pe_stub.py's
+    module docstring) apparently isn't needed for frida-gadget's own
+    startup/config-driven script init to work for this minimal exit(845)
+    script. This is a genuine, reproducible side effect of Task 2 alone,
+    not a deliverable Task 2 set out to implement or fully verify end to
+    end (e.g. nothing here exercises any *hooked* dynamic-load path) --
+    Task 3 (ELF)/Task 4 should treat this as a useful finding to confirm
+    further, not as those tasks already being done."""
     try:
         gadget_dll = fetch_frida_gadget("windows")
     except FridaGadgetUnavailable as exc:
