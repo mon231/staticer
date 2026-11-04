@@ -127,6 +127,18 @@ invoked by the installed package itself.
   entries, `R_*_COPY` relocations for a dependency's own globals, and weak
   symbols from the C runtime's own startup boilerplate — all fixed and
   covered by regression tests built from the same binaries that found them.
+  Also tried against a genuine real-world *instrumentation library*
+  (Frida's own `frida-gadget`, downloaded for real from its GitHub release
+  assets — see `tests/windows/test_pe_frida_gadget.py` /
+  `tests/linux/test_elf_frida_gadget.py`): it carries its own TLS
+  directory on both PE and ELF, so it currently hits the
+  already-documented TLS limitation below rather than embedding
+  end-to-end — confirmed by reading frida-core's own config-resolution
+  source that, were TLS merging supported, frida-gadget's config-file
+  lookup would resolve relative to the *host's* own path once embedded
+  (since there's no longer a separately-loaded module for it to resolve
+  against), so the config would need to be named after the host binary's
+  stem, not the gadget's.
 
 ## Limitations
 - Explicit dynamic-loading from the executed code itself (`dlopen`+`dlsym` / `LoadLibraryW`+`GetProcAddress`) is not hooked yet; only dependencies resolved through the input's own import/dynamic-section table are embedded.

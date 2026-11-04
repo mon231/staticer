@@ -116,3 +116,23 @@ exports, ordinal-only imports, forwarder import cycles, stale
 globals, and weak symbols from the C runtime's own startup boilerplate —
 all fixed, each covered by a regression test built from the binary that
 found it.
+
+Also tried, for real, against a genuine third-party *instrumentation*
+library — Frida's own `frida-gadget`, downloaded directly from its GitHub
+release assets rather than synthesized (see
+`tests/windows/test_pe_frida_gadget.py` /
+`tests/linux/test_elf_frida_gadget.py`). It doesn't embed end-to-end yet:
+frida-gadget carries its own TLS directory on both PE and ELF, which hits
+the already-documented TLS limitation (see
+[Limitations](limitations.md)) rather than a new bug. Investigating it
+did turn up one real, useful fact worth recording even though the test
+can't exercise it yet: frida-gadget resolves its own `.config` file by
+asking the OS which loaded module contains its own running code, then
+looking next to that module's path. Once embedded, that code no longer
+belongs to a separate module at all — it's part of the host — so, in
+principle, that lookup would resolve to the *host binary's own* path
+rather than the gadget's, meaning the config file would need to be named
+after the host's own filename stem, not the gadget's. That's confirmed
+by reading frida-core's own config-resolution source, not guessed, and
+is documented here so it isn't re-derived from scratch once TLS merging
+makes the rest of this actually runnable.

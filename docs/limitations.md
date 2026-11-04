@@ -22,7 +22,13 @@
 - `-o`/`--output` silently overwrites an existing file at that path.
 - A dependency using PE Thread Local Storage (`__declspec(thread)`) is
   rejected with a clear error rather than embedded incorrectly —
-  TLS-directory merging isn't implemented yet.
+  TLS-directory merging isn't implemented yet. The ELF side has no
+  equivalent up-front guard: a TLS-using `.so` dependency instead fails
+  later, with an "unsupported relocation type" error naming its own TLS
+  relocation (`R_X86_64_DTPMOD64`/`TPOFF64`), for the same underlying
+  reason. This is a real, independently-confirmed blocker for embedding
+  Frida's own `frida-gadget` library on either platform (see
+  [Features](features.md)) — not specific to synthetic test fixtures.
 - A fully self-contained module that both throws *and* catches a C++
   exception entirely within itself can still hit compiler-internal
   personality-routine details beyond the documented unwind ABI — ordinary
