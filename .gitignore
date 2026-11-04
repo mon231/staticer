@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Cached real third-party test binaries (tests/windows/test_pe_frida_gadget.py,
+# tests/linux/test_elf_frida_gadget.py) -- downloaded on demand, not committed.
+tests/fixtures/.frida-cache/
