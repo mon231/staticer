@@ -10,6 +10,15 @@
 - Process-detach cleanup (`elf-destructor` / `DllMain`
   `DLL_PROCESS_DETACH`) is not invoked for embedded dependencies, and
   thread attach/detach notifications may never be supported.
+- Because `DLL_PROCESS_DETACH` is never delivered to an embedded
+  dependency (see above), calling `FreeLibrary` on a staticer-produced
+  DLL *before* process exit can crash the process: a dependency built
+  against a dynamically-linked CRT registers process-wide TLS/FLS state
+  during its (real, CRT-startup) `DLL_PROCESS_ATTACH` that nothing ever
+  tears down, and the CRT's own exit-time bookkeeping later dereferences
+  it after the freed library's memory is gone. Confirmed reproducible.
+  Safe as long as the output DLL stays loaded for the life of the
+  process (the common case); avoid `FreeLibrary`-ing it otherwise.
 - `-o`/`--output` silently overwrites an existing file at that path.
 - A dependency using PE Thread Local Storage (`__declspec(thread)`) is
   rejected with a clear error rather than embedded incorrectly —
