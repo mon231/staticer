@@ -90,22 +90,45 @@ def list_elf_imports(path: Path) -> List[str]:
 
 
 def resolve_elf(name: str, search_dirs: List[Path]) -> Optional[Path]:
-    """Scan search_dirs in order for a file literally named `name`.
+    """Scan search_dirs in order for a file that `name` denotes.
 
     `name` comes straight from the ELF file being processed's own
     DT_NEEDED entries (an attacker-controlled dependency name, if the
     input binary is untrusted) -- it must never be allowed to escape the
     `search_dirs` entry it's being matched against via path-traversal
     components (``..``) or an absolute path (CWE-22), or `--lib-dir`'s
-    whole purpose (scoping embedding to one chosen folder) is defeated. A
-    `name` that isn't a bare filename is rejected outright before any
-    join is even attempted (cheap first-line defense); as a second,
-    independent check, any resulting candidate that resolves outside
-    `directory` is also rejected. Either way this behaves exactly like
-    "not found in this directory" -- falling through to the next
-    search_dirs entry, or returning None if none match -- never a hard
-    error."""
-    if not name or "/" in name or "\\" in name or name == ".." or Path(name).is_absolute():
+    whole purpose (scoping embedding to one chosen folder) is defeated.
+
+    A DT_NEEDED entry is *usually* a bare filename (e.g. "libc.so.6"),
+    but it legitimately isn't always one: a .so with no DT_SONAME of its
+    own that was linked by passing its full path on the linker command
+    line gets that literal path recorded as the NEEDED string by ld --
+    this project's own test fixtures do exactly that (`build_exe` passes
+    `str(lib)`, an absolute `tmp_path`-rooted path, with no
+    `-Wl,-soname=...` ever set). An earlier version of this check
+    rejected any such non-bare-filename name outright, which (correctly)
+    blocked a genuine traversal/absolute escape attempt but also
+    (incorrectly) blocked this entirely legitimate same-directory case,
+    since ``directory / name`` only ever *joins* when `name` is relative
+    -- for an absolute `name` it discards `directory` and evaluates to
+    `name` itself, so the real containment check below is what has to
+    carry the whole security property, not a cheap name-shape guard in
+    front of it.
+
+    So: no shape-based rejection up front. Every `name` -- bare,
+    relative-with-components, or absolute -- is joined against each
+    `directory` in turn (a no-op join for an absolute `name`, same as
+    Path's own semantics) and the resulting candidate is accepted only
+    if it both exists as a file and *resolves* (symlinks and all) to
+    somewhere inside that same `directory`'s own resolved form. A
+    genuine traversal (``../../etc/passwd``) or an absolute escape
+    (``/etc/passwd``) still fails that resolved-containment check against
+    every `search_dirs` entry, exactly as before -- only a `name` that
+    truly denotes a file inside one of them, however it's spelled, is
+    ever accepted. Either way a rejection behaves exactly like "not found
+    in this directory" -- falling through to the next search_dirs entry,
+    or returning None if none match -- never a hard error."""
+    if not name:
         return None
     for directory in search_dirs:
         candidate = directory / name
