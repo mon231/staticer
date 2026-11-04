@@ -46,5 +46,12 @@ jobs:
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
 
-    - name: Run tests
-      run: pytest -v
+    # Each OS leg only collects its own platform's tests; the skipif markers
+    # in the test files remain as a safety net for local runs.
+    - name: Run tests (Windows)
+      if: runner.os == 'Windows'
+      run: pytest tests/ --ignore=tests/linux -v
+
+    - name: Run tests (Linux)
+      if: runner.os == 'Linux'
+      run: pytest tests/ --ignore=tests/windows -v
