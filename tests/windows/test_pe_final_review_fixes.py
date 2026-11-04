@@ -59,17 +59,22 @@ def test_transitive_embedded_dependency_import_is_patched_not_dynamic(tmp_path, 
     assert result.returncode == 12  # lib_x_value() + lib_y_value() == 11 + 1
 
 
-def test_tls_dependency_fails_loudly(tmp_path, c_compiler):
-    """B3: a dependency carrying its own TLS directory must raise
-    ValueError (naming it) rather than being silently (and incorrectly)
-    embedded."""
+def test_host_with_own_tls_directory_fails_loudly(tmp_path, c_compiler):
+    """B3 (updated for Task 2's phase-1 TLS merge): embedding a TLS-
+    carrying dependency into a *TLS-less* host now succeeds (see
+    tests/windows/test_pe_tls.py) -- the dependency's own TLS directory
+    is adopted as the host's. What's still refused, and still a
+    ValueError naming the dependency, is the case this host fixture
+    exercises: the HOST *itself* already has its own TLS directory, so
+    there would be two real TLS directories to merge into one -- that
+    remains phase 2 / Task 5, not yet implemented."""
     dll = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep.c", "lib_tls_dep.dll", pic=True, bits=64)
     exe = build_exe(
-        tmp_path, FIXTURES / "main_tls_dep.c", "main_tls_dep.exe", [dll], pic=True, bits=64,
+        tmp_path, FIXTURES / "main_host_own_tls.c", "main_host_own_tls.exe", [dll], pic=True, bits=64,
     )
-    out = tmp_path / "static_tls_dep.exe"
+    out = tmp_path / "static_host_own_tls.exe"
 
-    with pytest.raises(ValueError, match="lib_tls_dep.dll"):
+    with pytest.raises(ValueError, match="(?i)lib_tls_dep.dll.*tls|tls.*lib_tls_dep.dll"):
         PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
 
 
