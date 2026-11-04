@@ -5,10 +5,13 @@ bitness and PIC-ness.
 """
 
 import functools
+import lzma
 import platform
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -262,4 +265,163 @@ def build_exe(
         # (PIE) vs ET_EXEC (fixed-base) binary.
         cmd.append("-pie" if pic else "-no-pie")
     _run(cmd)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# frida-gadget real-binary test support (tests/windows/test_pe_frida_gadget.py,
+# tests/linux/test_elf_frida_gadget.py)
+# ---------------------------------------------------------------------------
+
+#: Pinned, exact Frida release used by those tests -- see this constant's
+#: own callers for why: the two helpers below hardcode the dependency's own
+#: baked-in module name ("libfrida-gadget-raw.dll"/".so", read from its PE
+#: export-directory Name field / ELF DT_SONAME, confirmed for real against
+#: this exact release), which only stays accurate for pinning one specific
+#: version rather than always tracking "latest".
+FRIDA_GADGET_VERSION = "17.25.2"
+
+#: frida-gadget's own module name, as baked into its PE export directory's
+#: Name field / ELF DT_SONAME (confirmed for real by inspecting the
+#: FRIDA_GADGET_VERSION release assets with pefile/readelf) -- NOT the
+#: filename of the GitHub release asset, which is just
+#: "frida-gadget-<version>-<platform>-x86_64.<ext>". A GNU/mingw-w64 `ld`
+#: direct-DLL-link, and any ELF `DT_NEEDED` entry, both resolve/record a
+#: dependency by *this* name rather than whatever a caller names the file
+#: on disk -- so a lib_dir copy of the gadget must use this exact name
+#: for PortableExecutableEmbedder/ElfEmbedder's by-name resolution to find
+#: it at all.
+FRIDA_GADGET_MODULE_NAME = {"windows": "libfrida-gadget-raw.dll", "linux": "libfrida-gadget-raw.so"}
+
+FRIDA_CACHE_DIR = FIXTURES / ".frida-cache"
+
+_FRIDA_GADGET_ASSET_NAME = {
+    "windows": f"frida-gadget-{FRIDA_GADGET_VERSION}-windows-x86_64.dll.xz",
+    "linux": f"frida-gadget-{FRIDA_GADGET_VERSION}-linux-x86_64.so.xz",
+}
+_FRIDA_GADGET_EXT = {"windows": ".dll", "linux": ".so"}
+
+
+class FridaGadgetUnavailable(Exception):
+    """Raised by fetch_frida_gadget() when the real, genuine third-party
+    frida-gadget binary can't be obtained -- no network access, GitHub
+    unreachable, a truncated/corrupt download, etc. Callers should catch
+    this and pytest.skip() with its message: an inability to fetch a
+    third-party binary is an environment/infra concern, not a bug in
+    staticer itself, and shouldn't fail CI on that basis."""
+
+
+def fetch_frida_gadget(platform_name: str) -> Path:
+    """Downloads (or reuses a previously cached copy of) the real
+    frida-gadget shared library for `platform_name` ("windows" or
+    "linux"), fetched for real from Frida's own GitHub release assets --
+    never synthesized; see the real-binary test modules that call this
+    for why a genuine third-party binary matters here specifically.
+
+    Cached under tests/fixtures/.frida-cache/ (gitignored) so repeated
+    test runs don't re-download the ~9MB compressed asset every time.
+
+    Raises FridaGadgetUnavailable (never a bare network/OS exception) if
+    the real binary can't be obtained for any reason.
+    """
+    asset_name = _FRIDA_GADGET_ASSET_NAME[platform_name]
+    ext = _FRIDA_GADGET_EXT[platform_name]
+    FRIDA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    extracted = FRIDA_CACHE_DIR / f"frida-gadget-{FRIDA_GADGET_VERSION}-{platform_name}-x86_64{ext}"
+    if extracted.is_file() and extracted.stat().st_size > 0:
+        return extracted
+
+    compressed = FRIDA_CACHE_DIR / asset_name
+    if not (compressed.is_file() and compressed.stat().st_size > 0):
+        url = f"https://github.com/frida/frida/releases/download/{FRIDA_GADGET_VERSION}/{asset_name}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 (real asset, pinned host)
+                data = response.read()
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise FridaGadgetUnavailable(
+                f"could not download real frida-gadget from {url}: {exc}"
+            ) from exc
+        if not data:
+            raise FridaGadgetUnavailable(f"empty download from {url}")
+        compressed.write_bytes(data)
+
+    try:
+        extracted_bytes = lzma.decompress(compressed.read_bytes())
+    except lzma.LZMAError as exc:
+        # Don't leave a corrupt cache entry behind to keep failing every
+        # subsequent run the same way -- let a retry re-download instead.
+        compressed.unlink(missing_ok=True)
+        raise FridaGadgetUnavailable(
+            f"corrupt cached/downloaded frida-gadget archive ({compressed}): {exc}"
+        ) from exc
+
+    extracted.write_bytes(extracted_bytes)
+    return extracted
+
+
+def build_exe_importing_prebuilt_dll(
+    tmp_path: Path, source: Path, name: str, dll_path: Path, exported_symbol: str, *, bits: int,
+) -> Path:
+    """Like build_exe, but for linking against a prebuilt *third-party*
+    DLL that has no sibling MSVC import library of its own (e.g. a
+    downloaded release binary such as frida-gadget, as opposed to one of
+    this project's own fixtures built via build_shared_lib's `/LD` step,
+    which always produces one). `source` must reference `exported_symbol`
+    (e.g. as an unused function-pointer value) for either toolchain to
+    actually emit an import-table entry for it at all -- unlike ELF,
+    where a bare `--no-as-needed` is enough with zero symbols used.
+
+    MSVC's link.exe has no way to link directly against a bare DLL; one
+    is generated on the fly via lib.exe from a minimal .def file naming
+    just the one symbol this test needs, with the .def's `LIBRARY` line
+    set to `dll_path.name` so the generated import descriptor records
+    that exact name.
+
+    GNU/mingw-w64's `ld` *can* link directly against the DLL file itself
+    (reading its real export table) -- but the import descriptor name it
+    emits in the output comes from the DLL's own baked-in PE
+    export-directory Name field, not from the path/filename given on the
+    command line (confirmed for real against a downloaded frida-gadget
+    release build, whose own declared name differs from its release
+    asset's file name) -- so this only produces a *consistent* result
+    across both toolchains if `dll_path.name` already matches that
+    baked-in name.
+    """
+    kind, cl_path = _find_compiler()
+    out = tmp_path / name
+
+    if kind == "msvc":
+        _require_msvc_bits(cl_path, bits)
+        def_path = tmp_path / (Path(name).stem + "_prebuilt.def")
+        lib_path = tmp_path / (Path(name).stem + "_prebuilt.lib")
+        def_path.write_text(f"LIBRARY {dll_path.name}\nEXPORTS\n{exported_symbol}\n")
+        lib_exe = str(Path(cl_path).with_name("lib.exe"))
+        _run([lib_exe, f"/DEF:{def_path}", f"/OUT:{lib_path}", f"/MACHINE:{'X64' if bits == 64 else 'X86'}"])
+        obj = tmp_path / (Path(name).stem + ".obj")
+        _run([cl_path, "/nologo", str(source), f"/Fe{out}", f"/Fo{obj}", str(lib_path)])
+        return out
+
+    compiler = _gnu_compiler_for_bits(bits)
+    bits_flag = "-m64" if bits == 64 else "-m32"
+    _run([compiler, bits_flag, "-fno-pic", "-o", str(out), str(source), str(dll_path), "-Wl,--disable-dynamicbase"])
+    return out
+
+
+def build_exe_importing_prebuilt_so(
+    tmp_path: Path, source: Path, name: str, so_path: Path, *, bits: int,
+) -> Path:
+    """ELF counterpart of build_exe_importing_prebuilt_dll: links `source`
+    against the real, prebuilt `so_path` so the output's dynamic section
+    carries a DT_NEEDED entry naming it, recorded under `so_path`'s own
+    DT_SONAME (not its filename on disk, same caveat as the PE helper
+    above's docstring) -- `-Wl,--no-as-needed` forces the entry even
+    though, unlike the PE case, `source` references no symbol from it at
+    all (modern distro `ld` otherwise drops an unused direct `.so` link
+    input silently, confirmed for real against this exact Ubuntu
+    toolchain)."""
+    compiler = _gnu_compiler_for_bits(bits)
+    bits_flag = "-m64" if bits == 64 else "-m32"
+    out = tmp_path / name
+    _run([compiler, bits_flag, "-fpie", "-pie", "-o", str(out), str(source), "-Wl,--no-as-needed", str(so_path)])
     return out
