@@ -149,6 +149,21 @@ def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int, _depth: in
     encodes landing-pad offsets relative to the function itself, and type
     pointers via a self-relative/pcrel encoding) -- is already correct
     after a flat block move, needing no adjustment.
+
+    CAVEAT (confirmed real, not theoretical -- see tests/windows/
+    test_pe_unwind.py's UPDATE 2 note): the above is true for GCC/MinGW's
+    personality data, but NOT for MSVC's. At least current MSVC's (14.5x/
+    VS2026) default __CxxFrameHandler4 state tables embed further RVA- or
+    module-offset-relative references of their own, directly after the
+    handler RVA this function already patches, in an undocumented,
+    version-specific, bit-packed inline encoding -- not a value this
+    function can locate or safely reinterpret generically. A self-
+    contained throw/catch inside an MSVC-built embedded dependency
+    reliably corrupts memory as a result (STATUS_STACK_BUFFER_OVERRUN or
+    STATUS_ACCESS_VIOLATION depending on ASLR layout). Fixing this for
+    real would mean reverse-engineering __CxxFrameHandler4's private
+    layout well enough to relocate it -- out of this project's current
+    scope; see test_self_contained_throw_in_embedded_dll's MSVC skip.
     """
     if unwind_rva == 0 or unwind_rva + 4 > len(blob) or _depth > 32:
         return
