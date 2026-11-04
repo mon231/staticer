@@ -324,6 +324,7 @@ class PortableExecutableEmbedder:
             section_alignment = pe.OPTIONAL_HEADER.SectionAlignment
             file_alignment = pe.OPTIONAL_HEADER.FileAlignment
             original_entry_va = image_base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
+            host_tlsdir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_TLS]
 
             output = bytearray(self.input_path.read_bytes())
 
@@ -393,6 +394,13 @@ class PortableExecutableEmbedder:
             # right host-relative RVA for the accompanying relocation entry.
             dep_blobs_by_name_lower: Dict[str, bytearray] = {}
             dep_X_by_name_lower: Dict[str, int] = {}
+            # (host_rva, size, dep_name) of the one dependency TLS directory
+            # adopted as the host's own, once that dependency's placement X
+            # is known -- see the TLS-directory handling comment in the
+            # main loop below and its use at the end of embed() to patch
+            # DATA_DIRECTORY[IMAGE_DIRECTORY_ENTRY_TLS]. Stays None unless
+            # some dependency in `order` actually carries a TLS directory.
+            merged_tls: Optional[tuple] = None
 
             for node in order:
                 dep = pefile.PE(str(node.path))
@@ -406,28 +414,48 @@ class PortableExecutableEmbedder:
 
                     dep.parse_data_directories()
 
-                    # B3: a dependency carrying its own TLS directory (any
-                    # __declspec(thread)/thread_local variable) cannot be
-                    # embedded correctly yet -- there's no code anywhere in
-                    # this module that merges TLS directories (allocates a
-                    # new `_tls_index` slot shared with the host, relocates
-                    # the dependency's TLS-relative data references, etc.),
-                    # so silently embedding it would either read garbage
-                    # through TLS slot 0 or silently alias onto the host's
-                    # own thread-local storage. Fail loudly (per the design
-                    # spec's anti-goal: silent corruption is the one
-                    # outcome worse than a loud failure) rather than ship
-                    # that. Full TLS-directory merging is future work.
+                    # TLS-directory handling (Task 2, phase 1 of the design
+                    # spec's PE merge mechanism): a dependency carrying its
+                    # own non-empty IMAGE_DIRECTORY_ENTRY_TLS (any
+                    # __declspec(thread)/thread_local variable) can now be
+                    # *adopted* as the host's own TLS directory -- the host
+                    # simply had none of its own (the common case: a tiny
+                    # host exe/stub, or a dependency-free host, doesn't
+                    # itself use thread-local storage). Unlike every other
+                    # directory this module merges (imports, relocations,
+                    # exception/.pdata), Windows' real PE loader only
+                    # processes *one* TLS directory per image -- there is no
+                    # "append a second entry" option -- so genuinely
+                    # combining two independent TLS directories (the host's
+                    # own, or a second dependency's) into one raw-data
+                    # range/callback array is real additional work, not
+                    # implemented here. That remains phase 2 (Task 5): fail
+                    # loudly rather than silently pick one and discard/
+                    # alias the other (per the design spec's anti-goal:
+                    # silent corruption is the one outcome worse than a
+                    # loud failure).
                     dep_tlsdir = dep.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_TLS]
                     if dep_tlsdir.Size:
-                        raise ValueError(
-                            f"cannot embed dependency '{node.name}': it has its own "
-                            f"Thread Local Storage (TLS) directory (a "
-                            f"__declspec(thread)/thread_local variable), which "
-                            f"staticer does not yet support merging -- embedding it "
-                            f"would silently corrupt TLS access rather than fail "
-                            f"loudly"
-                        )
+                        if host_tlsdir.Size:
+                            raise ValueError(
+                                f"cannot embed dependency '{node.name}': both the "
+                                f"host and this dependency carry their own Thread "
+                                f"Local Storage (TLS) directory -- merging two real "
+                                f"TLS directories into one is not yet supported "
+                                f"(phase 2 / Task 5); only adopting a single "
+                                f"dependency's TLS directory into a TLS-less host "
+                                f"is implemented so far"
+                            )
+                        if merged_tls is not None:
+                            raise ValueError(
+                                f"cannot embed dependency '{node.name}': it has its "
+                                f"own Thread Local Storage (TLS) directory, but "
+                                f"another dependency ('{merged_tls[2]}') already had "
+                                f"its TLS directory adopted as the host's -- merging "
+                                f"TLS directories from more than one dependency into "
+                                f"a single host is not yet supported (phase 2 / "
+                                f"Task 5)"
+                            )
 
                     dep_image_base = dep.OPTIONAL_HEADER.ImageBase
                     blob_size = _align_up(dep.OPTIONAL_HEADER.SizeOfImage, section_alignment)
@@ -551,6 +579,32 @@ class PortableExecutableEmbedder:
                     # docstring). No-op for a dependency with no exception
                     # directory at all (e.g. any x86/32-bit dependency).
                     dep_pdata_entries.extend(_collect_and_patch_dep_unwind(dep, blob, X))
+
+                    # Adopt this dependency's TLS directory as the host's
+                    # own (see the guard above): the struct's own fields
+                    # (StartAddressOfRawData/EndAddressOfRawData/
+                    # AddressOfIndex/AddressOfCallBacks, and every callback
+                    # VA in the null-terminated array AddressOfCallBacks
+                    # points at) live inside `blob` at their original
+                    # (dep-relative) locations -- already byte-copied above
+                    # by the generic per-section copy, and, for the
+                    # has_reloc case, already rewritten to host-relative
+                    # VAs by the ordinary base-relocation loop above (every
+                    # one of those fields is itself an absolute VA the
+                    # dependency's own linker emitted a base relocation
+                    # entry for, same as any other absolute pointer in its
+                    # data -- confirmed against the real frida-gadget DLL's
+                    # TLS directory and 3-entry callback array; see
+                    # .superpowers/findings/2026-11-04-frida-gadget-tls-
+                    # shape.md). So nothing about the struct's *contents*
+                    # needs patching here -- only the new
+                    # DATA_DIRECTORY[IMAGE_DIRECTORY_ENTRY_TLS] entry
+                    # itself (an ordinary RVA+Size pair, like every other
+                    # data directory, not a VA) needs to point at it, which
+                    # is applied once, after the loop, alongside the other
+                    # directory patches.
+                    if dep_tlsdir.Size:
+                        merged_tls = (X + dep_tlsdir.VirtualAddress, dep_tlsdir.Size, node.name)
 
                     # This dependency's own *raw* export table, by both name
                     # and ordinal: either an already-absolute VA (a normal,
@@ -1012,6 +1066,14 @@ class PortableExecutableEmbedder:
                 sz_off = excdir.get_field_absolute_offset("Size")
                 output[va_off:va_off + 4] = struct.pack("<I", exc_rva)
                 output[sz_off:sz_off + 4] = struct.pack("<I", len(exc_bytes))
+
+            if merged_tls is not None:
+                tls_rva, tls_size, _ = merged_tls
+                tlsdir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_TLS]
+                va_off = tlsdir.get_field_absolute_offset("VirtualAddress")
+                sz_off = tlsdir.get_field_absolute_offset("Size")
+                output[va_off:va_off + 4] = struct.pack("<I", tls_rva)
+                output[sz_off:sz_off + 4] = struct.pack("<I", tls_size)
 
             # Authenticode (IMAGE_DIRECTORY_ENTRY_SECURITY) is left dangling
             # otherwise: embed() always mutates the host's bytes once there
