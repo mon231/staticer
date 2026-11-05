@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Set
 import pefile
 
 from .common.depgraph import build_dependency_graph, embed_order
-from .stubs.windows.pe_stub import build_windows_stub
+from .stubs.windows.pe_stub import build_windows_stub, build_windows_tls_index_fixup
 
 IMAGE_REL_BASED_ABSOLUTE = 0
 IMAGE_REL_BASED_HIGHLOW = 3
@@ -229,6 +229,75 @@ def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int)
     return entries
 
 
+def _patch_dep_tls_access_offsets(blob: bytearray, dep_index_rva: int, shift: int) -> int:
+    """TLS phase 2's last remaining piece of real byte-level surgery:
+    find every compiled access to *this dependency's own* TLS variable(s)
+    inside `blob` and shift its embedded, compile-time-fixed offset (into
+    the per-thread TLS block) by `shift` -- the size of the host's own
+    raw TLS data, now prepended ahead of this dependency's own in the
+    combined raw-data range pe_embedder.py's phase-2 block builds (see
+    its own long comment for the full picture).
+
+    Why this can't be avoided (and isn't covered by any ordinary PE base
+    relocation, unlike nearly everything else this module patches): the
+    x64/x86 mingw-w64 and MSVC compiled idiom for `__declspec(thread)`/
+    `__thread` access reads the *value* of a global `_tls_index`
+    variable (that part *is* just an ordinary pointer-sized global, fully
+    handled by `build_windows_tls_index_fixup`), but the *offset* added
+    to the resulting per-thread block pointer to reach any one specific
+    TLS variable is a small link-time constant -- (that variable's own
+    RVA) minus (its *own* module's TLS directory's own
+    StartAddressOfRawData), baked directly into the instruction as an
+    immediate, by design *not* relocation-covered (it doesn't change
+    when the whole module is relocated by a uniform delta, which is
+    exactly why it normally needs no fixup at all -- just not in this
+    one case, where the per-thread block's own *layout* is being changed
+    out from under it).
+
+    Confirmed against this project's own mingw-w64-compiled test
+    fixtures, the compiled idiom (identical for a read or a write) is
+    this exact instruction sequence, with only the destination/
+    intermediate *register choice* varying by call site:
+
+        mov   r32, [rip+disp32]      ; load _tls_index's current value
+        mov   r64, gs:0x58           ; TEB.ThreadLocalStoragePointer
+        mov   r64, [r64 + r32*8]     ; this module's own per-thread block
+        mov/  r32, [r64+disp32]      ; <- disp32 is the one to shift
+         mov      [r64+disp32], r32
+
+    This walks `blob` for the first instruction (an exact, unambiguous
+    match: `_tls_index`'s own RVA, not a heuristic), then scans forward a
+    short, bounded window for the final disp32-based access and shifts
+    it. This is a real, if narrow, binary-pattern dependency -- it
+    recognizes exactly this compiler-generated shape and nothing else;
+    an entirely different compiler/codegen for the same source-level
+    construct would need its own pattern added here. Returns how many
+    call sites were found and patched (0 means the caller should treat
+    the merge as unsupported for this dependency rather than silently
+    leave a wrong offset in place).
+    """
+    count = 0
+    n = len(blob)
+    i = 0
+    while i + 6 <= n:
+        if blob[i] == 0x8B and (blob[i + 1] & 0xC7) == 0x05:
+            disp = int.from_bytes(blob[i + 2:i + 6], "little", signed=True)
+            if i + 6 + disp == dep_index_rva:
+                j = i + 6
+                window_end = min(j + 32, n - 6)
+                while j <= window_end:
+                    op = blob[j]
+                    if op in (0x8B, 0x89) and (blob[j + 1] & 0xC0) == 0x80 and (blob[j + 1] & 0x07) != 0x04:
+                        disp_off = j + 2
+                        cur = int.from_bytes(blob[disp_off:disp_off + 4], "little", signed=True)
+                        blob[disp_off:disp_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
+                        count += 1
+                        break
+                    j += 1
+        i += 1
+    return count
+
+
 class PortableExecutableEmbedder:
     def __init__(self, input_path: Path, output_path: Path, exclude: Set[str], lib_dir: Optional[Path]):
         self.input_path = Path(input_path)
@@ -401,6 +470,14 @@ class PortableExecutableEmbedder:
             # DATA_DIRECTORY[IMAGE_DIRECTORY_ENTRY_TLS]. Stays None unless
             # some dependency in `order` actually carries a TLS directory.
             merged_tls: Optional[tuple] = None
+            # Set instead of `merged_tls` when the HOST *also* already has
+            # its own non-empty TLS directory (phase 2 / Task 5 -- see the
+            # guard/assignment below). Holds the name of the one
+            # dependency that brought its own TLS directory in (merged in
+            # place, inline, once its own placement X is known), purely so
+            # a *second* TLS-bearing dependency in the same run can be
+            # named in the "more than one" guard's error message.
+            tls_phase2: Optional[str] = None
 
             for node in order:
                 dep = pefile.PE(str(node.path))
@@ -414,47 +491,54 @@ class PortableExecutableEmbedder:
 
                     dep.parse_data_directories()
 
-                    # TLS-directory handling (Task 2, phase 1 of the design
-                    # spec's PE merge mechanism): a dependency carrying its
-                    # own non-empty IMAGE_DIRECTORY_ENTRY_TLS (any
-                    # __declspec(thread)/thread_local variable) can now be
-                    # *adopted* as the host's own TLS directory -- the host
-                    # simply had none of its own (the common case: a tiny
-                    # host exe/stub, or a dependency-free host, doesn't
-                    # itself use thread-local storage). Unlike every other
-                    # directory this module merges (imports, relocations,
-                    # exception/.pdata), Windows' real PE loader only
-                    # processes *one* TLS directory per image -- there is no
-                    # "append a second entry" option -- so genuinely
-                    # combining two independent TLS directories (the host's
-                    # own, or a second dependency's) into one raw-data
-                    # range/callback array is real additional work, not
-                    # implemented here. That remains phase 2 (Task 5): fail
-                    # loudly rather than silently pick one and discard/
-                    # alias the other (per the design spec's anti-goal:
-                    # silent corruption is the one outcome worse than a
-                    # loud failure).
+                    # TLS-directory handling (Task 2 phase 1 + Task 5 phase
+                    # 2 of the design spec's PE merge mechanism): a
+                    # dependency carrying its own non-empty
+                    # IMAGE_DIRECTORY_ENTRY_TLS (any __declspec(thread)/
+                    # thread_local variable) can now be merged in either of
+                    # two ways: *adopted* as the host's own TLS directory
+                    # when the host had none of its own (phase 1, below,
+                    # unchanged), or -- when the host *also* already has
+                    # its own non-empty TLS directory -- merged into one
+                    # combined raw-data range sharing the host's own
+                    # (real, loader-assigned) index slot (phase 2, see the
+                    # inline block below, right where `tls_phase2` gets
+                    # set, and `_patch_dep_tls_access_offsets`'s and
+                    # `build_windows_tls_index_fixup`'s own docstrings, for
+                    # the full mechanism and why it's needed: Windows' real
+                    # PE loader only natively processes *one* TLS directory
+                    # per image).
+                    #
+                    # Still not supported, for either path: more than one
+                    # *dependency* bringing its own TLS directory into the
+                    # same embed() run (there's still only one of these
+                    # mechanisms set up per run) -- fail loudly rather than
+                    # silently pick one and discard/alias the other (per
+                    # the design spec's anti-goal: silent corruption is the
+                    # one outcome worse than a loud failure). Phase 2 is
+                    # also 64-bit-only so far (the synthesized callback is
+                    # x64 machine code).
                     dep_tlsdir = dep.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_TLS]
                     if dep_tlsdir.Size:
-                        if host_tlsdir.Size:
-                            raise ValueError(
-                                f"cannot embed dependency '{node.name}': both the "
-                                f"host and this dependency carry their own Thread "
-                                f"Local Storage (TLS) directory -- merging two real "
-                                f"TLS directories into one is not yet supported "
-                                f"(phase 2 / Task 5); only adopting a single "
-                                f"dependency's TLS directory into a TLS-less host "
-                                f"is implemented so far"
-                            )
-                        if merged_tls is not None:
+                        if merged_tls is not None or tls_phase2 is not None:
+                            already = merged_tls[2] if merged_tls is not None else tls_phase2
                             raise ValueError(
                                 f"cannot embed dependency '{node.name}': it has its "
                                 f"own Thread Local Storage (TLS) directory, but "
-                                f"another dependency ('{merged_tls[2]}') already had "
-                                f"its TLS directory adopted as the host's -- merging "
+                                f"another dependency ('{already}') already had "
+                                f"its TLS directory merged into the host's -- merging "
                                 f"TLS directories from more than one dependency into "
                                 f"a single host is not yet supported (phase 2 / "
                                 f"Task 5)"
+                            )
+                        if host_tlsdir.Size and not is64:
+                            raise ValueError(
+                                f"cannot embed dependency '{node.name}': both the "
+                                f"host and this dependency carry their own Thread "
+                                f"Local Storage (TLS) directory, and the host is "
+                                f"32-bit -- merging two real TLS directories into "
+                                f"one is only implemented for 64-bit hosts so far "
+                                f"(phase 2 / Task 5)"
                             )
 
                     dep_image_base = dep.OPTIONAL_HEADER.ImageBase
@@ -603,8 +687,228 @@ class PortableExecutableEmbedder:
                     # data directory, not a VA) needs to point at it, which
                     # is applied once, after the loop, alongside the other
                     # directory patches.
+                    #
+                    # Phase 2 (host already has its own TLS directory too):
+                    # the struct's contents are equally untouched/correct
+                    # in `blob` by this point (same reasoning as above), so
+                    # everything the post-loop "TLS phase 2" block needs --
+                    # the dependency's own raw-data template VA/size,
+                    # zero-fill size, `_tls_index` variable's VA, and its
+                    # own (already host-relative, already-correct) callback
+                    # VA list -- can be read directly out of `blob` right
+                    # now, while `dep`/`blob`/`X` are all still in scope.
                     if dep_tlsdir.Size:
-                        merged_tls = (X + dep_tlsdir.VirtualAddress, dep_tlsdir.Size, node.name)
+                        if host_tlsdir.Size:
+                            tls_off = dep_tlsdir.VirtualAddress
+                            final_start, final_end, final_index_va, final_cb_va = struct.unpack_from(
+                                "<4Q", blob, tls_off
+                            )
+                            final_zero_fill = struct.unpack_from("<I", blob, tls_off + 32)[0]
+                            dep_cb_vas: List[int] = []
+                            if final_cb_va:
+                                cb_off = (final_cb_va - image_base) - X
+                                idx = 0
+                                while 0 <= cb_off + idx * ptr_size < blob_size:
+                                    entry_off = cb_off + idx * ptr_size
+                                    entry = int.from_bytes(blob[entry_off:entry_off + ptr_size], "little")
+                                    if entry == 0:
+                                        break
+                                    dep_cb_vas.append(entry)
+                                    idx += 1
+
+                            # Phase 2's real mechanism (an earlier design
+                            # tried giving this dependency a fully
+                            # separate, dynamically TlsAlloc()'d slot
+                            # instead -- see this comment block's own
+                            # git-blame/commit history for exactly why it
+                            # didn't work, empirically, not just in
+                            # theory: TlsAlloc()'s index space is the
+                            # Win32 "dynamic TLS" one (TEB.TlsSlots/
+                            # TlsExpansionSlots), a *different* array from
+                            # the one compiled `__declspec(thread)`/
+                            # `__thread` access actually reads
+                            # (TEB.ThreadLocalStoragePointer, offset 0x58
+                            # on x64) -- confirmed by building and running
+                            # the first version of this change, which
+                            # produced wrong values without crashing).
+                            #
+                            # There is no public API to allocate a second
+                            # *real* ThreadLocalStoragePointer-array slot,
+                            # so this reuses the *one* real slot the OS
+                            # loader already assigned the host for its own
+                            # native TLS directory -- both the host's own
+                            # compiled TLS access and this dependency's own
+                            # end up reading the exact same per-thread
+                            # block, at *different, non-overlapping*
+                            # offsets within one combined raw-data range:
+                            #
+                            # 1. Copy the host's own raw TLS bytes
+                            #    (unchanged content, same relative layout)
+                            #    immediately followed by this dependency's
+                            #    own raw TLS bytes into a new, combined
+                            #    range appended onto the end of `blob` --
+                            #    the *native* loader then keeps copying
+                            #    this correctly into a fresh per-thread
+                            #    block on every thread's creation, for
+                            #    both halves, with zero custom runtime
+                            #    code needed for *that* part (this is
+                            #    exactly how the host's own half already
+                            #    worked, unaffected).
+                            # 2. Patch the host's own TLS directory struct
+                            #    (Start/EndAddressOfRawData, SizeOfZeroFill
+                            #    -- directly in `output`, below) to point
+                            #    at this new combined range instead of its
+                            #    original (now-superseded) one.
+                            #    AddressOfIndex stays the host's own
+                            #    unchanged variable -- that real, loader-
+                            #    assigned slot number is exactly what gets
+                            #    reused.
+                            # 3. The host's own compiled offset into its
+                            #    per-thread block (a link-time constant
+                            #    relative to its own *original*
+                            #    StartAddressOfRawData, which is left at
+                            #    the same relative position -- offset 0 of
+                            #    the new range -- by placing the host's
+                            #    copy first) needs no changes at all.
+                            # 4. This dependency's own compiled offset(s),
+                            #    by contrast, were computed relative to
+                            #    *its own* original StartAddressOfRawData,
+                            #    which is no longer offset 0 of the
+                            #    combined range (the host's own raw data
+                            #    now comes first) -- so every compiled
+                            #    access to its own TLS variable(s) needs
+                            #    its embedded offset shifted by
+                            #    `len(host's own raw bytes)` to land on the
+                            #    right spot in the new, combined layout
+                            #    (`_patch_dep_tls_access_offsets`, below --
+                            #    see its own docstring for exactly which
+                            #    compiled byte pattern it finds and edits,
+                            #    and the honest limits of that pattern
+                            #    match).
+                            # 5. Only this dependency's own `_tls_index`
+                            #    variable needs a *runtime* fixup left: a
+                            #    tiny generated function, hooked onto the
+                            #    init-call stub this module already builds
+                            #    whenever any embedded dependency has its
+                            #    own entry point (`dep_entry_calls`/
+                            #    `build_windows_stub`, Task 7, which runs
+                            #    unconditionally once at real process
+                            #    start -- or, for a DLL host, once at its
+                            #    own real DLL_PROCESS_ATTACH, already
+                            #    guarded by `host_is_dll`), copies the
+                            #    host's own (by-then loader-assigned)
+                            #    `_tls_index` *value* into this
+                            #    dependency's own `_tls_index` variable --
+                            #    a plain data write, needing no further
+                            #    per-thread work, since the slot *number*
+                            #    is a process-wide constant once assigned
+                            #    (only the per-thread *block pointer*
+                            #    varies, and that's the native loader's
+                            #    job, unaffected by any of this).
+                            host_struct = pe.DIRECTORY_ENTRY_TLS.struct
+                            host_start_rva = host_struct.StartAddressOfRawData - image_base
+                            host_raw_size = host_struct.EndAddressOfRawData - host_struct.StartAddressOfRawData
+                            host_zero_fill = host_struct.SizeOfZeroFill
+                            host_index_va = host_struct.AddressOfIndex
+                            host_raw_bytes = pe.get_data(host_start_rva, host_raw_size) if host_raw_size else b""
+
+                            dep_index_blob_rva = (final_index_va - image_base) - X
+                            raw_size = final_end - final_start
+                            dep_raw_off_in_blob = (final_start - image_base) - X
+                            dep_raw_bytes = bytes(blob[dep_raw_off_in_blob:dep_raw_off_in_blob + raw_size])
+
+                            patched = _patch_dep_tls_access_offsets(
+                                blob, dep_index_blob_rva, host_raw_size
+                            )
+                            if patched == 0:
+                                raise ValueError(
+                                    f"cannot embed dependency '{node.name}': merging "
+                                    f"its own Thread Local Storage (TLS) directory "
+                                    f"into a host that already has its own needs to "
+                                    f"locate and shift its own compiled TLS-variable "
+                                    f"access offset(s), but none were found matching "
+                                    f"the expected compiled pattern -- refusing to "
+                                    f"proceed rather than silently leave its TLS "
+                                    f"access reading the wrong location"
+                                )
+
+                            merged_raw_off = len(blob)
+                            blob += host_raw_bytes
+                            blob += dep_raw_bytes
+                            merged_start_va = image_base + X + merged_raw_off
+                            merged_end_va = merged_start_va + len(host_raw_bytes) + len(dep_raw_bytes)
+                            merged_zero_fill = host_zero_fill + final_zero_fill
+
+                            start_off = host_struct.get_field_absolute_offset("StartAddressOfRawData")
+                            end_off = host_struct.get_field_absolute_offset("EndAddressOfRawData")
+                            zf_off = host_struct.get_field_absolute_offset("SizeOfZeroFill")
+                            output[start_off:start_off + 8] = struct.pack("<Q", merged_start_va)
+                            output[end_off:end_off + 8] = struct.pack("<Q", merged_end_va)
+                            output[zf_off:zf_off + 4] = struct.pack("<I", merged_zero_fill)
+
+                            if dep_cb_vas:
+                                # The host had none of its own (confirmed
+                                # above, `host_cb_va` truthiness) or did --
+                                # either way, append this dependency's own
+                                # (already host-relative, already-correct)
+                                # callback VAs after whatever the host's
+                                # own array already held, onto a fresh
+                                # combined array (also appended onto
+                                # `blob`), and repoint AddressOfCallBacks
+                                # at it; left completely alone otherwise.
+                                host_cb_vas: List[int] = []
+                                host_cb_va = host_struct.AddressOfCallBacks
+                                if host_cb_va:
+                                    hidx = 0
+                                    while True:
+                                        hentry = struct.unpack(
+                                            "<Q",
+                                            pe.get_data(
+                                                host_cb_va - image_base + hidx * ptr_size, ptr_size
+                                            ),
+                                        )[0]
+                                        if hentry == 0:
+                                            break
+                                        host_cb_vas.append(hentry)
+                                        hidx += 1
+
+                                while len(blob) % ptr_size:
+                                    blob += b"\x00"
+                                cb_array_off = len(blob)
+                                cb_entries = host_cb_vas + dep_cb_vas
+                                for cb_va in cb_entries:
+                                    blob += struct.pack("<Q", cb_va)
+                                blob += struct.pack("<Q", 0)  # null terminator
+                                for i in range(len(cb_entries)):
+                                    new_reloc_entries.append(
+                                        (X + cb_array_off + i * ptr_size, IMAGE_REL_BASED_DIR64)
+                                    )
+
+                                cb_field_off = host_struct.get_field_absolute_offset("AddressOfCallBacks")
+                                output[cb_field_off:cb_field_off + ptr_size] = struct.pack(
+                                    "<Q", image_base + X + cb_array_off
+                                )
+
+                            # The one remaining runtime step: a tiny
+                            # generated function copying the host's own
+                            # (real, loader-assigned) `_tls_index` value
+                            # into this dependency's own `_tls_index`
+                            # variable, hooked onto the init-call stub
+                            # (see the long comment above).
+                            fixup_off = len(blob)
+                            fixup_code, fixup_abs_offsets = build_windows_tls_index_fixup(
+                                host_tlsindex_va=host_index_va,
+                                dep_tlsindex_va=final_index_va,
+                            )
+                            blob += fixup_code
+                            for off in fixup_abs_offsets:
+                                new_reloc_entries.append((X + fixup_off + off, IMAGE_REL_BASED_DIR64))
+                            fixup_va = image_base + X + fixup_off
+                            dep_entry_calls.append((f"__tls_fixup_{node.name}__", 0, fixup_va))
+
+                            tls_phase2 = node.name
+                        else:
+                            merged_tls = (X + dep_tlsdir.VirtualAddress, dep_tlsdir.Size, node.name)
 
                     # This dependency's own *raw* export table, by both name
                     # and ordinal: either an already-absolute VA (a normal,
@@ -784,7 +1088,11 @@ class PortableExecutableEmbedder:
                     ))
                     dep_blobs_by_name_lower[node.name.lower()] = blob
                     dep_X_by_name_lower[node.name.lower()] = X
-                    occupied_ranges.append((X, X + blob_size, node.name))
+                    # `len(blob)` rather than `blob_size` -- the TLS
+                    # phase-2 splice above (when it fires) appends extra
+                    # bytes past the original (already section-aligned)
+                    # `blob_size`, so `blob` itself may now be longer.
+                    occupied_ranges.append((X, X + len(blob), node.name))
                     # For the reloc-bearing path X == next_rva always, so
                     # this is equivalent to the old unconditional
                     # `next_rva = X + blob_size`. For a no-reloc dependency,
@@ -793,7 +1101,9 @@ class PortableExecutableEmbedder:
                     # backwards, so later appended structures (merged
                     # imports, the init stub, the combined reloc table)
                     # keep landing past every reservation made so far.
-                    next_rva = max(next_rva, X + blob_size)
+                    # `_align_up` re-rounds to a section boundary in case
+                    # the TLS phase-2 splice above grew `blob` past that.
+                    next_rva = max(next_rva, _align_up(X + len(blob), section_alignment))
                 finally:
                     dep.close()
 

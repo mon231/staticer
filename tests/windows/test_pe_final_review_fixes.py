@@ -59,23 +59,22 @@ def test_transitive_embedded_dependency_import_is_patched_not_dynamic(tmp_path, 
     assert result.returncode == 12  # lib_x_value() + lib_y_value() == 11 + 1
 
 
-def test_host_with_own_tls_directory_fails_loudly(tmp_path, c_compiler):
-    """B3 (updated for Task 2's phase-1 TLS merge): embedding a TLS-
-    carrying dependency into a *TLS-less* host now succeeds (see
-    tests/windows/test_pe_tls.py) -- the dependency's own TLS directory
-    is adopted as the host's. What's still refused, and still a
-    ValueError naming the dependency, is the case this host fixture
-    exercises: the HOST *itself* already has its own TLS directory, so
-    there would be two real TLS directories to merge into one -- that
-    remains phase 2 / Task 5, not yet implemented."""
+def test_host_with_own_tls_directory_merges_on_64bit(tmp_path, c_compiler):
+    """B3 (updated again for Task 5's phase-2 TLS merge): embedding a
+    TLS-carrying dependency into a host that *also* already has its own
+    TLS directory now succeeds on 64-bit hosts too (see
+    tests/windows/test_pe_tls.py's
+    test_tls_merge_when_host_already_has_its_own_tls_directory for the
+    positive, read-both-values-back version of this same fixture pair).
+    This just re-confirms embed() no longer raises for it here, next to
+    this suite's other TLS-shape regression tests."""
     dll = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep.c", "lib_tls_dep.dll", pic=True, bits=64)
     exe = build_exe(
         tmp_path, FIXTURES / "main_host_own_tls.c", "main_host_own_tls.exe", [dll], pic=True, bits=64,
     )
     out = tmp_path / "static_host_own_tls.exe"
 
-    with pytest.raises(ValueError, match="(?i)lib_tls_dep.dll.*tls|tls.*lib_tls_dep.dll"):
-        PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
+    PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
 
 
 def test_dependency_header_region_is_copied_into_blob(tmp_path, c_compiler):

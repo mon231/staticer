@@ -53,6 +53,7 @@ GetProcAddress interception, this ships the real, tested DllMain-ordering
 mechanism now and leaves steps 1-4 as documented follow-up work.
 """
 
+import struct
 from typing import Dict, List, Set, Tuple
 
 # Each helper below returns (bytes, [byte offsets of embedded absolute-VA
@@ -156,6 +157,59 @@ def _x86_process_attach_guard(skip_len: int) -> bytes:
     # than a register, since this stub's entrypoint hasn't pushed anything
     # of its own yet at this point.
     return b"\x83\x7C\x24\x08\x01" + b"\x0F\x85" + skip_len.to_bytes(4, "little", signed=True)
+
+
+def _mov_r64_imm64(reg_opcode: int, imm64: int) -> bytes:
+    return bytes([0x48, reg_opcode]) + imm64.to_bytes(8, "little")
+
+
+def build_windows_tls_index_fixup(*, host_tlsindex_va: int, dep_tlsindex_va: int) -> Tuple[bytes, List[int]]:
+    """x64 machine code for the one remaining runtime step in task 5 /
+    phase 2's TLS merge (host already has its own TLS directory too):
+    copy the host's own, by-then loader-assigned, `_tls_index` *value*
+    into the embedded dependency's own `_tls_index` variable.
+
+    Why this is the only runtime code phase 2 still needs (see
+    pe_embedder.py's own phase-2 comment, right where this is called,
+    for the full derivation): once the host's own TLS directory has been
+    extended to cover a combined raw-data range holding both the host's
+    own and the dependency's own raw TLS bytes (at correctly
+    non-overlapping offsets -- a pure data change, needing no runtime
+    code at all, since the native per-thread copy the OS loader already
+    does for the host's own directory keeps doing the right thing for
+    both halves automatically), both modules' compiled TLS access end up
+    reading the exact same per-thread block through the exact same real,
+    loader-assigned `ThreadLocalStoragePointer` slot -- *if* both their
+    own `_tls_index` variables hold that same slot *number*. Only the
+    host's own ever gets written by the real loader (there's only one
+    real TLS directory left); this one-time copy is what makes the
+    dependency's own agree with it. The slot number is a process-wide
+    constant once assigned (unlike the per-thread block *pointer*, which
+    varies per thread and needs no attention here at all), so copying it
+    once, this early, is sufficient -- no per-thread re-invocation
+    needed.
+
+    Takes no `(DllHandle, Reason, Reserved)` parameters at all (unlike a
+    real TLS callback) -- the caller hooks it onto the init-call stub
+    this module already generates for any embedded dependency with its
+    own entry point (`dep_entry_calls`/`build_windows_stub`), which calls
+    everything in `dep_entry_calls` with that same 3-argument call
+    convention regardless, so it's simplest to just ignore all three
+    here rather than ask the caller to use a different call shape for
+    one single entry.
+    """
+    out = bytearray()
+    abs_offsets: List[int] = []
+
+    out += _mov_r64_imm64(0xB8, host_tlsindex_va)  # mov rax, host_tlsindex_va
+    abs_offsets.append(len(out) - 8)
+    out += bytes([0x8B, 0x08])  # mov ecx, [rax]
+    out += _mov_r64_imm64(0xB8, dep_tlsindex_va)  # mov rax, dep_tlsindex_va
+    abs_offsets.append(len(out) - 8)
+    out += bytes([0x89, 0x08])  # mov [rax], ecx
+    out += bytes([0xC3])  # ret
+
+    return bytes(out), abs_offsets
 
 
 def build_windows_stub(
