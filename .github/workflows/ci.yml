@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+        pip install pytest
+
+    # Windows runners ship MSVC but do not put cl.exe on PATH by default.
+    # The compiler is only used by the test suite to build fixtures; the
+    # installed staticer package stays pure-Python.
+    - name: Put MSVC cl.exe on PATH (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
+    # ubuntu-latest ships gcc/clang for 64-bit builds, but not the 32-bit
+    # multilib support the test suite's [32]-parametrized ELF fixtures
+    # need (-m32); without it those fail with a RuntimeError from the
+    # build helper instead of skipping cleanly.
+    - name: Install 32-bit build support (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+
+    # Each OS leg only collects its own platform's tests; the skipif markers
+    # in the test files remain as a safety net for local runs.
+    - name: Run tests (Windows)
+      if: runner.os == 'Windows'
+      run: pytest tests/ --ignore=tests/linux -v
+
+    - name: Run tests (Linux)
+      if: runner.os == 'Linux'
+      run: pytest tests/ --ignore=tests/windows -v

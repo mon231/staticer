@@ -1,1 +1,0 @@
-from .staticer import main
