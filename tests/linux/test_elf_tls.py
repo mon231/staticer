@@ -129,5 +129,15 @@ def test_tlsgd_relocation_fails_loudly(tmp_path, c_compiler):
     exe = build_exe(tmp_path, FIXTURES / "main_tls_simple.c", "main_tls_simple", [so], pic=True, bits=64)
     out = tmp_path / "static_tlsgd"
 
-    with pytest.raises(ValueError, match="(?i)TLSGD"):
+    # Matched on text unique to the new rejection branch's own message
+    # ("General/Local-Dynamic"), not on "TLSGD" alone: pytest's own
+    # `tmp_path` directory is named after this test function (truncated),
+    # e.g. ".../test_tlsgd_relocation_fails_lo0/lib_tls_simple.so", and
+    # that path is embedded via `node.name` into EVERY ValueError the
+    # per-dependency relocation loop can raise -- including the
+    # pre-existing generic "unsupported relocation type" fallback. A
+    # "TLSGD"-only match would therefore pass even if the new check were
+    # deleted, proving nothing about it specifically (confirmed by
+    # disabling the new check and re-running: see task-6-report.md).
+    with pytest.raises(ValueError, match="General/Local-Dynamic"):
         ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
