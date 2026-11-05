@@ -131,14 +131,22 @@ invoked by the installed package itself.
   (Frida's own `frida-gadget`, downloaded for real from its GitHub release
   assets — see `tests/windows/test_pe_frida_gadget.py` /
   `tests/linux/test_elf_frida_gadget.py`): it carries its own TLS
-  directory on both PE and ELF, so it currently hits the
-  already-documented TLS limitation below rather than embedding
-  end-to-end — confirmed by reading frida-core's own config-resolution
-  source that, were TLS merging supported, frida-gadget's config-file
-  lookup would resolve relative to the *host's* own path once embedded
-  (since there's no longer a separately-loaded module for it to resolve
-  against), so the config would need to be named after the host binary's
-  stem, not the gadget's.
+  directory on both PE and ELF (a real `AddressOfCallBacks`-bearing PE
+  TLS directory, a real `PT_TLS` segment on ELF), which TLS-directory
+  merging (see Features below) now adopts as the TLS-less host's own on
+  both platforms. Past that, the gadget's full config-driven-script flow
+  — load a `.config` naming a JS file, run it, have the script call
+  `exit()` — runs genuinely end-to-end once embedded, on both platforms,
+  confirmed by actually executing the embedded binary: frida-gadget's
+  own config-path lookup resolves relative to the *host's* own path once
+  embedded (since there's no longer a separately-loaded module for it to
+  resolve against — confirmed by reading frida-core's own
+  config-resolution source), so the config is named after the host
+  binary's stem, not the gadget's; the script's own `exit(845)` call
+  really executes (PE reports it back as `845` — a full 32-bit exit
+  code; ELF reports `77`, since POSIX process exit statuses are
+  truncated to 8 bits by the kernel itself, `845 & 0xFF == 77`, nothing
+  to do with staticer or frida-gadget).
 
 ## Limitations
 - Explicit dynamic-loading from the executed code itself (`dlopen`+`dlsym` / `LoadLibraryW`+`GetProcAddress`) is not hooked yet; only dependencies resolved through the input's own import/dynamic-section table are embedded.
@@ -146,6 +154,6 @@ invoked by the installed package itself.
 - Process-detach cleanup (`elf-destructor` / `DllMain` `DLL_PROCESS_DETACH`) is not invoked for embedded dependencies, and thread attach/detach notifications may never be supported.
 - Because `DLL_PROCESS_DETACH` is never delivered to an embedded dependency (see above), calling `FreeLibrary` on a staticer-produced DLL *before* process exit can crash the process: a dependency built against a dynamically-linked CRT registers process-wide TLS/FLS state during its (real, CRT-startup) `DLL_PROCESS_ATTACH` that nothing ever tears down, and the CRT's own exit-time bookkeeping later dereferences it after the freed library's memory is gone. Confirmed reproducible. Safe as long as the output DLL stays loaded for the life of the process (the common case); avoid `FreeLibrary`-ing it otherwise.
 - `-o`/`--output` silently overwrites an existing file at that path (see Usage above).
-- A dependency using PE Thread Local Storage (`__declspec(thread)`) is rejected with a clear error rather than embedded incorrectly — TLS-directory merging isn't implemented yet.
+- A dependency using Thread Local Storage (PE `__declspec(thread)` / ELF `__thread`) merges cleanly into a *TLS-less* host on both platforms (see Features above) — but merging two separate TLS directories, one from the host itself and one from a dependency, into a single combined block isn't implemented; that case is rejected with a clear error rather than embedded incorrectly.
 - ELF embedding of a dependency whose own further imports aren't themselves embedded or excluded (an "in-between" import) isn't supported; such a dependency fails loudly rather than silently losing that further dependency.
 - A COPY-relocated ELF symbol larger than one pointer, containing its own interior pointer fields, doesn't get relocation entries for those interior pointers — a genuine architectural limit, since ELF carries no type/layout metadata for a COPY-relocated symbol beyond a byte count.

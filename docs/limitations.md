@@ -20,15 +20,13 @@
   Safe as long as the output DLL stays loaded for the life of the
   process (the common case); avoid `FreeLibrary`-ing it otherwise.
 - `-o`/`--output` silently overwrites an existing file at that path.
-- A dependency using PE Thread Local Storage (`__declspec(thread)`) is
-  rejected with a clear error rather than embedded incorrectly —
-  TLS-directory merging isn't implemented yet. The ELF side has no
-  equivalent up-front guard: a TLS-using `.so` dependency instead fails
-  later, with an "unsupported relocation type" error naming its own TLS
-  relocation (`R_X86_64_DTPMOD64`/`TPOFF64`), for the same underlying
-  reason. This is a real, independently-confirmed blocker for embedding
-  Frida's own `frida-gadget` library on either platform (see
-  [Features](features.md)) — not specific to synthetic test fixtures.
+- A dependency using Thread Local Storage (PE `__declspec(thread)` /
+  ELF `__thread`) merges cleanly into a *TLS-less* host on both
+  platforms (see [Features](features.md)) — but merging two *separate*
+  TLS directories, one from the host itself and one from a dependency,
+  into a single combined block isn't implemented; that case is rejected
+  with a clear error naming the dependency rather than embedded
+  incorrectly.
 - A fully self-contained module that both throws *and* catches a C++
   exception entirely within itself can still hit compiler-internal
   personality-routine details beyond the documented unwind ABI — ordinary

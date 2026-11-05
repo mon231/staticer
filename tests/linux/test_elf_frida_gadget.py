@@ -11,7 +11,23 @@ against the real downloaded `.so`: a PT_TLS segment, and via `readelf -r`:
 TLS merge (tests/linux/test_elf_tls.py) now adopts that PT_TLS as the
 TLS-less host's own, so embed() no longer fails on it with "unsupported
 relocation type 16 in dependency 'libfrida-gadget-raw.so'" the way it
-used to."""
+used to.
+
+UPDATE (Task 4): past that TLS guard, the full config-driven
+script/exit flow genuinely runs end to end on Linux too, verified with
+strace against the real embedded binary -- the gadget's own config-path
+resolution against the host's path works, it opens and runs the script,
+and the script's own `exitFn(845)` call really executes
+(`exit_group(845)` observed directly in the trace). The only difference
+from the PE sibling test is cosmetic: POSIX process exit statuses are
+only 8 bits wide (see `man 2 wait`), so the kernel itself truncates 845
+down to `845 & 0xFF == 77` before the parent ever sees it -- that 77
+(previously recorded in this module as an unexplained failure) was
+never a sign of anything broken in staticer, frida-gadget, or the
+config-resolution mechanism; it is unconditional OS behavior that
+affects every Linux process returning any value above 255, embedded or
+not. See test_embedded_frida_gadget_runs_config_driven_script_and_exits
+below for the now-passing assertion against the truncated value."""
 
 import json
 import platform
@@ -76,21 +92,6 @@ def test_embedding_frida_gadget_no_longer_fails_on_its_own_tls_relocations(tmp_p
     assert FRIDA_GADGET_MODULE_NAME["linux"] not in list_elf_imports(out)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Task 3's ELF TLS merge is done (see "
-        "test_embedding_frida_gadget_no_longer_fails_on_its_own_tls_"
-        "relocations above -- embed() no longer raises on frida-gadget's "
-        "TLS directory), but the full config-driven script/exit(845) flow "
-        "doesn't pass outright the way the PE sibling test's did as a "
-        "bonus (confirmed by actually running it: real exit code 77, not "
-        "845) -- running the embedded gadget's config-driven script flow "
-        "end to end on Linux is Task 4's own scope, not this task's. Left "
-        "xfail rather than deleted: once Task 4 lands, this documents "
-        "exactly what should then start passing."
-    ),
-    strict=True,
-)
 def test_embedded_frida_gadget_runs_config_driven_script_and_exits(tmp_path, c_compiler):
     try:
         gadget_so = fetch_frida_gadget("linux")
@@ -125,4 +126,19 @@ def test_embedded_frida_gadget_runs_config_driven_script_and_exits(tmp_path, c_c
     }))
 
     result = subprocess.run([str(out)], capture_output=True, timeout=15)
-    assert result.returncode == 845
+    # UPDATE (Task 4): the config-driven script flow genuinely runs end
+    # to end on Linux too -- config resolution against the host's own
+    # path works exactly as the PE sibling test's does, and the script's
+    # exitFn(845) call really executes (confirmed for real via strace:
+    # exit_group(845) is the call actually made). What's *not* the same
+    # as PE is the number the OS hands back to the parent: POSIX exit
+    # statuses are only 8 bits wide (man 2 exit / wait(2): "only the
+    # least significant 8 bits ... are available"), so any value above
+    # 255 is silently truncated mod 256 by the kernel itself -- nothing
+    # staticer, frida-gadget, or this test does controls that. 845 & 0xFF
+    # == 77, which is exactly the "exit code 77, not 845" previously
+    # recorded here (that was never a sign of brokenness, just this
+    # truncation, not yet understood at the time). Windows' PE exit
+    # codes are a full 32-bit DWORD (GetExitCodeProcess), which is why
+    # the PE sibling test can and does assert the untruncated 845.
+    assert result.returncode == 845 & 0xFF
