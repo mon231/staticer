@@ -27,6 +27,34 @@
   into a single combined block isn't implemented; that case is rejected
   with a clear error naming the dependency rather than embedded
   incorrectly.
+- ELF General/Local-Dynamic TLS model call-site relaxation
+  (`R_X86_64_TLSGD`/`TLSLD`, types 19/20, and the i386 equivalents) is
+  deliberately not implemented — not because it was overlooked, but
+  because it was investigated and found to be an effectively dead code
+  path for any input `embed()` can actually encounter. These relocation
+  types exist only as a directive from the compiler to the *static
+  linker* inside an unlinked relocatable object file (`.o`); confirmed
+  with `readelf -r` that `gcc -c` genuinely emits
+  `R_X86_64_TLSGD` there (including when explicitly forced via
+  `__attribute__((tls_model("global-dynamic")))` or
+  `-ftls-model=global-dynamic`), but every linker tried against the
+  resulting *linked* `.so` (GNU `ld`/bfd and `lld`) always resolves it at
+  link time into an ordinary `DTPMOD64`/`DTPOFF64` GOT-slot pair (which
+  *is* implemented — see above) before it ever reaches a linked output
+  file. This held even for the one shape that should structurally defeat
+  link-time resolution — an `extern __thread` variable whose definition
+  lives in a wholly different, unlinked shared object, so its TLS module
+  id genuinely cannot be known until load time — the linked `.so` still
+  carried `DTPMOD64`/`DTPOFF64` against the undefined symbol, never
+  `TLSGD`/`TLSLD`. Since every dependency `embed()` processes is already
+  a linked `.so` (never a raw `.o`), this relocation type cannot appear
+  in practice regardless of source code shape, compiler flags, or
+  toolchain version. `embed()` still checks for it explicitly, before
+  falling into the generic "unsupported relocation type" error, and
+  raises a specific `ValueError` naming the relocation type if it's ever
+  encountered — see
+  `.superpowers/sdd/2026-11-04-tls-support/task-6-report.md` for the full
+  investigation.
 - A fully self-contained module that both throws *and* catches a C++
   exception entirely within itself can still hit compiler-internal
   personality-routine details beyond the documented unwind ABI — ordinary

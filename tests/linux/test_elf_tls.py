@@ -23,9 +23,11 @@ raises.
 """
 
 import platform
+import struct
 import subprocess
 
 import pytest
+from elftools.elf.elffile import ELFFile
 
 from conftest import FIXTURES, build_exe, build_shared_lib
 
@@ -72,4 +74,60 @@ def test_host_with_own_tls_directory_fails_loudly(tmp_path, c_compiler):
     out = tmp_path / "static_host_own_tls"
 
     with pytest.raises(ValueError, match="(?i)lib_tls_dep.so.*tls|tls.*lib_tls_dep.so"):
+        ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+
+
+def _patch_dtpmod64_to_tlsgd(so_path):
+    """Rewrite the type field of the first R_X86_64_DTPMOD64 (16)
+    relocation entry found in `so_path`'s own .rela.dyn into
+    R_X86_64_TLSGD (19), in place.
+
+    This exists only to produce, for test purposes, the one ELF shape
+    Task 6's investigation (see task-6-report.md) found is otherwise
+    impossible to obtain from a real compiler/linker: a genuinely
+    *linked* .so carrying an R_X86_64_TLSGD/TLSLD relocation. Every
+    toolchain tried (gcc with `-ftls-model=global-dynamic` and the
+    `tls_model("global-dynamic")` attribute, GNU ld/bfd, lld) always
+    resolves TLSGD/TLSLD at static-link time into an ordinary
+    DTPMOD64/DTPOFF64 GOT-slot pair before it ever reaches a linked
+    output file -- so the only way to exercise `embed()`'s own explicit
+    rejection of this relocation type is to hand-craft it directly,
+    exactly as a malicious or unusual input might.
+    """
+    with open(so_path, "rb") as f:
+        data = bytearray(f.read())
+    with open(so_path, "rb") as f:
+        elf = ELFFile(f)
+        sec = elf.get_section_by_name(".rela.dyn")
+        assert sec is not None, f"{so_path} has no .rela.dyn section"
+        off = sec["sh_offset"]
+        entsize = sec["sh_entsize"]
+        count = sec["sh_size"] // entsize
+        for i in range(count):
+            entry_off = off + i * entsize
+            r_info = struct.unpack_from("<Q", data, entry_off + 8)[0]
+            if (r_info & 0xFFFFFFFF) == 16:  # R_X86_64_DTPMOD64
+                new_info = (r_info & ~0xFFFFFFFF) | 19  # R_X86_64_TLSGD
+                struct.pack_into("<Q", data, entry_off + 8, new_info)
+                break
+        else:
+            raise AssertionError(f"no R_X86_64_DTPMOD64 relocation found in {so_path}")
+    so_path.write_bytes(bytes(data))
+
+
+def test_tlsgd_relocation_fails_loudly(tmp_path, c_compiler):
+    """`embed()` must reject a genuine R_X86_64_TLSGD relocation with a
+    specific, named error (rather than falling into the generic
+    "unsupported relocation type" message, or silently mishandling it) --
+    see the module-level comment above `R_X86_64_TLSGD`'s own declaration
+    in elf_embedder.py and task-6-report.md for why this can only be
+    exercised via a hand-crafted fixture (no real compiler/linker on this
+    project's supported toolchains actually produces this relocation type
+    in a linked .so)."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib_tls_simple.c", "lib_tls_simple.so", pic=True, bits=64)
+    _patch_dtpmod64_to_tlsgd(so)
+    exe = build_exe(tmp_path, FIXTURES / "main_tls_simple.c", "main_tls_simple", [so], pic=True, bits=64)
+    out = tmp_path / "static_tlsgd"
+
+    with pytest.raises(ValueError, match="(?i)TLSGD"):
         ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()

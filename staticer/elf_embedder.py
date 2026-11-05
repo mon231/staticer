@@ -77,6 +77,41 @@ R_X86_64_DTPMOD64 = 16
 R_X86_64_DTPOFF64 = 17
 R_X86_64_TPOFF64 = 18
 
+# The call-site General/Local-Dynamic relaxation relocation types
+# (Task 6). Investigated, not guessed: these exist ONLY as a directive
+# from the compiler to the STATIC LINKER inside an unlinked relocatable
+# object file (.o) -- confirmed with `readelf -r` against a `gcc -c`
+# .o built from a source file carrying
+# `__attribute__((tls_model("global-dynamic")))`, which genuinely does
+# emit R_X86_64_TLSGD there. But every linker tried against the *linked*
+# .so built from that same .o (GNU ld/bfd, lld; gold wasn't installed to
+# test but there is no reason to expect it differs -- the ELF TLS ABI
+# itself, not a particular linker's heuristic, requires this) always
+# consumes/resolves the TLSGD/TLSLD relocation at link time and replaces
+# it with an ordinary DTPMOD64/DTPOFF64 GOT-slot pair (what Task 3 above
+# already handles) -- even for the one case that should structurally
+# defeat link-time resolution: a `.so` whose `extern __thread` variable
+# is defined in a wholly different, unlinked shared object (so its
+# module id genuinely cannot be known until load time) still comes out
+# as DTPMOD64/DTPOFF64 against the undefined symbol, never TLSGD/TLSLD.
+# So R_X86_64_TLSGD/TLSLD (and the i386 equivalents, R_386_TLS_GD/
+# R_386_TLS_LDM, including their _PUSH/_CALL/_POP sequence variants)
+# cannot appear in any ELF file `embed()` actually ever opens -- every
+# dependency it processes is already a linked `.so`, never a raw `.o` --
+# regardless of source code shape, compiler flags, or GCC version. See
+# .superpowers/sdd/2026-11-04-tls-support/task-6-report.md for the full
+# investigation (including the exact commands/output). Checked for
+# explicitly anyway, right before the generic "unsupported relocation
+# type" fallback, so that IF this analysis is ever wrong -- a future
+# toolchain, a hand-crafted/malicious input, or a target this project
+# doesn't support yet -- the error names the specific relocation type
+# and explains why GD/LD relaxation isn't implemented, instead of the
+# much less specific generic message.
+R_X86_64_TLSGD = 19
+R_X86_64_TLSLD = 20
+R_386_TLS_GD = 18
+R_386_TLS_LDM = 19
+
 _SUPPORTED_MACHINES = ("EM_X86_64", "EM_386")
 
 _PAGE = 0x1000
@@ -1358,6 +1393,34 @@ class ElfEmbedder:
                                     )
                             _write_int(blob, blob_offset, ptr_size, new_val)
                             continue
+                        is_tlsgd_or_tlsld = (
+                            (host_machine == "EM_X86_64" and rtype in (R_X86_64_TLSGD, R_X86_64_TLSLD))
+                            or (host_machine == "EM_386" and rtype in (R_386_TLS_GD, R_386_TLS_LDM))
+                        )
+                        if is_tlsgd_or_tlsld:
+                            # See R_X86_64_TLSGD's own declaration above
+                            # (Task 6) for the investigation backing this:
+                            # a linked .so can never actually carry this
+                            # relocation type (the static linker always
+                            # consumes/resolves it, replacing it with an
+                            # ordinary DTPMOD64/DTPOFF64 GOT-slot pair,
+                            # handled above) -- reaching this line means
+                            # either a hand-crafted/malicious input, or an
+                            # assumption here turning out wrong for some
+                            # future toolchain. Named explicitly rather
+                            # than falling into the generic "unsupported
+                            # relocation type" message below: General/
+                            # Local-Dynamic TLS call-site relaxation
+                            # (rewriting the `lea ...@tlsgd; call
+                            # __tls_get_addr` sequence into a direct
+                            # thread-pointer-relative access) is not
+                            # implemented.
+                            raise ValueError(
+                                f"dependency '{node.name}' has an R_X86_64_TLSGD/TLSLD "
+                                f"(type {rtype}) call-site General/Local-Dynamic TLS "
+                                "relocation; GD/LD instruction-sequence relaxation is not "
+                                "implemented (see docs/limitations.md)"
+                            )
                         if rtype not in (R_ABS_PLUS_ADDEND, R_GLOB_DAT):
                             raise ValueError(
                                 f"unsupported relocation type {rtype} in dependency '{node.name}'"
