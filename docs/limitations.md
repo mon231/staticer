@@ -73,3 +73,40 @@
   inside the PLT relocation table under lazy binding (not seen in any
   real-world binary encountered so far) would take the eager-binding
   code path instead.
+- **PE's section-header table has no growth mechanism.** Embedding a
+  dependency appends new sections, which needs new section-header
+  entries — but if the host's own section-header table was packed tight
+  against its first section's file data by the original linker (common
+  for modern, real-world commercial binaries; found via local testing
+  against a genuine Qt6-based application, [010 Editor](https://www.sweetscape.com/010editor/)),
+  there may be only a handful of bytes of slack, nowhere near enough for
+  even one dependency's worth of new sections. `embed()` correctly fails
+  loudly (`"not enough slack in the host's section header table to add N
+  new section(s)"`) rather than corrupting the output, but cannot embed
+  *anything* into such a host today. ELF has an equivalent constraint
+  (growing the program-header array) and already solved it — this is
+  the PE side's open counterpart. **Planned, not yet implemented**: when
+  there's insufficient header slack, move the section-header table's
+  effective capacity forward by growing `SizeOfHeaders`/shifting the
+  first section's own file data later (the same "grow in place, extend
+  the existing boundary" discipline this project already applies on the
+  ELF side), rather than only failing.
+- **The host-already-has-TLS merge's byte-pattern scanner
+  (`_patch_dep_tls_access_offsets`) is narrower than its own docstring
+  implies.** It was verified correct against this project's own
+  mingw-w64-compiled test fixtures, but **confirmed to fail against real
+  MSVC-built third-party DLLs** (found via the same local 010 Editor
+  test: `embed()` correctly refused to merge Qt6Core.dll/Qt6Widgets.dll/
+  etc.'s TLS directories into the host, each failing loudly with "none
+  were found matching the expected compiled pattern," rather than
+  silently mis-patching). This is the disclosed risk from the original
+  implementation materializing on real software, not a new kind of bug —
+  but it means the host-already-has-TLS merge path, while safe, is
+  currently narrower in practice than "works for 64-bit PE" suggests.
+  **Planned, not yet implemented**: broaden the scanner to recognize the
+  compiled-TLS-access idiom across more real compilers/optimization
+  levels (at minimum real MSVC-emitted code, not just mingw-w64), or add
+  a second, independent verification pass (e.g. checking the matched
+  instruction's full surrounding byte context, not just the first
+  candidate) so a genuine non-match still fails loudly but a near-miss
+  doesn't silently misfire.
