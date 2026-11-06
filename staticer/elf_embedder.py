@@ -98,11 +98,9 @@ R_X86_64_TPOFF64 = 18
 # R_386_TLS_LDM, including their _PUSH/_CALL/_POP sequence variants)
 # cannot appear in any ELF file `embed()` actually ever opens -- every
 # dependency it processes is already a linked `.so`, never a raw `.o` --
-# regardless of source code shape, compiler flags, or GCC version. See
-# .superpowers/sdd/2026-11-04-tls-support/task-6-report.md for the full
-# investigation (including the exact commands/output). Checked for
-# explicitly anyway, right before the generic "unsupported relocation
-# type" fallback, so that IF this analysis is ever wrong -- a future
+# regardless of source code shape, compiler flags, or GCC version.
+# Checked for explicitly anyway, right before the generic "unsupported
+# relocation type" fallback, so that IF this analysis is ever wrong -- a future
 # toolchain, a hand-crafted/malicious input, or a target this project
 # doesn't support yet -- the error names the specific relocation type
 # and explains why GD/LD relaxation isn't implemented, instead of the
@@ -1345,6 +1343,25 @@ class ElfEmbedder:
                                 # inside __tls_get_addr's own dtv lookup
                                 # or silently read back the wrong thread's
                                 # slot, neither of which happens.
+                                #
+                                # Same external-symbol guard as the
+                                # DTPOFF64/TPOFF64 branch below: a
+                                # DTPMOD64 relocation against an
+                                # SHN_UNDEF (external, not-embedded) TLS
+                                # symbol belongs to some OTHER module, not
+                                # this merge's module-id-1 host -- without
+                                # this check, it would silently get
+                                # assigned module id 1 anyway instead of
+                                # failing loudly.
+                                sym_idx = reloc["r_info_sym"]
+                                if sym_idx != 0:
+                                    tls_sym = dep_dyn.get_symbol(sym_idx)
+                                    if tls_sym["st_shndx"] == "SHN_UNDEF":
+                                        raise ValueError(
+                                            f"dependency '{node.name}' has a TLS relocation "
+                                            f"referencing an external (not embedded) TLS "
+                                            f"symbol '{tls_sym.name}'; unsupported"
+                                        )
                                 new_val = 1
                             else:
                                 sym_idx = reloc["r_info_sym"]
@@ -1415,8 +1432,13 @@ class ElfEmbedder:
                             # __tls_get_addr` sequence into a direct
                             # thread-pointer-relative access) is not
                             # implemented.
+                            gd_ld_names = (
+                                "R_X86_64_TLSGD/TLSLD"
+                                if host_machine == "EM_X86_64"
+                                else "R_386_TLS_GD/TLS_LDM"
+                            )
                             raise ValueError(
-                                f"dependency '{node.name}' has an R_X86_64_TLSGD/TLSLD "
+                                f"dependency '{node.name}' has an {gd_ld_names} "
                                 f"(type {rtype}) call-site General/Local-Dynamic TLS "
                                 "relocation; GD/LD instruction-sequence relaxation is not "
                                 "implemented (see docs/limitations.md)"
