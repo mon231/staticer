@@ -594,6 +594,22 @@ def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int,
         _patched = set()
     if unwind_rva == 0 or unwind_rva + 4 > len(blob) or _depth > 32:
         return
+    if unwind_rva in _patched:
+        # Already visited via another RUNTIME_FUNCTION entry that shares
+        # this exact UNWIND_INFO -- the linker's comdat folding can (and,
+        # confirmed against frida-gadget's own real, large x64 DLL, in
+        # practice does) make many distinct functions' entries all point
+        # at one shared UNWIND_INFO, directly or by chaining to it. Without
+        # this check, every one of those entries would re-run the `+shift`
+        # patch below on the exact same bytes -- not a no-op repeat (unlike
+        # ordinary relocation, which is idempotent by nature), but a
+        # second, third, ... genuine additional `+shift`, so a
+        # sufficiently-shared chain eventually overflows its own DWORD
+        # field (`struct.error: 'I' format requires 0 <= number <=
+        # 4294967295`) once the repeat count is high enough -- exactly
+        # the real crash this guards against, not a hypothetical one.
+        return
+    _patched.add(unwind_rva)
     version_flags = blob[unwind_rva]
     flags = (version_flags >> 3) & 0x1F
     count_of_codes = blob[unwind_rva + 2]
