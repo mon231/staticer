@@ -949,14 +949,16 @@ def _try_patch_msvc_style_tls_access(
     regardless of compiler. Returns whether a match was found and
     patched.
 
-    Known limitation, same honestly-documented spirit as the rest of
-    this module: if `_tls_index` itself were loaded into an extended
-    register (r8d-r15d, needing its own REX prefix before the `8B`
-    opcode the caller matches), this function would never even be
-    reached -- the caller's own anchor match doesn't look for that REX
-    prefix. Not observed in practice (every real-world and locally
-    compiled case seen loads it into eax/ecx/edx), so left as a gap
-    rather than guessed at.
+    Re-reviewed and confirmed NOT a gap: an extended-register load of
+    `_tls_index` (r8d-r15d, via a REX prefix immediately before the `8B`
+    opcode) still matches the caller's own anchor check -- that check
+    masks only the ModRM reg-field bits (`blob[i+1] & 0xC7 == 0x05`),
+    which is unaffected by a preceding REX byte, and the disp32-relative
+    target-RVA math is REX-position-independent too. Hand-verified by
+    encoding `mov r9d,[rip+disp32]` (`44 8B 0D <disp32>`) and tracing it
+    through the matcher. Every real-world and locally compiled case seen
+    so far loads it into eax/ecx/edx anyway, but the extended-register
+    case was never actually unreachable.
     """
     win_begin = max(0, anchor_begin - 32)
     win_end = min(limit, tls_index_load_end + 32, len(blob))
