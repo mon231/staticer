@@ -862,6 +862,138 @@ def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int)
     return entries
 
 
+def _try_patch_mingw_style_tls_access(
+    blob: bytearray, anchor_begin: int, tls_index_load_end: int, limit: int, shift: int
+) -> bool:
+    """mingw-w64's compiled idiom for the final, variable-specific part of
+    a `__declspec(thread)`/`__thread` access: once `_tls_index`'s value
+    has been loaded and combined with `TEB.ThreadLocalStoragePointer`
+    into this module's own per-thread block pointer, the link-time
+    constant offset to this one specific TLS variable is baked directly
+    into *this* access instruction's own disp32 field:
+
+        mov/  r32, [r64+disp32]      ; <- disp32 is the one to shift
+         mov      [r64+disp32], r32
+
+    Scans forward from `tls_index_load_end` (where the `_tls_index` load
+    matched by the caller ends) through a short, bounded window for the
+    first instruction matching that exact shape (``8B``/``89`` opcode,
+    ModRM mod=10 i.e. disp32-sized displacement, rm!=100 i.e. a plain
+    base register with no SIB byte) and shifts its disp32 in place.
+    `anchor_begin` is unused here (mingw's idiom never needs to look
+    behind the `_tls_index` load) -- it's only part of this function's
+    signature so every entry in `_KNOWN_DEP_TLS_ACCESS_PATTERNS` shares
+    one call shape. Returns whether a match was found and patched.
+    """
+    j = tls_index_load_end
+    window_end = min(j + 32, limit - 6, len(blob) - 6)
+    while j <= window_end:
+        op = blob[j]
+        if op in (0x8B, 0x89) and (blob[j + 1] & 0xC0) == 0x80 and (blob[j + 1] & 0x07) != 0x04:
+            disp_off = j + 2
+            cur = int.from_bytes(blob[disp_off:disp_off + 4], "little", signed=True)
+            blob[disp_off:disp_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
+            return True
+        j += 1
+    return False
+
+
+# The fixed tail of `mov r64, qword ptr gs:[0x58]` (TEB.ThreadLocalStoragePointer,
+# a 9-byte instruction: `65` GS-segment prefix, REX.W (`48`/`4C`), `8B`, a ModRM
+# selecting the destination register with rm=100 (SIB follows), then this SIB
+# byte (`25` = scale 00, index 100 "none", base 101 "disp32 only, no base reg")
+# and the little-endian disp32 `0x58`). This exact tail is identical no matter
+# which register is the destination, and -- unlike `_tls_index`'s own load --
+# identical across every compiler: it's the one truly compiler-independent
+# instruction in a compiled `__declspec(thread)`/`__thread` access, so it's
+# used below purely as corroboration (never as the thing being patched).
+_TEB_TLS_POINTER_GS_TAIL = b"\x25\x58\x00\x00\x00"
+
+
+def _try_patch_msvc_style_tls_access(
+    blob: bytearray, anchor_begin: int, tls_index_load_end: int, limit: int, shift: int
+) -> bool:
+    """MSVC's compiled idiom for the same final, variable-specific part
+    of a `__declspec(thread)`/`__thread` access -- confirmed against
+    real `cl.exe`-compiled x64 output (both an unoptimized and an `/O2`
+    build), and genuinely different from mingw-w64's, above: MSVC never
+    bakes the offset into the final access instruction's own disp32 at
+    all. Instead, the final access is SIB-addressed with no
+    displacement at all (`mov r32, [base_reg + offset_reg]` / `inc
+    dword ptr [base_reg + offset_reg]`, etc.), and the offset constant
+    instead lives in a separate, nearby `mov r32, imm32` (opcode
+    0xB8-0xBF, optionally preceded by a single REX prefix byte with
+    REX.W clear -- REX.W set would make this a different, 10-byte
+    `mov r64, imm64` instruction, not this one) that loads it into the
+    register later used as that SIB offset. For example (`/O2`,
+    this project's own locally-compiled test case):
+
+        mov   edx, [rip+disp32]      ; load _tls_index's current value
+        mov   rcx, gs:0x58           ; TEB.ThreadLocalStoragePointer
+        mov   r8d, 4                 ; <- the offset to shift lives here
+        mov   rax, [rcx+rdx*8]       ; this module's own per-thread block
+        inc   dword ptr [rax+r8]     ; no disp32 at all -- r8 carries it
+
+    and, unoptimized, the same `mov r32, imm32` instead appears *before*
+    the `_tls_index` load rather than after it -- so this searches a
+    bounded window on both sides of it (`anchor_begin`/
+    `tls_index_load_end`), not just forward like the mingw-w64 pattern
+    above.
+
+    `mov r32, imm32` alone is far too generic a byte shape to trust
+    without corroboration (it's an extremely common instruction for
+    entirely unrelated reasons), so this only looks for it inside a
+    window that also contains a `mov r64, gs:[0x58]`
+    (`_TEB_TLS_POINTER_GS_TAIL`) access -- the one instruction every
+    compiled `__declspec(thread)`/`__thread` access has in common
+    regardless of compiler. Returns whether a match was found and
+    patched.
+
+    Known limitation, same honestly-documented spirit as the rest of
+    this module: if `_tls_index` itself were loaded into an extended
+    register (r8d-r15d, needing its own REX prefix before the `8B`
+    opcode the caller matches), this function would never even be
+    reached -- the caller's own anchor match doesn't look for that REX
+    prefix. Not observed in practice (every real-world and locally
+    compiled case seen loads it into eax/ecx/edx), so left as a gap
+    rather than guessed at.
+    """
+    win_begin = max(0, anchor_begin - 32)
+    win_end = min(limit, tls_index_load_end + 32, len(blob))
+    if blob.find(_TEB_TLS_POINTER_GS_TAIL, win_begin, win_end) < 0:
+        return False
+    j = win_begin
+    while j <= win_end - 5:
+        op = blob[j]
+        rex_len = 0
+        opcode = op
+        if 0x40 <= op <= 0x47:  # REX prefix, W clear (W set -> imm64, a different instruction)
+            if j + 1 >= len(blob):
+                break
+            rex_len = 1
+            opcode = blob[j + 1]
+        if 0xB8 <= opcode <= 0xBF:
+            imm_off = j + rex_len + 1
+            if imm_off + 4 <= len(blob):
+                cur = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
+                blob[imm_off:imm_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
+                return True
+        j += 1
+    return False
+
+
+# Tried, in order, for every `_tls_index`-load call site found below. Each
+# entry recognizes one compiler's own compiled shape for the final,
+# variable-specific part of a `__declspec(thread)`/`__thread` access (see
+# each one's own docstring); a third compiler's idiom, if one is ever found
+# to differ from both of these, belongs here as a new entry, not as a
+# special case folded into either existing function.
+_KNOWN_DEP_TLS_ACCESS_PATTERNS = [
+    _try_patch_mingw_style_tls_access,
+    _try_patch_msvc_style_tls_access,
+]
+
+
 def _patch_dep_tls_access_offsets(blob: bytearray, dep_index_rva: int, shift: int) -> int:
     """TLS phase 2's last remaining piece of real byte-level surgery:
     find every compiled access to *this dependency's own* TLS variable(s)
@@ -887,27 +1019,24 @@ def _patch_dep_tls_access_offsets(blob: bytearray, dep_index_rva: int, shift: in
     one case, where the per-thread block's own *layout* is being changed
     out from under it).
 
-    Confirmed against this project's own mingw-w64-compiled test
-    fixtures, the compiled idiom (identical for a read or a write) is
-    this exact instruction sequence, with only the destination/
-    intermediate *register choice* varying by call site:
-
-        mov   r32, [rip+disp32]      ; load _tls_index's current value
-        mov   r64, gs:0x58           ; TEB.ThreadLocalStoragePointer
-        mov   r64, [r64 + r32*8]     ; this module's own per-thread block
-        mov/  r32, [r64+disp32]      ; <- disp32 is the one to shift
-         mov      [r64+disp32], r32
-
-    This walks `blob` for the first instruction (an exact, unambiguous
-    match: `_tls_index`'s own RVA, not a heuristic), then scans forward a
-    short, bounded window for the final disp32-based access and shifts
-    it. This is a real, if narrow, binary-pattern dependency -- it
-    recognizes exactly this compiler-generated shape and nothing else;
-    an entirely different compiler/codegen for the same source-level
-    construct would need its own pattern added here. Returns how many
-    call sites were found and patched (0 means the caller should treat
-    the merge as unsupported for this dependency rather than silently
-    leave a wrong offset in place).
+    Both mingw-w64 and MSVC load `_tls_index`'s current value the same
+    way -- a RIP-relative 32-bit load, `mov r32, [rip+disp32]`, where
+    `disp32` resolves to `_tls_index`'s own RVA -- and this still walks
+    `blob` for exactly that instruction (an exact, unambiguous match,
+    not a heuristic) as the shared anchor for both compilers' idioms.
+    From there, the two compilers diverge in how the *variable-specific*
+    offset itself is encoded -- see `_try_patch_mingw_style_tls_access`
+    and `_try_patch_msvc_style_tls_access`'s own docstrings for each
+    compiler's real, locally-confirmed compiled shape. Each entry in
+    `_KNOWN_DEP_TLS_ACCESS_PATTERNS` is tried in order per anchor match;
+    the first one that finds and shifts its offset wins. This is still a
+    real, if narrow, binary-pattern dependency -- it recognizes exactly
+    these compiler-generated shapes and nothing else; a third compiler's
+    codegen for the same source-level construct would need its own
+    pattern added to that list. Returns how many call sites were found
+    and patched (0 means the caller should treat the merge as
+    unsupported for this dependency rather than silently leave a wrong
+    offset in place).
     """
     count = 0
     n = len(blob)
@@ -917,16 +1046,12 @@ def _patch_dep_tls_access_offsets(blob: bytearray, dep_index_rva: int, shift: in
             disp = int.from_bytes(blob[i + 2:i + 6], "little", signed=True)
             if i + 6 + disp == dep_index_rva:
                 j = i + 6
-                window_end = min(j + 32, n - 6)
-                while j <= window_end:
-                    op = blob[j]
-                    if op in (0x8B, 0x89) and (blob[j + 1] & 0xC0) == 0x80 and (blob[j + 1] & 0x07) != 0x04:
-                        disp_off = j + 2
-                        cur = int.from_bytes(blob[disp_off:disp_off + 4], "little", signed=True)
-                        blob[disp_off:disp_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
+                for try_pattern in _KNOWN_DEP_TLS_ACCESS_PATTERNS:
+                    if try_pattern(blob, i, j, n, shift):
                         count += 1
                         break
-                    j += 1
+                i = j
+                continue
         i += 1
     return count
 
