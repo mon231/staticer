@@ -53,3 +53,4 @@ nav:
   - Examples: examples.md
   - Limitations: limitations.md
   - Architecture: architecture.md
+  - Internals: internals.md

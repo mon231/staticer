@@ -120,6 +120,11 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# superpowers SDD scratch workspace (plans/specs/findings/ledgers) --
+# process artifacts, not shipped product; key findings get written up
+# properly into docs/ instead
+/.superpowers/
+
 # mypy
 .mypy_cache/
 .dmypy.json
