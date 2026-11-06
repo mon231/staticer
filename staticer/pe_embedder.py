@@ -131,40 +131,467 @@ def _pack_section_header(name: bytes, virtual_size: int, virtual_address: int,
     )
 
 
-def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int, _depth: int = 0) -> None:
+class _FH4ParseError(Exception):
+    """Raised internally by the ``_fh4_parse_*`` helpers below when the
+    bytes at some offset don't decode as a plausible __CxxFrameHandler4
+    structure (out-of-bounds read, an implausible entry count, a header
+    byte with its documented-always-zero 'reserved' bit set, ...).
+    Caught by ``_adjust_cxx_frame_handler4_funcinfo``, which then leaves
+    that function's FuncInfo4 data completely unpatched rather than risk
+    writing a wrong address over real data -- the same fail-safe,
+    leave-it-alone behavior this module already falls back to for any
+    other not-confidently-understood case."""
+
+
+#: Upper bound on any single compressed-int *count* field (NumEntries,
+#: number of try blocks, number of handlers, ...) __CxxFrameHandler4 data
+#: is ever expected to contain for a real, compiler-generated function.
+#: Purely a sanity backstop against treating garbage/unrelated bytes as a
+#: huge entry count and looping far past anything a real function would
+#: need -- every real read is already bounds-checked against `len(blob)`
+#: regardless, so this can never cause an out-of-bounds access by itself.
+_FH4_MAX_ENTRIES = 1 << 16
+
+
+def _fh4_read_compressed_uint(blob: bytearray, pos: int) -> "tuple[int, int]":
+    """Decode one of __CxxFrameHandler4's own variable-length ("compressed")
+    unsigned integers starting at byte offset `pos` in `blob`, returning
+    ``(value, new_pos)``.
+
+    This is the format MSVC's own ``FH4::ReadUnsigned``/
+    ``FH4::Compress::getNETencoded`` (see ``ehdata4_export.h``, shipped
+    with MSVC under ``VC/Tools/MSVC/<ver>/include/`` -- the project's own
+    semi-public header for this exact on-disk format, confirmed present
+    and readable on this machine) implement: the low bits of the first
+    byte, read as a unary prefix, give the total encoded length in bytes
+    (1-5); the remaining bits (spread across however many bytes that is)
+    hold the actual value, least-significant byte first:
+
+        bit0=0                     -> 1 byte,  7 value bits (byte0>>1)
+        bit0=1, bit1=0             -> 2 bytes, 14 value bits
+        bit0=1, bit1=1, bit2=0     -> 3 bytes, 21 value bits
+        bits0-2=1, bit3=0 (0x07)   -> 4 bytes, 28 value bits
+        bits0-3=1 (0x0F)           -> 5 bytes, 32 value bits (raw LE)
+
+    Confirmed against MSVC 19.51's own compiled output by decoding a real
+    FuncInfo4 blob both this way and via a tiny harness that calls the
+    real ``FH4::DecompFuncInfo``/``FH4::ReadUnsigned`` from
+    ``ehdata4_export.h`` directly (LoadLibraryExA'd with
+    ``LOAD_LIBRARY_AS_IMAGE_RESOURCE`` so RVA-based pointer arithmetic
+    inside those inline functions is valid) -- the two gave identical
+    results. Never embeds an RVA itself (it's used only for counts,
+    state-transition deltas, and bit-packed type tags), so nothing this
+    function decodes ever needs ``+shift`` treatment -- it only needs to
+    be decoded accurately enough to find *where the next field starts*.
+    """
+    if pos >= len(blob):
+        raise _FH4ParseError("compressed-int read starts past end of buffer")
+    b0 = blob[pos]
+    if b0 & 1 == 0:
+        return b0 >> 1, pos + 1
+    if b0 & 3 == 1:
+        if pos + 2 > len(blob):
+            raise _FH4ParseError("2-byte compressed-int read past end of buffer")
+        return (b0 >> 2) | (blob[pos + 1] << 6), pos + 2
+    if b0 & 7 == 3:
+        if pos + 3 > len(blob):
+            raise _FH4ParseError("3-byte compressed-int read past end of buffer")
+        return (b0 >> 3) | (blob[pos + 1] << 5) | (blob[pos + 2] << 13), pos + 3
+    if b0 & 0xF == 7:
+        if pos + 4 > len(blob):
+            raise _FH4ParseError("4-byte compressed-int read past end of buffer")
+        return (
+            (b0 >> 4) | (blob[pos + 1] << 4) | (blob[pos + 2] << 12) | (blob[pos + 3] << 20),
+            pos + 4,
+        )
+    if pos + 5 > len(blob):
+        raise _FH4ParseError("5-byte compressed-int read past end of buffer")
+    value = blob[pos + 1] | (blob[pos + 2] << 8) | (blob[pos + 3] << 16) | (blob[pos + 4] << 24)
+    return value, pos + 5
+
+
+def _fh4_read_count(blob: bytearray, pos: int) -> "tuple[int, int]":
+    """Like ``_fh4_read_compressed_uint``, but for a *NumEntries*-style
+    count field specifically -- rejects an implausibly large result (see
+    ``_FH4_MAX_ENTRIES``) rather than looping that many times below."""
+    count, pos = _fh4_read_compressed_uint(blob, pos)
+    if count > _FH4_MAX_ENTRIES:
+        raise _FH4ParseError(f"implausible entry count {count}")
+    return count, pos
+
+
+def _fh4_rva_in_module(rva: int, module_ranges: List["tuple[int, int]"]) -> bool:
+    """True if `rva` falls within some real section of the module (i.e.
+    some ``[VirtualAddress, VirtualAddress + size)`` range reported by the
+    dependency's own section table) -- false for an RVA that lands in the
+    PE header/DOS-stub region before the first section, past the end of
+    the image, or in an inter-section alignment gap no section claims.
+
+    This is the key discriminator that keeps ``_fh4_parse_func_info4`` and
+    friends from treating some *other* personality routine's unrelated
+    data (plain SEH scope tables, __CxxFrameHandler3's legacy format,
+    ...) as __CxxFrameHandler4's -- confirmed necessary, not theoretical:
+    an early version of this patch, validating only "in-bounds of `blob`"
+    plus FuncInfoHeader's reserved-bit, happily accepted small
+    coincidentally-reserved-bit-clear values (1, 2, 3, 4, ...) read out of
+    plain-SEH scope-table bytes for a non-C++, DllMain-only MSVC-built
+    dependency (see ``tests/fixtures/lib_order_a.c``) as "valid" FuncInfo4
+    RVAs and corrupted unrelated bytes near the start of the image -- a
+    real, reproduced false positive, not a hypothetical one. Every one of
+    those bogus values landed below the dependency's first section's own
+    ``VirtualAddress`` (i.e. in the header region); real FuncInfo4 data,
+    being ordinary comdat'd .xdata/.rdata content, never does.
+    """
+    return any(lo <= rva < hi for lo, hi in module_ranges)
+
+
+def _fh4_rva_field(blob: bytearray, pos: int,
+                    module_ranges: List["tuple[int, int]"]) -> "tuple[int, int]":
+    """Reads one plain 4-byte image-relative-offset ("RVA") field at `pos`
+    -- one of FuncInfo4's own fixed-size fields (dispUnwindMap,
+    dispTryBlockMap, an UnwindMapEntry4's `action`, a TryBlockMapEntry4's
+    dispHandlerArray, a HandlerType4's dispType/dispOfHandler/
+    continuation address, ...) -- unlike every other field in this format,
+    these are NOT compressed-int-encoded (see ehdata4_export.h's own
+    on-disk-format comment: each is spelled out as "4 bytes, RVA to ...").
+    Returns ``(value, pos + 4)``; `pos` itself is the field's own offset,
+    which the caller collects for patching.
+
+    A nonzero value failing ``_fh4_rva_in_module`` raises, exactly like an
+    out-of-bounds read -- see that function's docstring for why this
+    check earns its place on every single RVA field this format has, not
+    just the ones this module recurses through."""
+    if pos + 4 > len(blob):
+        raise _FH4ParseError("RVA field read past end of buffer")
+    (value,) = struct.unpack_from("<I", blob, pos)
+    if value and not _fh4_rva_in_module(value, module_ranges):
+        raise _FH4ParseError(f"RVA 0x{value:x} outside every known module section")
+    return value, pos + 4
+
+
+def _fh4_parse_handler_map4(blob: bytearray, rva: int,
+                             module_ranges: List["tuple[int, int]"]) -> List[int]:
+    """Parses a HandlerMap4 blob (the per-try-block array of catch-handler
+    descriptors a TryBlockMapEntry4's ``dispHandlerArray`` points at --
+    see ehdata4_export.h's "HandlerMap4" on-disk-format comment and
+    ``FH4::HandlerMap4::DecompHandler``), returning the list of byte
+    offsets *within* `blob` that hold a 4-byte RVA needing ``+shift``:
+    each entry's optional ``dispType`` (the RTTI type descriptor the
+    thrown object is matched against), its always-present
+    ``dispOfHandler`` (the catch handler's own entry point), and, only
+    when ``contIsRVA`` is set (used for POGO/BBT-separated code), its 1-2
+    continuation addresses."""
+    if rva >= len(blob):
+        raise _FH4ParseError("HandlerMap4 RVA out of bounds")
+    pos = rva
+    count, pos = _fh4_read_count(blob, pos)
+    patches = []
+    for _ in range(count):
+        if pos >= len(blob):
+            raise _FH4ParseError("HandlerMap4 entry header read past end of buffer")
+        header = blob[pos]
+        pos += 1
+        has_adjectives = header & 1
+        has_disp_type = (header >> 1) & 1
+        has_catch_obj = (header >> 2) & 1
+        cont_is_rva = (header >> 3) & 1
+        cont_addr = (header >> 4) & 0b11
+        if has_adjectives:
+            _, pos = _fh4_read_compressed_uint(blob, pos)
+        if has_disp_type:
+            _, pos2 = _fh4_rva_field(blob, pos, module_ranges)
+            patches.append(pos)
+            pos = pos2
+        if has_catch_obj:
+            _, pos = _fh4_read_compressed_uint(blob, pos)
+        _, pos2 = _fh4_rva_field(blob, pos, module_ranges)  # dispOfHandler: always present
+        patches.append(pos)
+        pos = pos2
+        if cont_is_rva:
+            if cont_addr == 1:
+                _, pos2 = _fh4_rva_field(blob, pos, module_ranges)
+                patches.append(pos)
+                pos = pos2
+            elif cont_addr == 2:
+                _, pos2 = _fh4_rva_field(blob, pos, module_ranges)
+                patches.append(pos)
+                pos = pos2
+                _, pos2 = _fh4_rva_field(blob, pos, module_ranges)
+                patches.append(pos)
+                pos = pos2
+            # cont_addr == 0 (none) or 3 (reserved): no continuation field at all.
+        else:
+            # Function-relative (not RVA), used for non-separated code --
+            # no adjustment needed.
+            if cont_addr == 1:
+                _, pos = _fh4_read_compressed_uint(blob, pos)
+            elif cont_addr == 2:
+                _, pos = _fh4_read_compressed_uint(blob, pos)
+                _, pos = _fh4_read_compressed_uint(blob, pos)
+    return patches
+
+
+def _fh4_parse_try_block_map4(blob: bytearray, rva: int,
+                               module_ranges: List["tuple[int, int]"]) -> List[int]:
+    """Parses a TryBlockMap4 blob (FuncInfo4's own ``dispTryBlockMap``
+    points here -- see ehdata4_export.h's "TryBlockMap4" comment and
+    ``FH4::TryBlockMap4::DecompTryBlock``): one entry per try block, each
+    giving the EH-state range it covers and an RVA (``dispHandlerArray``)
+    to that try's own HandlerMap4 (recursed into here). Returns every byte
+    offset found needing ``+shift``."""
+    if rva >= len(blob):
+        raise _FH4ParseError("TryBlockMap4 RVA out of bounds")
+    pos = rva
+    count, pos = _fh4_read_count(blob, pos)
+    patches = []
+    for _ in range(count):
+        _, pos = _fh4_read_compressed_uint(blob, pos)  # tryLow
+        _, pos = _fh4_read_compressed_uint(blob, pos)  # tryHigh
+        _, pos = _fh4_read_compressed_uint(blob, pos)  # catchHigh
+        disp_handler_array, pos = _fh4_rva_field(blob, pos, module_ranges)
+        patches.append(pos - 4)
+        if disp_handler_array:
+            patches.extend(_fh4_parse_handler_map4(blob, disp_handler_array, module_ranges))
+    return patches
+
+
+def _fh4_parse_unwind_map4(blob: bytearray, rva: int,
+                            module_ranges: List["tuple[int, int]"]) -> List[int]:
+    """Parses an UWMap4 blob (FuncInfo4's own ``dispUnwindMap`` points
+    here -- see ehdata4_export.h's "UWMap4" comment and
+    ``FH4::UWMap4::ReadEntry``): one entry per unwind-map state, each a
+    compressed ``nextOffset<<2|type`` tag followed by an ``action`` RVA
+    (to the destructor/cleanup thunk to run) for every type *except*
+    ``NoUW`` (0) -- a state with nothing to unwind has no further data at
+    all. Returns every byte offset found needing ``+shift``."""
+    if rva >= len(blob):
+        raise _FH4ParseError("UWMap4 RVA out of bounds")
+    pos = rva
+    count, pos = _fh4_read_count(blob, pos)
+    patches = []
+    for _ in range(count):
+        packed, pos = _fh4_read_compressed_uint(blob, pos)
+        entry_type = packed & 0b11
+        if entry_type in (1, 2):  # DtorWithObj, DtorWithPtrToObj
+            _, pos = _fh4_rva_field(blob, pos, module_ranges)
+            patches.append(pos - 4)
+            _, pos = _fh4_read_compressed_uint(blob, pos)  # object (frame offset, not an RVA)
+        elif entry_type == 3:  # RVA
+            _, pos = _fh4_rva_field(blob, pos, module_ranges)
+            patches.append(pos - 4)
+        # entry_type == 0 (NoUW): no further data for this entry.
+    return patches
+
+
+def _fh4_parse_sep_ip2state_map4(blob: bytearray, rva: int,
+                                  module_ranges: List["tuple[int, int]"]) -> List[int]:
+    """Parses a SepIPtoStateMap4 blob (only present for POGO/BBT-separated
+    functions, pointed at by FuncInfo4's ``dispUnwindMap``-slot field when
+    ``header.isSeparated`` is set -- see ehdata4_export.h's
+    "SepIPtoStateMap4" comment): one ``(addrStartRVA, dispOfIPMap)`` pair
+    per code segment, both real RVAs (the segment's own start address,
+    and the RVA to *that* segment's own IPtoStateMap4 -- which, like the
+    non-separated IPtoStateMap4, has no RVA fields of its own and so
+    needs no further recursion)."""
+    if rva >= len(blob):
+        raise _FH4ParseError("SepIPtoStateMap4 RVA out of bounds")
+    pos = rva
+    count, pos = _fh4_read_count(blob, pos)
+    patches = []
+    for _ in range(count):
+        _, pos = _fh4_rva_field(blob, pos, module_ranges)  # addrStartRVA
+        patches.append(pos - 4)
+        _, pos = _fh4_rva_field(blob, pos, module_ranges)  # dispOfIPMap
+        patches.append(pos - 4)
+    return patches
+
+
+def _fh4_parse_func_info4(blob: bytearray, rva: int,
+                           module_ranges: List["tuple[int, int]"]) -> List[int]:
+    """Parses a FuncInfo4 blob (__CxxFrameHandler4's own top-level
+    per-function metadata structure -- see ehdata4_export.h's "FuncInfo4"
+    comment and ``FH4::DecompFuncInfo``) and everything it transitively
+    points to (its UnwindMap, TryBlockMap and, for POGO/BBT-separated
+    code, per-segment IP-to-state map), returning every byte offset
+    within `blob` found to hold a 4-byte RVA needing ``+shift``.
+
+    Raises ``_FH4ParseError`` -- caught by this module's one caller,
+    ``_adjust_cxx_frame_handler4_funcinfo`` -- the moment anything stops
+    looking like a real, well-formed FuncInfo4 (an out-of-bounds read, an
+    implausible entry count, or ``header``'s documented-always-zero
+    'reserved' bit being set): that's the signal this *isn't* actually
+    __CxxFrameHandler4 data after all (see that function's docstring for
+    why a plain RVA can't be told apart from one on sight alone), and the
+    caller leaves it completely unpatched rather than risk doing this
+    wrong."""
+    if rva >= len(blob):
+        raise _FH4ParseError("FuncInfo4 RVA out of bounds")
+    pos = rva
+    header = blob[pos]
+    if header & 0x80:  # FuncInfoHeader.reserved: "Have to be 0"
+        raise _FH4ParseError("FuncInfoHeader.reserved bit set")
+    is_catch = header & 1
+    is_separated = (header >> 1) & 1
+    has_bbt = (header >> 2) & 1
+    has_unwind_map = (header >> 3) & 1
+    has_try_block_map = (header >> 4) & 1
+    pos += 1
+
+    if has_bbt:
+        _, pos = _fh4_read_compressed_uint(blob, pos)  # bbtFlags
+
+    disp_unwind_map = 0
+    disp_unwind_map_off = None
+    if has_unwind_map:
+        disp_unwind_map, pos = _fh4_rva_field(blob, pos, module_ranges)
+        disp_unwind_map_off = pos - 4
+
+    disp_try_block_map = 0
+    disp_try_block_map_off = None
+    if has_try_block_map:
+        disp_try_block_map, pos = _fh4_rva_field(blob, pos, module_ranges)
+        disp_try_block_map_off = pos - 4
+
+    # dispIPtoStateMap (non-separated) / dispToSegMap (separated) is
+    # unconditional -- see ehdata4_export.h: "always assumed to exist".
+    disp_ip_or_seg_map, pos = _fh4_rva_field(blob, pos, module_ranges)
+    disp_ip_or_seg_map_off = pos - 4
+
+    if is_catch:
+        _, pos = _fh4_read_compressed_uint(blob, pos)  # dispFrame
+
+    patches = []
+    if disp_unwind_map_off is not None:
+        patches.append(disp_unwind_map_off)
+    if disp_try_block_map_off is not None:
+        patches.append(disp_try_block_map_off)
+    patches.append(disp_ip_or_seg_map_off)
+
+    if disp_unwind_map:
+        patches.extend(_fh4_parse_unwind_map4(blob, disp_unwind_map, module_ranges))
+    if disp_try_block_map:
+        patches.extend(_fh4_parse_try_block_map4(blob, disp_try_block_map, module_ranges))
+    if is_separated and disp_ip_or_seg_map:
+        patches.extend(_fh4_parse_sep_ip2state_map4(blob, disp_ip_or_seg_map, module_ranges))
+    # Non-separated IPtoStateMap4 (the common case) has no RVA fields of
+    # its own at all (Ip is function-relative *and* delta-encoded, State
+    # is a small compressed state index) -- nothing further to patch.
+
+    return patches
+
+
+def _adjust_cxx_frame_handler4_funcinfo(blob: bytearray, disp_off: int, shift: int,
+                                         patched: Set[int],
+                                         module_ranges: List["tuple[int, int]"]) -> None:
+    """__CxxFrameHandler4 -- the personality routine VS2019+ emits by
+    default for x64 C++ EH, and the one case this module's general
+    UNWIND_INFO handling (see ``_adjust_unwind_info``) does NOT cover --
+    embeds one more RVA field immediately after its own (already-patched)
+    handler-RVA field: an indirection to a separately-comdat'd
+    ``FuncInfo4``/"cppxdata" blob (apparently so the linker can
+    fold/dedup identical FuncInfo4 data shared by multiple functions),
+    rather than inlining that data directly the way the public x64 ABI
+    docs describe for a generic "exception handler data" blob.
+
+    This is a *confirmed-real* finding, not a guess: reverse-engineered
+    by cross-referencing MSVC's own real (and realistically-public --
+    shipped in ``VC/Tools/MSVC/<ver>/include/ehdata4_export.h`` alongside
+    cl.exe itself) struct/format definitions for ``FuncInfo4``,
+    ``UnwindMapEntry4``, ``TryBlockMapEntry4`` and ``HandlerType4`` against
+    (a) ``dumpbin /unwindinfo`` and ``/disasm`` on a real MSVC-14.51
+    (VS2026)-compiled self-contained-throw/catch fixture, (b) the exact
+    COMDAT-relocation list (``dumpbin /relocations``) of several
+    deliberately differently-shaped EH functions compiled fresh for this
+    investigation, and (c) a tiny harness calling MSVC's own
+    ``FH4::DecompFuncInfo``/``ReadUnsigned`` (from that same header)
+    directly against the compiled bytes via
+    ``LoadLibraryExA(..., LOAD_LIBRARY_AS_IMAGE_RESOURCE)``. All three
+    agree on the exact byte layout implemented by ``_fh4_parse_func_info4``
+    and its helpers above.
+
+    Deliberately does NOT try to identify __CxxFrameHandler4 (or its
+    stack-cookie-checking wrapper, __GSHandlerCheck_EH4, which has the
+    exact same FuncInfo4-pointer-after-handler layout) by name/import --
+    this fixture's own build statically links it in with no
+    vcruntime140.dll dependency at all, so there's no import entry to
+    resolve against. Instead, it *structurally* validates the data at
+    `disp_off` before touching anything: `_fh4_parse_func_info4` and its
+    helpers bounds-check every read, cap every entry count, and check
+    FuncInfoHeader's documented-always-zero reserved bit; if any of that
+    comes back wrong, this is firmly NOT __CxxFrameHandler4-shaped data
+    (e.g. it's __CxxFrameHandler3's magic-number-prefixed legacy format,
+    plain SEH, or something else again), and this function leaves it
+    completely untouched -- the same fail-safe behavior this module
+    already has for anything it doesn't confidently understand. Patches
+    are collected into a full list *before* any byte is written, so a
+    failure partway through a function's FuncInfo4 can't leave it
+    half-patched either.
+
+    `patched` is the set of absolute `blob` byte-offsets already shifted
+    by this dependency's unwind-info pass (shared across every
+    RUNTIME_FUNCTION entry via `_collect_and_patch_dep_unwind`): the
+    linker can comdat-fold an identical FuncInfo4 (or a shared
+    sub-structure within it) across multiple distinct functions, so
+    without this guard a shared blob reachable from more than one
+    RUNTIME_FUNCTION entry would get `+shift` applied once per entry that
+    reaches it, corrupting it.
+
+    `module_ranges` (this dependency's own section VA ranges, built once
+    by `_collect_and_patch_dep_unwind`) backs the one validation check
+    that turned out to matter most in practice -- see
+    `_fh4_rva_in_module`'s docstring for the real false-positive this
+    caught on a plain (non-C++) MSVC-built dependency: bounds-checking
+    against `len(blob)` and FuncInfoHeader's reserved bit alone was
+    nowhere near enough to reject other personality routines' data.
+    """
+    if disp_off + 4 > len(blob):
+        return
+    (fi_rva,) = struct.unpack_from("<I", blob, disp_off)
+    if not fi_rva or not _fh4_rva_in_module(fi_rva, module_ranges):
+        return
+    try:
+        patches = [disp_off] + _fh4_parse_func_info4(blob, fi_rva, module_ranges)
+    except _FH4ParseError:
+        return
+    for off in patches:
+        if off in patched:
+            continue
+        (value,) = struct.unpack_from("<I", blob, off)
+        if value:
+            struct.pack_into("<I", blob, off, value + shift)
+        patched.add(off)
+
+
+def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int,
+                         module_ranges: List["tuple[int, int]"], _depth: int = 0,
+                         _patched: Optional[Set[int]] = None) -> None:
     """Patch the RVA-relative fields *inside* an x64 UNWIND_INFO structure
     (and any chained UNWIND_INFO it references) by `shift`, in place
     within `blob`, at the structure's *original* (pre-shift) offset.
 
-    Only two kinds of fields inside UNWIND_INFO are themselves RVAs (and
+    Two kinds of fields inside UNWIND_INFO proper are themselves RVAs (and
     so need the same "+shift" treatment as the RUNTIME_FUNCTION entries
     that point at them -- see _collect_and_patch_dep_unwind): a trailing
     exception-handler RVA (present when UNW_FLAG_EHANDLER/UHANDLER is set
     -- this is what the OS actually calls to run a C++ personality
     routine/__except filter when an exception unwinds through the
     function) and a chained RUNTIME_FUNCTION record (when
-    UNW_FLAG_CHAININFO is set, itself recursed into). Everything else --
-    the unwind-code array, and any language-specific exception data
-    following the handler RVA (e.g. GCC's LSDA/call-site table, which
-    encodes landing-pad offsets relative to the function itself, and type
-    pointers via a self-relative/pcrel encoding) -- is already correct
-    after a flat block move, needing no adjustment.
+    UNW_FLAG_CHAININFO is set, itself recursed into). The unwind-code
+    array itself is already correct after a flat block move, needing no
+    adjustment.
 
-    CAVEAT (confirmed real, not theoretical -- see tests/windows/
-    test_pe_unwind.py's UPDATE 2 note): the above is true for GCC/MinGW's
-    personality data, but NOT for MSVC's. At least current MSVC's (14.5x/
-    VS2026) default __CxxFrameHandler4 state tables embed further RVA- or
-    module-offset-relative references of their own, directly after the
-    handler RVA this function already patches, in an undocumented,
-    version-specific, bit-packed inline encoding -- not a value this
-    function can locate or safely reinterpret generically. A self-
-    contained throw/catch inside an MSVC-built embedded dependency
-    reliably corrupts memory as a result (STATUS_STACK_BUFFER_OVERRUN or
-    STATUS_ACCESS_VIOLATION depending on ASLR layout). Fixing this for
-    real would mean reverse-engineering __CxxFrameHandler4's private
-    layout well enough to relocate it -- out of this project's current
-    scope; see test_self_contained_throw_in_embedded_dll's MSVC skip.
+    Language-specific exception data following the handler RVA is, for
+    most personality routines (e.g. GCC/MinGW's LSDA/call-site table,
+    which encodes everything self-relative/pcrel), *also* already correct
+    unmodified -- but NOT univerally: see
+    ``_adjust_cxx_frame_handler4_funcinfo`` for the one confirmed
+    exception, MSVC's __CxxFrameHandler4, whose own further data this
+    function hands off to it for every EHANDLER/UHANDLER entry (a no-op,
+    confirmed by that function's own structural validation, for any
+    personality routine that isn't __CxxFrameHandler4-shaped).
     """
+    if _patched is None:
+        _patched = set()
     if unwind_rva == 0 or unwind_rva + 4 > len(blob) or _depth > 32:
         return
     version_flags = blob[unwind_rva]
@@ -177,7 +604,7 @@ def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int, _depth: in
         if extra_off + 12 > len(blob):
             return
         cbegin, cend, cunwind = struct.unpack_from("<III", blob, extra_off)
-        _adjust_unwind_info(blob, cunwind, shift, _depth + 1)
+        _adjust_unwind_info(blob, cunwind, shift, module_ranges, _depth + 1, _patched)
         struct.pack_into(
             "<III", blob, extra_off,
             cbegin + shift, cend + shift, (cunwind + shift) if cunwind else 0,
@@ -188,6 +615,160 @@ def _adjust_unwind_info(blob: bytearray, unwind_rva: int, shift: int, _depth: in
         (handler,) = struct.unpack_from("<I", blob, extra_off)
         if handler:
             struct.pack_into("<I", blob, extra_off, handler + shift)
+        _adjust_cxx_frame_handler4_funcinfo(blob, extra_off + 4, shift, _patched, module_ranges)
+
+
+#: Fixed on-disk sizes (bytes) of the x64 (``_EH_RELATIVE_TYPEINFO=1``)
+#: ``_s_ThrowInfo``/``_s_CatchableType`` structs -- see
+#: ``ehdata_forceinclude.h`` (shipped with MSVC, force-included into
+#: every C++ TU it compiles -- about as public as this project's own
+#: on-disk-format references get) for the real struct definitions these
+#: mirror. Both are fixed-size (``#pragma pack(push, ehdata, 4)``, no
+#: compressed-int fields at all, unlike FuncInfo4) so no parser is needed
+#: beyond plain offsets.
+_THROWINFO_SIZE = 16  # attributes(4) + pmfnUnwind(4) + pForwardCompat(4) + pCatchableTypeArray(4)
+_CATCHABLE_TYPE_SIZE = 28  # properties(4) + pType(4) + thisDisplacement[3](12) + sizeOrOffset(4) + copyFunction(4)
+_CATCHABLE_TYPE_PTYPE_OFF = 4
+_CATCHABLE_TYPE_COPYFUNC_OFF = 24
+_MAX_CATCHABLE_TYPES = 256  # a real throw site lists a small handful at most (one per qualifier variant)
+
+
+def _fh4_relocate_throw_info(blob: bytearray, rva: int, shift: int, patched: Set[int],
+                              module_ranges: List["tuple[int, int]"]) -> bool:
+    """Validates and, if it checks out, relocates one ``_ThrowInfo`` blob
+    (MSVC's per-throw-site "description of the thrown object" -- see
+    ``ehdata_forceinclude.h``'s own long comment on it) and the
+    ``CatchableTypeArray``/``CatchableType`` chain it points to, all of
+    which embed further module-relative RVAs needing the same ``+shift``
+    treatment as everything else this module patches.
+
+    This is a *second*, independent gap from __CxxFrameHandler4's
+    FuncInfo4 (see ``_adjust_cxx_frame_handler4_funcinfo``), discovered
+    by debugging *why* a self-contained throw/catch still crashed after
+    FuncInfo4 relocation alone: real-execution debugging (WinDbg/cdb
+    against the actual embedded, crashing binary -- breakpointing
+    __CxxFrameHandler4 itself, confirming it ran exactly once on the
+    exception's first (search) pass and declined to handle it) showed
+    the *search* itself failing, not the unwind/invoke step FuncInfo4
+    governs. __CxxFrameHandler4's ``TypeMatch`` compares the thrown
+    type's ``CatchableType.pType``-pointed ``TypeDescriptor`` against the
+    catch's (correctly-relocated) ``HandlerType4.dispType``-pointed one --
+    by *dereferencing both and comparing the decorated name string*, not
+    by raw pointer identity (consistent with needing to match identical
+    types declared in different modules/DLLs). Since nothing relocated
+    ``_ThrowInfo``/``CatchableTypeArray``/``CatchableType`` before this,
+    the thrown side's ``pType`` was still the dependency's *original*
+    (pre-embed) RVA -- which, in the merged image, now points at
+    unrelated bytes -- so the name comparison read garbage and never
+    matched, exactly reproducing the observed "search pass declines, no
+    second invocation, unhandled exception" behavior.
+
+    Unlike FuncInfo4, ``_ThrowInfo`` has no directory anywhere that lists
+    every instance -- it's pure ``.rdata``, reachable only from the
+    *code* at each throw site (as the 2nd argument to
+    ``_CxxThrowException``), so there's no clean, directory-driven way to
+    enumerate every one the way ``_adjust_unwind_info`` enumerates
+    RUNTIME_FUNCTION entries. `rva` here is only ever a *candidate*,
+    handed in by a narrow instruction-pattern scan (see
+    ``_fh4_scan_for_throw_info_candidates``) that itself can misfire on
+    coincidental byte sequences -- so, same spirit as
+    ``_fh4_parse_func_info4``, every field is structurally validated
+    (bounds, a plausible small ``nCatchableTypes``, every nested RVA
+    landing inside some real module section) *before* anything is
+    trusted enough to patch; a candidate that doesn't fully check out is
+    left completely untouched and this returns False.
+    """
+    if not rva or not _fh4_rva_in_module(rva, module_ranges) or rva + _THROWINFO_SIZE > len(blob):
+        return False
+    _attributes, _pmfn_unwind, _p_forward_compat, p_catchable_array = struct.unpack_from("<Iiii", blob, rva)
+    if not p_catchable_array or not _fh4_rva_in_module(p_catchable_array, module_ranges):
+        return False
+    if p_catchable_array + 4 > len(blob):
+        return False
+    (num_catchable,) = struct.unpack_from("<i", blob, p_catchable_array)
+    if not (0 < num_catchable <= _MAX_CATCHABLE_TYPES):
+        return False
+    array_off = p_catchable_array + 4
+    if array_off + 4 * num_catchable > len(blob):
+        return False
+    catchable_rvas = struct.unpack_from(f"<{num_catchable}i", blob, array_off)
+    for ct_rva in catchable_rvas:
+        if not ct_rva or not _fh4_rva_in_module(ct_rva, module_ranges):
+            return False
+        if ct_rva + _CATCHABLE_TYPE_SIZE > len(blob):
+            return False
+        (p_type,) = struct.unpack_from("<i", blob, ct_rva + _CATCHABLE_TYPE_PTYPE_OFF)
+        if not p_type or not _fh4_rva_in_module(p_type, module_ranges):
+            return False
+
+    patches = [rva + 4, rva + 8, rva + 12, p_catchable_array]  # pmfnUnwind, pForwardCompat, pCatchableTypeArray, nCatchableTypes's array
+    for i, ct_rva in enumerate(catchable_rvas):
+        patches.append(array_off + i * 4)
+        patches.append(ct_rva + _CATCHABLE_TYPE_PTYPE_OFF)
+        patches.append(ct_rva + _CATCHABLE_TYPE_COPYFUNC_OFF)
+    for off in patches:
+        if off in patched:
+            continue
+        (value,) = struct.unpack_from("<i", blob, off)
+        if value:
+            struct.pack_into("<i", blob, off, value + shift)
+        patched.add(off)
+    return True
+
+
+def _fh4_scan_for_throw_info_candidates(blob: bytearray, begin: int, end: int) -> List[int]:
+    """Scans the narrow, already-known ``[begin, end)`` byte range of one
+    function (a RUNTIME_FUNCTION entry's own BeginAddress/EndAddress --
+    this is always called with those, never a blind whole-section scan)
+    for `_CxxThrowException(void* object, _ThrowInfo* pThrowInfo)`'s
+    exact, unambiguous x64-calling-convention call shape: ``pThrowInfo``
+    (the 2nd argument -- RDX in the Microsoft x64 calling convention) is
+    always loaded via a RIP-relative LEA, since it's always a static,
+    per-throw-site ``.rdata`` blob, never a computed/dynamic address --
+    ``48 8D 15 <disp32>`` (``LEA RDX, [RIP+disp32]``, the only encoding of
+    "load RDX via RIP-relative LEA": REX.W + opcode 0x8D + ModRM 0x15 is
+    mod=00/reg=010(RDX)/rm=101(RIP-relative), and REX.R would change the
+    destination register away from RDX) -- followed, within a short
+    window, by a direct ``E8 <rel32>`` CALL.
+
+    Same spirit, and the same honestly-documented caveat, as this
+    module's existing ``_patch_dep_tls_access_offsets``: this recognizes
+    one exact, real, MSVC-x64-compiler-generated byte shape via a plain
+    byte scan (no disassembler, so no instruction-boundary awareness --
+    a coincidental match inside a longer, unrelated instruction is
+    possible in principle), not a general-purpose instruction decoder.
+    It is deliberately narrow in scope, not a generic "find every throw
+    in this module" scanner: restricting it to one already-known
+    function's own byte range (rather than scanning the whole section)
+    both keeps false positives rare in practice and keeps this cheap.
+    Every resulting candidate is independently, structurally validated
+    by ``_fh4_relocate_throw_info`` before anything is trusted -- a
+    misfire here (a coincidental 3-byte match that isn't really this
+    instruction) fails that validation and is silently skipped, same as
+    any other not-confidently-understood data in this module.
+    """
+    window = 24
+    candidates = []
+    i = begin
+    limit = min(end, len(blob))
+    while i + 7 <= limit:
+        if blob[i] == 0x48 and blob[i + 1] == 0x8D and blob[i + 2] == 0x15:
+            (disp,) = struct.unpack_from("<i", blob, i + 3)
+            target = i + 7 + disp
+            j = i + 7
+            window_end = min(j + window, limit - 5, len(blob) - 5)
+            found_call = False
+            while j <= window_end:
+                if blob[j] == 0xE8:
+                    found_call = True
+                    break
+                j += 1
+            if found_call and 0 <= target < len(blob):
+                candidates.append(target)
+            i += 7
+        else:
+            i += 1
+    return candidates
 
 
 def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int) -> List[tuple]:
@@ -208,12 +789,42 @@ def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int)
     No-op (returns []) for a dependency with no exception directory at
     all -- the common case for x86 (32-bit) PE images, which don't use
     this table-based unwind mechanism.
+
+    One `_patched` offset-set is shared across every RUNTIME_FUNCTION
+    entry processed here (not just within one call to
+    ``_adjust_unwind_info``): the linker can comdat-fold a UNWIND_INFO's
+    chained parent, or a __CxxFrameHandler4 FuncInfo4 (or one of its own
+    sub-structures), across multiple distinct functions, so a single
+    shared blob reachable from more than one entry in this loop must
+    still only ever get `+shift` applied to it once.
+
+    Also builds this dependency's own section VA-range table once here
+    (rather than inside ``_adjust_unwind_info``'s recursion, which may
+    visit many entries) and threads it down to
+    ``_adjust_cxx_frame_handler4_funcinfo`` -- see
+    ``_fh4_rva_in_module``'s docstring for what it's for and why it's
+    load-bearing, not an extra nice-to-have.
+
+    Also, for every entry here (regardless of its own UNWIND_INFO flags
+    -- a function can call ``_CxxThrowException`` without having any
+    try/catch of its own), scans that function's own byte range for a
+    throw site and relocates its ``_ThrowInfo`` -- see
+    ``_fh4_scan_for_throw_info_candidates``/``_fh4_relocate_throw_info``
+    for why that's a second, independent gap from FuncInfo4 and a
+    necessary one for a self-contained throw+catch to actually work once
+    embedded, not an optional extra.
     """
     excdir = dep.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_EXCEPTION]
     if not excdir.Size:
         return []
     entries = []
     base = excdir.VirtualAddress
+    patched: Set[int] = set()
+    module_ranges = [
+        (section.VirtualAddress, section.VirtualAddress + max(section.Misc_VirtualSize, section.SizeOfRawData))
+        for section in dep.sections
+        if section.Misc_VirtualSize or section.SizeOfRawData
+    ]
     for i in range(excdir.Size // 12):
         off = base + i * 12
         if off + 12 > len(blob):
@@ -221,7 +832,9 @@ def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int)
         begin, end, unwind = struct.unpack_from("<III", blob, off)
         if begin == 0 and end == 0 and unwind == 0:
             continue
-        _adjust_unwind_info(blob, unwind, shift)
+        _adjust_unwind_info(blob, unwind, shift, module_ranges, _patched=patched)
+        for throw_info_rva in _fh4_scan_for_throw_info_candidates(blob, begin, end):
+            _fh4_relocate_throw_info(blob, throw_info_rva, shift, patched, module_ranges)
         new_begin, new_end = begin + shift, end + shift
         new_unwind = (unwind + shift) if unwind else 0
         struct.pack_into("<III", blob, off, new_begin, new_end, new_unwind)
