@@ -51,10 +51,42 @@ unconditional stub and explicitly deferring full hooking), and since no
 test in this task's own suite exercises runtime LoadLibraryW/
 GetProcAddress interception, this ships the real, tested DllMain-ordering
 mechanism now and leaves steps 1-4 as documented follow-up work.
+
+Assembly mechanism: every byte sequence below is assembled from real
+x86/x64 assembly *source text* by the Keystone assembler engine
+(``keystone-engine``, a deliberate, documented exception to this
+project's otherwise-pure-Python/no-native-toolchain rule -- see
+``docs/architecture.md``'s "Why no linker is involved" section), not
+hand-encoded as hex-literal bytes. None of these stubs is long enough to
+warrant a separate ``.asm`` source file -- each is built from an inline
+string -- but the ``_assemble``/sentinel-splice helpers below are
+structured so a future, longer stub could reasonably load its source from
+a ``.asm`` file instead without changing the calling convention.
+
+Each builder below needs to emit code containing an address value
+(``hinst_va``, ``entry_va``, ``target_va``, ``host_tlsindex_va``,
+``dep_tlsindex_va``) that is only known at call time, *and* report the
+exact byte offset of that immediate within the assembled output (for
+ASLR base-relocation registration -- see above). Keystone needs a
+concrete immediate to assemble against, so each builder assembles the
+instruction text with a distinctive placeholder ("sentinel") constant
+substituted in (``_X64_SENTINEL_A``/``_B`` or ``_X86_SENTINEL_A``/``_B``:
+chosen as alternating-nibble patterns vanishingly unlikely to recur
+elsewhere in these few-instruction sequences), locates the sentinel's own
+little-endian byte pattern in the assembled output (asserting it occurs
+*exactly once*, so a coincidental collision fails loudly instead of
+silently mis-patching), and splices in the real value at that offset.
+This -- rather than assembling directly against the real value and
+searching for *its* byte pattern -- is deliberately the more robust of
+the two options the embedding task considered: real VAs are caller
+-controlled and not guaranteed to have a byte pattern absent elsewhere in
+the same short sequence, whereas the sentinels are chosen once, verified
+once (see ``tests/windows/test_pe_stub_keystone.py``), and never vary.
 """
 
-import struct
 from typing import Dict, List, Set, Tuple
+
+from keystone import Ks, KS_ARCH_X86, KS_MODE_32, KS_MODE_64
 
 # Each helper below returns (bytes, [byte offsets of embedded absolute-VA
 # immediates within that block]) -- moved essentially unchanged from
@@ -65,72 +97,176 @@ from typing import Dict, List, Set, Tuple
 # docstring on why the caller must turn each one into a new base
 # relocation entry.
 
+# Sentinel placeholders substituted into assembly source text in place of
+# a not-yet-known runtime VA, then located (by their own distinctive
+# little-endian byte pattern) and overwritten with the real value after
+# assembly -- see the module docstring's "Assembly mechanism" section.
+# "_A"/"_B" are used when a single instruction sequence embeds two
+# independent absolute addresses, so each can be located unambiguously.
+_X64_SENTINEL_A = 0x1122334455667788
+_X64_SENTINEL_B = 0x8877665544332211
+_X86_SENTINEL_A = 0x11223344
+_X86_SENTINEL_B = 0x44332211
+
+# Keystone engine instances are cheap to reuse and expensive-ish to
+# construct repeatedly (each wraps a native handle), so one per mode is
+# cached for the lifetime of the process.
+_ks_engines: Dict[int, Ks] = {}
+
+
+def _ks(is64: bool) -> Ks:
+    mode = KS_MODE_64 if is64 else KS_MODE_32
+    engine = _ks_engines.get(mode)
+    if engine is None:
+        engine = Ks(KS_ARCH_X86, mode)
+        _ks_engines[mode] = engine
+    return engine
+
+
+def _assemble(is64: bool, asm_text: str) -> bytes:
+    """Assemble `asm_text` (real x86/x64 assembly source) at a nominal
+    base address of 0 and return the resulting machine code as `bytes`.
+
+    The base address matters only for instructions whose encoding depends
+    on an absolute target address relative to where the instruction itself
+    sits (e.g. `jne <absolute address>`, used by the process-attach guards
+    below) -- assembling at 0 makes that address arithmetic exact and
+    reproducible. None of these stubs otherwise care what address they're
+    assembled "at", since every absolute VA they embed is a sentinel
+    placeholder spliced in after the fact (see module docstring).
+    """
+    encoding, _count = _ks(is64).asm(asm_text, 0)
+    if encoding is None:
+        raise ValueError(f"keystone failed to assemble: {asm_text!r}")
+    return bytes(encoding)
+
+
+def _patch_immediate(data: bytes, sentinel_bytes: bytes, replacement_bytes: bytes) -> Tuple[bytes, int]:
+    """Locate `sentinel_bytes` within `data`, assert it occurs exactly
+    once (a coincidental second occurrence would mean some *other* fixed
+    opcode/operand byte in this same short sequence happens to match the
+    sentinel pattern, which would make the splice below silently wrong --
+    see module docstring), and return `data` with that one occurrence
+    replaced by `replacement_bytes` (same length), plus the byte offset at
+    which the replacement now sits.
+    """
+    if len(sentinel_bytes) != len(replacement_bytes):
+        raise AssertionError("sentinel and replacement must be the same width")
+    first = data.find(sentinel_bytes)
+    if first == -1:
+        raise AssertionError(f"sentinel pattern {sentinel_bytes.hex()} not found in assembled code {data.hex()}")
+    if data.find(sentinel_bytes, first + 1) != -1:
+        raise AssertionError(
+            f"sentinel pattern {sentinel_bytes.hex()} occurs more than once in assembled code {data.hex()}"
+        )
+    patched = data[:first] + replacement_bytes + data[first + len(replacement_bytes):]
+    return patched, first
+
+
+def _patch_va_sentinel(data: bytes, sentinel: int, width: int, real_va: int) -> Tuple[bytes, int]:
+    """`_patch_immediate` specialised for an absolute-VA immediate: both
+    the sentinel and the real value are encoded as unsigned, `width`-byte,
+    little-endian integers (matching how x86/x64 `mov reg, imm` and
+    `push imm32` encode their operands).
+    """
+    sentinel_bytes = sentinel.to_bytes(width, "little")
+    real_bytes = real_va.to_bytes(width, "little")
+    return _patch_immediate(data, sentinel_bytes, real_bytes)
+
 
 def _x64_call_dllmain(hinst_va: int, entry_va: int) -> Tuple[bytes, List[int]]:
     # Preserve the real entrypoint's incoming arg registers around our own
     # call, then call dep_entry(hinstDLL=hinst_va, DLL_PROCESS_ATTACH=1, NULL).
-    prefix = (
-        b"\x51"  # push rcx
-        b"\x52"  # push rdx
-        b"\x41\x50"  # push r8
-        b"\x41\x51"  # push r9
-        b"\x48\x83\xEC\x28"  # sub rsp, 0x28
+    #
+    # The push/pop pairs bracketing the call are what fixed the original
+    # REX-byte save/restore asymmetry bug: `r8`/`r9` need the REX.B bit
+    # (`push r8`/`push r9` encode as `41 50`/`41 51`, their `pop`
+    # counterparts as `41 58`/`41 59`) while `rcx`/`rdx` don't -- getting
+    # any of those four REX bytes wrong, or popping in a different order
+    # than pushed, corrupts the real entrypoint's own incoming registers.
+    # Assembling real `push`/`pop` mnemonics for all four registers (rather
+    # than hand-picking hex bytes) makes Keystone responsible for emitting
+    # the correct REX prefixes, removing that whole class of mistake.
+    asm = (
+        "push rcx\n"
+        "push rdx\n"
+        "push r8\n"
+        "push r9\n"
+        "sub rsp, 0x28\n"
+        f"mov rcx, {_X64_SENTINEL_A}\n"
+        "mov edx, 1\n"
+        "xor r8d, r8d\n"
+        f"mov rax, {_X64_SENTINEL_B}\n"
+        "call rax\n"
+        "add rsp, 0x28\n"
+        "pop r9\n"
+        "pop r8\n"
+        "pop rdx\n"
+        "pop rcx"
     )
-    mov_rcx_op = b"\x48\xB9"  # mov rcx, imm64
-    hinst_off = len(prefix) + len(mov_rcx_op)
-    mid = (
-        b"\xBA\x01\x00\x00\x00"  # mov edx, 1
-        b"\x45\x31\xC0"  # xor r8d, r8d
-    )
-    mov_rax_op = b"\x48\xB8"  # mov rax, imm64
-    entry_off = hinst_off + 8 + len(mid) + len(mov_rax_op)
-    tail = (
-        b"\xFF\xD0"  # call rax
-        b"\x48\x83\xC4\x28"  # add rsp, 0x28
-        b"\x41\x59"  # pop r9
-        b"\x41\x58"  # pop r8
-        b"\x5A"  # pop rdx
-        b"\x59"  # pop rcx
-    )
-    data = (
-        prefix + mov_rcx_op + hinst_va.to_bytes(8, "little") + mid
-        + mov_rax_op + entry_va.to_bytes(8, "little") + tail
-    )
+    data = _assemble(True, asm)
+    data, hinst_off = _patch_va_sentinel(data, _X64_SENTINEL_A, 8, hinst_va)
+    data, entry_off = _patch_va_sentinel(data, _X64_SENTINEL_B, 8, entry_va)
     return data, [hinst_off, entry_off]
 
 
 def _x64_tail_jmp(target_va: int) -> Tuple[bytes, List[int]]:
-    mov_rax_op = b"\x48\xB8"
-    data = mov_rax_op + target_va.to_bytes(8, "little") + b"\xFF\xE0"
-    return data, [len(mov_rax_op)]
+    asm = f"mov rax, {_X64_SENTINEL_A}\njmp rax"
+    data = _assemble(True, asm)
+    data, off = _patch_va_sentinel(data, _X64_SENTINEL_A, 8, target_va)
+    return data, [off]
 
 
 def _x86_call_dllmain(hinst_va: int, entry_va: int) -> Tuple[bytes, List[int]]:
     # __stdcall DllMain(hinstDLL, fdwReason, lpvReserved) - callee pops its
     # own 3 args, so the stack is already balanced after `call`.
-    prefix = (
-        b"\x6A\x00"  # push 0            ; lpvReserved
-        b"\x6A\x01"  # push 1            ; DLL_PROCESS_ATTACH
+    asm = (
+        "push 0\n"  # lpvReserved
+        "push 1\n"  # DLL_PROCESS_ATTACH
+        f"push {_X86_SENTINEL_A}\n"  # hinstDLL
+        f"mov eax, {_X86_SENTINEL_B}\n"
+        "call eax"
     )
-    push_op = b"\x68"  # push imm32
-    hinst_off = len(prefix) + len(push_op)
-    mov_eax_op = b"\xB8"  # mov eax, imm32
-    entry_off = hinst_off + 4 + len(mov_eax_op)
-    tail = b"\xFF\xD0"  # call eax
-    data = (
-        prefix + push_op + hinst_va.to_bytes(4, "little")
-        + mov_eax_op + entry_va.to_bytes(4, "little") + tail
-    )
+    data = _assemble(False, asm)
+    data, hinst_off = _patch_va_sentinel(data, _X86_SENTINEL_A, 4, hinst_va)
+    data, entry_off = _patch_va_sentinel(data, _X86_SENTINEL_B, 4, entry_va)
     return data, [hinst_off, entry_off]
 
 
 def _x86_tail_jmp(target_va: int) -> Tuple[bytes, List[int]]:
-    mov_eax_op = b"\xB8"
-    data = mov_eax_op + target_va.to_bytes(4, "little") + b"\xFF\xE0"
-    return data, [len(mov_eax_op)]
+    asm = f"mov eax, {_X86_SENTINEL_A}\njmp eax"
+    data = _assemble(False, asm)
+    data, off = _patch_va_sentinel(data, _X86_SENTINEL_A, 4, target_va)
+    return data, [off]
 
 
 _DLL_PROCESS_ATTACH = 1
+
+
+def _patch_guard_jump(data: bytes, forced_target: int, skip_len: int) -> bytes:
+    """Shared machinery for the two process-attach guards below: both
+    assemble a `jne <forced_target>` against a target address far enough
+    away that Keystone cannot use the short (rel8) jump encoding, forcing
+    the deterministic `0F 85 <rel32>` ("jne near") form regardless of the
+    real `skip_len`'s magnitude -- exactly as the original hand-encoded
+    bytes always used the near form unconditionally. The rel32 Keystone
+    actually computed for `forced_target` is then located by its own
+    (deterministic, since `data`'s length is now known) little-endian
+    pattern and overwritten with the real `skip_len`, the same
+    sentinel-splice technique used for the absolute-VA immediates above,
+    just applied to a relative-displacement immediate instead.
+    """
+    computed_disp = forced_target - len(data)
+    sentinel_bytes = computed_disp.to_bytes(4, "little", signed=True)
+    replacement_bytes = skip_len.to_bytes(4, "little", signed=True)
+    patched, _off = _patch_immediate(data, sentinel_bytes, replacement_bytes)
+    return patched
+
+
+# A target address this far away can never be reached by a one-byte
+# (rel8) displacement from these few-byte guard sequences, so Keystone is
+# forced into the near (rel32) `jne` encoding every time.
+_GUARD_FORCED_TARGET = 0x7FFFFFFF
 
 
 def _x64_process_attach_guard(skip_len: int) -> bytes:
@@ -147,7 +283,9 @@ def _x64_process_attach_guard(skip_len: int) -> bytes:
     # `jne` lands exactly at the tail-jump to `original_entry_va`, which
     # must always run regardless of `fdwReason` so the host's own real
     # DllMain still sees every notification it's supposed to).
-    return b"\x83\xFA\x01" + b"\x0F\x85" + skip_len.to_bytes(4, "little", signed=True)
+    asm = f"cmp edx, 1\njne {_GUARD_FORCED_TARGET}"
+    data = _assemble(True, asm)
+    return _patch_guard_jump(data, _GUARD_FORCED_TARGET, skip_len)
 
 
 def _x86_process_attach_guard(skip_len: int) -> bytes:
@@ -156,11 +294,9 @@ def _x86_process_attach_guard(skip_len: int) -> bytes:
     # ([esp+0]=return address, [esp+4]=hinstDLL, [esp+8]=fdwReason) rather
     # than a register, since this stub's entrypoint hasn't pushed anything
     # of its own yet at this point.
-    return b"\x83\x7C\x24\x08\x01" + b"\x0F\x85" + skip_len.to_bytes(4, "little", signed=True)
-
-
-def _mov_r64_imm64(reg_opcode: int, imm64: int) -> bytes:
-    return bytes([0x48, reg_opcode]) + imm64.to_bytes(8, "little")
+    asm = f"cmp dword ptr [esp+8], 1\njne {_GUARD_FORCED_TARGET}"
+    data = _assemble(False, asm)
+    return _patch_guard_jump(data, _GUARD_FORCED_TARGET, skip_len)
 
 
 def build_windows_tls_index_fixup(*, host_tlsindex_va: int, dep_tlsindex_va: int) -> Tuple[bytes, List[int]]:
@@ -197,19 +333,25 @@ def build_windows_tls_index_fixup(*, host_tlsindex_va: int, dep_tlsindex_va: int
     convention regardless, so it's simplest to just ignore all three
     here rather than ask the caller to use a different call shape for
     one single entry.
+
+    Register usage: `rax` holds each `_tls_index` variable's own address
+    in turn (never a thread-local block pointer -- that distinction
+    matters, see docstring above), and `ecx` carries the 4-byte slot
+    *value* being copied between them. Both are scratch here (this code
+    runs with no live incoming arguments it needs to preserve, unlike
+    `_x64_call_dllmain` above), so no save/restore is needed around them.
     """
-    out = bytearray()
-    abs_offsets: List[int] = []
-
-    out += _mov_r64_imm64(0xB8, host_tlsindex_va)  # mov rax, host_tlsindex_va
-    abs_offsets.append(len(out) - 8)
-    out += bytes([0x8B, 0x08])  # mov ecx, [rax]
-    out += _mov_r64_imm64(0xB8, dep_tlsindex_va)  # mov rax, dep_tlsindex_va
-    abs_offsets.append(len(out) - 8)
-    out += bytes([0x89, 0x08])  # mov [rax], ecx
-    out += bytes([0xC3])  # ret
-
-    return bytes(out), abs_offsets
+    asm = (
+        f"mov rax, {_X64_SENTINEL_A}\n"  # rax = &host._tls_index
+        "mov ecx, dword ptr [rax]\n"  # ecx = host._tls_index (the real slot number)
+        f"mov rax, {_X64_SENTINEL_B}\n"  # rax = &dep._tls_index
+        "mov dword ptr [rax], ecx\n"  # dep._tls_index = ecx
+        "ret"
+    )
+    data = _assemble(True, asm)
+    data, host_off = _patch_va_sentinel(data, _X64_SENTINEL_A, 8, host_tlsindex_va)
+    data, dep_off = _patch_va_sentinel(data, _X64_SENTINEL_B, 8, dep_tlsindex_va)
+    return data, [host_off, dep_off]
 
 
 def build_windows_stub(
