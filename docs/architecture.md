@@ -72,7 +72,7 @@ no compiled C extensions" rule above — the same rule that excluded
 compiled assembler engine under its Python bindings. It does not,
 however, reintroduce the "needs a C toolchain" problem that rule exists
 to prevent: `keystone-engine` publishes prebuilt wheels (confirmed:
-`manylinux1_x86_64`/`manylinux2014_x86_64` and `win_amd64`, among
+`manylinux1_x86_64` and `win_amd64`, among
 others) with the compiled engine already bundled, so installing it —
 like `pefile`/`pyelftools` — never requires the end user to have a C
 compiler. Its use is scoped narrowly: only for assembling the small,
