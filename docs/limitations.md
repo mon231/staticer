@@ -73,24 +73,32 @@
   inside the PLT relocation table under lazy binding (not seen in any
   real-world binary encountered so far) would take the eager-binding
   code path instead.
-- **PE's section-header table has no growth mechanism.** Embedding a
-  dependency appends new sections, which needs new section-header
-  entries — but if the host's own section-header table was packed tight
-  against its first section's file data by the original linker (common
-  for modern, real-world commercial binaries; found via local testing
-  against a genuine Qt6-based application, [010 Editor](https://www.sweetscape.com/010editor/)),
+- **PE's section-header table has no growth mechanism — update: now
+  implemented.** Embedding a dependency appends new sections, which
+  needs new section-header entries — but if the host's own
+  section-header table was packed tight against its first section's
+  file data by the original linker (common for modern, real-world
+  commercial binaries; found via local testing against a genuine
+  Qt6-based application, [010 Editor](https://www.sweetscape.com/010editor/)),
   there may be only a handful of bytes of slack, nowhere near enough for
-  even one dependency's worth of new sections. `embed()` correctly fails
-  loudly (`"not enough slack in the host's section header table to add N
-  new section(s)"`) rather than corrupting the output, but cannot embed
-  *anything* into such a host today. ELF has an equivalent constraint
-  (growing the program-header array) and already solved it — this is
-  the PE side's open counterpart. **Planned, not yet implemented**: when
-  there's insufficient header slack, move the section-header table's
-  effective capacity forward by growing `SizeOfHeaders`/shifting the
-  first section's own file data later (the same "grow in place, extend
-  the existing boundary" discipline this project already applies on the
-  ELF side), rather than only failing.
+  even one dependency's worth of new sections. `embed()` used to always
+  fail loudly in this case (`"not enough slack in the host's section
+  header table to add N new section(s)"`) rather than corrupting the
+  output, but couldn't embed *anything* into such a host. ELF had an
+  equivalent constraint (growing the program-header array) and already
+  solved it; `embed()` now applies the PE-side counterpart of that same
+  "grow in place, extend the existing boundary" discipline when the
+  existing slack is insufficient: it shifts every section's
+  `PointerToRawData` (and the debug directory's own file-offset-based
+  `PointerToRawData` entries, if present) forward by enough
+  `FileAlignment`-aligned bytes to close the shortfall, grows
+  `SizeOfHeaders` to match, and physically widens the output file with
+  that many padding bytes right before the first section's raw data.
+  Every RVA/VA-based field (imports, relocations, exceptions, TLS, the
+  entry point, ...) is untouched by construction, since this only moves
+  *file* offsets. When the host already has enough slack (the common
+  case), behavior is byte-for-byte unchanged — the growth path only
+  activates when the existing check would otherwise have raised.
 - **The host-already-has-TLS merge's byte-pattern scanner
   (`_patch_dep_tls_access_offsets`) is narrower than its own docstring
   implies.** It was verified correct against this project's own
