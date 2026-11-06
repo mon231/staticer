@@ -394,6 +394,24 @@ class PortableExecutableEmbedder:
             file_alignment = pe.OPTIONAL_HEADER.FileAlignment
             original_entry_va = image_base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
             host_tlsdir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[_IMAGE_DIRECTORY_ENTRY_TLS]
+            # The real Windows loader keys TLS-directory presence off
+            # VirtualAddress, not Size -- but every "does the host already
+            # have its own TLS directory" branch below used `.Size` as a
+            # presence proxy (true for every real compiler's output, where
+            # the two fields are always either both zero or both
+            # non-zero). A hand-crafted/malformed PE could set them
+            # inconsistently; checked once, here, up front, with a clean
+            # ValueError, rather than letting that disagreement silently
+            # route to the wrong merge path or surface as an unrelated
+            # AttributeError further down.
+            if bool(host_tlsdir.VirtualAddress) != bool(host_tlsdir.Size):
+                raise ValueError(
+                    f"host '{self.input_path}' has a malformed TLS directory: "
+                    f"VirtualAddress={host_tlsdir.VirtualAddress:#x} but "
+                    f"Size={host_tlsdir.Size:#x} -- these must be either both "
+                    f"zero or both non-zero"
+                )
+            host_has_tls = bool(host_tlsdir.VirtualAddress)
 
             output = bytearray(self.input_path.read_bytes())
 
@@ -531,7 +549,7 @@ class PortableExecutableEmbedder:
                                 f"a single host is not yet supported (phase 2 / "
                                 f"Task 5)"
                             )
-                        if host_tlsdir.Size and not is64:
+                        if host_has_tls and not is64:
                             raise ValueError(
                                 f"cannot embed dependency '{node.name}': both the "
                                 f"host and this dependency carry their own Thread "
@@ -698,7 +716,7 @@ class PortableExecutableEmbedder:
                     # VA list -- can be read directly out of `blob` right
                     # now, while `dep`/`blob`/`X` are all still in scope.
                     if dep_tlsdir.Size:
-                        if host_tlsdir.Size:
+                        if host_has_tls:
                             tls_off = dep_tlsdir.VirtualAddress
                             final_start, final_end, final_index_va, final_cb_va = struct.unpack_from(
                                 "<4Q", blob, tls_off
