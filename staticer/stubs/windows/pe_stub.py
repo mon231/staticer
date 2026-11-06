@@ -149,18 +149,49 @@ def _patch_immediate(data: bytes, sentinel_bytes: bytes, replacement_bytes: byte
     see module docstring), and return `data` with that one occurrence
     replaced by `replacement_bytes` (same length), plus the byte offset at
     which the replacement now sits.
+
+    Caller beware: when a single assembled sequence embeds *more than one*
+    sentinel (e.g. `_x64_call_dllmain`'s two VA slots), do not call this
+    repeatedly against the *already-patched* buffer -- see
+    `_locate_sentinel`/`_splice_at` below and the "cross-sentinel
+    collision" note on `_patch_two_sentinels` for why, and use that helper
+    instead for any multi-sentinel sequence.
     """
     if len(sentinel_bytes) != len(replacement_bytes):
-        raise AssertionError("sentinel and replacement must be the same width")
+        raise ValueError("internal error: sentinel and replacement must be the same width")
+    offset = _locate_sentinel(data, sentinel_bytes)
+    return _splice_at(data, offset, replacement_bytes), offset
+
+
+def _locate_sentinel(data: bytes, sentinel_bytes: bytes) -> int:
+    """Find `sentinel_bytes`'s one-and-only occurrence in `data` (without
+    modifying it) and return its offset. Raises `ValueError` -- an
+    internal-error message in this codebase's existing style (see e.g.
+    `elf_embedder.py`'s "internal error: ..." `ValueError`s for other
+    should-never-happen invariant violations) -- if the pattern is absent
+    or, more subtly, if it occurs more than once: a second occurrence
+    would mean some *other* fixed opcode/operand byte in this same short
+    sequence happens to coincide with the sentinel's own byte pattern,
+    which would make a blind splice silently wrong rather than loudly
+    wrong. This has never been observed for any of the sequences in this
+    module (verified empirically across typical, edge-case, and
+    sentinel-shaped-adversarial VA/skip_len values -- see
+    `tests/windows/test_pe_stub_keystone.py`), but is checked on every
+    call rather than assumed, since a future change to one of these
+    assembly strings could in principle introduce it.
+    """
     first = data.find(sentinel_bytes)
     if first == -1:
-        raise AssertionError(f"sentinel pattern {sentinel_bytes.hex()} not found in assembled code {data.hex()}")
+        raise ValueError(f"internal error: sentinel pattern {sentinel_bytes.hex()} not found in assembled code {data.hex()}")
     if data.find(sentinel_bytes, first + 1) != -1:
-        raise AssertionError(
-            f"sentinel pattern {sentinel_bytes.hex()} occurs more than once in assembled code {data.hex()}"
+        raise ValueError(
+            f"internal error: sentinel pattern {sentinel_bytes.hex()} occurs more than once in assembled code {data.hex()}"
         )
-    patched = data[:first] + replacement_bytes + data[first + len(replacement_bytes):]
-    return patched, first
+    return first
+
+
+def _splice_at(data: bytes, offset: int, replacement_bytes: bytes) -> bytes:
+    return data[:offset] + replacement_bytes + data[offset + len(replacement_bytes):]
 
 
 def _patch_va_sentinel(data: bytes, sentinel: int, width: int, real_va: int) -> Tuple[bytes, int]:
@@ -168,10 +199,49 @@ def _patch_va_sentinel(data: bytes, sentinel: int, width: int, real_va: int) -> 
     the sentinel and the real value are encoded as unsigned, `width`-byte,
     little-endian integers (matching how x86/x64 `mov reg, imm` and
     `push imm32` encode their operands).
+
+    Single-sentinel use only -- see `_patch_two_va_sentinels` for sequences
+    embedding two.
     """
     sentinel_bytes = sentinel.to_bytes(width, "little")
     real_bytes = real_va.to_bytes(width, "little")
     return _patch_immediate(data, sentinel_bytes, real_bytes)
+
+
+def _patch_two_va_sentinels(
+    data: bytes,
+    sentinel_a: int,
+    real_va_a: int,
+    sentinel_b: int,
+    real_va_b: int,
+    width: int,
+) -> Tuple[bytes, int, int]:
+    """Patch two independent absolute-VA sentinels in one assembled
+    sequence (`_x64_call_dllmain`/`_x86_call_dllmain`/
+    `build_windows_tls_index_fixup`, each of which embeds a `hinst`-ish
+    slot and an `entry`-ish slot).
+
+    Cross-sentinel collision: locates *both* sentinels' offsets against
+    the original, unmodified `data` before splicing either one in. Doing
+    this instead of the simpler "patch A, then search the already-patched
+    buffer for B" is deliberate: if the caller-supplied real value for
+    slot A happens to equal sentinel B's own constant (astronomically
+    unlikely for loader/ASLR-assigned addresses, which are not
+    attacker-controlled input, but not impossible, and cheap to rule out
+    here), patching A first would plant sentinel B's own byte pattern a
+    *second* time, and the subsequent search for B would find two matches
+    instead of one -- a real, reachable `ValueError` from
+    `_locate_sentinel`, not a hypothetical one. Locating both offsets
+    up front, against data neither has touched yet, and only then
+    splicing each one in by its own already-known offset, makes that
+    scenario structurally impossible: the second lookup is never run
+    against a buffer the first patch could have perturbed.
+    """
+    offset_a = _locate_sentinel(data, sentinel_a.to_bytes(width, "little"))
+    offset_b = _locate_sentinel(data, sentinel_b.to_bytes(width, "little"))
+    data = _splice_at(data, offset_a, real_va_a.to_bytes(width, "little"))
+    data = _splice_at(data, offset_b, real_va_b.to_bytes(width, "little"))
+    return data, offset_a, offset_b
 
 
 def _x64_call_dllmain(hinst_va: int, entry_va: int) -> Tuple[bytes, List[int]]:
@@ -205,8 +275,9 @@ def _x64_call_dllmain(hinst_va: int, entry_va: int) -> Tuple[bytes, List[int]]:
         "pop rcx"
     )
     data = _assemble(True, asm)
-    data, hinst_off = _patch_va_sentinel(data, _X64_SENTINEL_A, 8, hinst_va)
-    data, entry_off = _patch_va_sentinel(data, _X64_SENTINEL_B, 8, entry_va)
+    data, hinst_off, entry_off = _patch_two_va_sentinels(
+        data, _X64_SENTINEL_A, hinst_va, _X64_SENTINEL_B, entry_va, 8
+    )
     return data, [hinst_off, entry_off]
 
 
@@ -228,8 +299,9 @@ def _x86_call_dllmain(hinst_va: int, entry_va: int) -> Tuple[bytes, List[int]]:
         "call eax"
     )
     data = _assemble(False, asm)
-    data, hinst_off = _patch_va_sentinel(data, _X86_SENTINEL_A, 4, hinst_va)
-    data, entry_off = _patch_va_sentinel(data, _X86_SENTINEL_B, 4, entry_va)
+    data, hinst_off, entry_off = _patch_two_va_sentinels(
+        data, _X86_SENTINEL_A, hinst_va, _X86_SENTINEL_B, entry_va, 4
+    )
     return data, [hinst_off, entry_off]
 
 
@@ -349,8 +421,9 @@ def build_windows_tls_index_fixup(*, host_tlsindex_va: int, dep_tlsindex_va: int
         "ret"
     )
     data = _assemble(True, asm)
-    data, host_off = _patch_va_sentinel(data, _X64_SENTINEL_A, 8, host_tlsindex_va)
-    data, dep_off = _patch_va_sentinel(data, _X64_SENTINEL_B, 8, dep_tlsindex_va)
+    data, host_off, dep_off = _patch_two_va_sentinels(
+        data, _X64_SENTINEL_A, host_tlsindex_va, _X64_SENTINEL_B, dep_tlsindex_va, 8
+    )
     return data, [host_off, dep_off]
 
 
