@@ -92,13 +92,19 @@ On PE, this also handles a dependency's TLS callback array
 against a real-world dependency (frida-gadget, below) whose own TLS
 directory carries three real callback entries.
 
+A dependency's TLS directory can also be merged with a *64-bit PE host's own*
+pre-existing TLS directory, rather than only adopted by a TLS-less host: both
+raw-data ranges are combined, both halves share the one `_tls_index` slot the
+loader actually assigns, and the dependency's compiled TLS-access offsets are
+patched to their new position within the combined range.
+
 !!! note
     Merging the host's *own* TLS directory with a dependency's separate one
-    into a single combined block isn't implemented — see
-    [Limitations](limitations.md). The supported case is a TLS-less host
-    adopting a dependency's TLS directory as its own, which is what every
-    TLS-using dependency seen so far (synthetic fixtures and frida-gadget
-    alike) needs.
+    is not yet implemented for a 32-bit PE host, or for ELF on either
+    bit-width (nor for a second TLS-bearing dependency in one `embed()`
+    call) — see [Limitations](limitations.md). For those cases, the
+    supported path is still a TLS-less host adopting a dependency's TLS
+    directory as its own.
 
 ## Generated entrypoint stub
 

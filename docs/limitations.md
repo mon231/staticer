@@ -22,9 +22,12 @@
 - `-o`/`--output` silently overwrites an existing file at that path.
 - A dependency using Thread Local Storage (PE `__declspec(thread)` /
   ELF `__thread`) merges cleanly into a *TLS-less* host on both
-  platforms (see [Features](features.md)) — but merging two *separate*
-  TLS directories, one from the host itself and one from a dependency,
-  into a single combined block isn't implemented; that case is rejected
+  platforms (see [Features](features.md)). Merging two *separate* TLS
+  directories — one from the host itself and one from a dependency —
+  into a single combined block is implemented for a 64-bit PE host
+  (see Features). It is still not implemented for a 32-bit PE host, or
+  for ELF on either bit-width (nor for a second TLS-bearing dependency
+  in one `embed()` call, on either platform); those cases are rejected
   with a clear error naming the dependency rather than embedded
   incorrectly.
 - ELF General/Local-Dynamic TLS model call-site relaxation
@@ -52,9 +55,7 @@
   toolchain version. `embed()` still checks for it explicitly, before
   falling into the generic "unsupported relocation type" error, and
   raises a specific `ValueError` naming the relocation type if it's ever
-  encountered — see
-  `.superpowers/sdd/2026-11-04-tls-support/task-6-report.md` for the full
-  investigation.
+  encountered.
 - A fully self-contained module that both throws *and* catches a C++
   exception entirely within itself can still hit compiler-internal
   personality-routine details beyond the documented unwind ABI — ordinary
