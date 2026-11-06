@@ -680,7 +680,11 @@ def _fh4_relocate_throw_info(blob: bytearray, rva: int, shift: int, patched: Set
     """
     if not rva or not _fh4_rva_in_module(rva, module_ranges) or rva + _THROWINFO_SIZE > len(blob):
         return False
-    _attributes, _pmfn_unwind, _p_forward_compat, p_catchable_array = struct.unpack_from("<Iiii", blob, rva)
+    _attributes, pmfn_unwind, p_forward_compat, p_catchable_array = struct.unpack_from("<Iiii", blob, rva)
+    if pmfn_unwind and not _fh4_rva_in_module(pmfn_unwind, module_ranges):
+        return False
+    if p_forward_compat and not _fh4_rva_in_module(p_forward_compat, module_ranges):
+        return False
     if not p_catchable_array or not _fh4_rva_in_module(p_catchable_array, module_ranges):
         return False
     if p_catchable_array + 4 > len(blob):
