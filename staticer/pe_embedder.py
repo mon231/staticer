@@ -2078,13 +2078,65 @@ class PortableExecutableEmbedder:
                 combined_reloc_bytes = b""
 
             # -- lay the new sections out in the file & write headers ------
-            if len(new_sections) * 40 > first_raw_data_offset - (
+            #
+            # The section-header table has a fixed home: it always starts
+            # right after the Optional Header (`section_table_offset`) and
+            # has no RVA/pointer of its own the loader follows -- unlike
+            # ELF's program-header table (relocatable via e_phoff), it
+            # can't be moved somewhere else in the file. Its only
+            # available capacity is whatever gap the original linker left
+            # before the first section's own raw file data
+            # (`first_raw_data_offset`). A real-world (especially
+            # commercial, tightly-linked) host can leave only a few dozen
+            # bytes there -- nowhere near this run's `len(new_sections) *
+            # 40` requirement.
+            #
+            # When that happens, grow the gap itself: push every section's
+            # `PointerToRawData` (and `SizeOfHeaders`, which bounds the
+            # same headers region) forward by enough `FileAlignment`-
+            # aligned bytes to close the shortfall, and physically widen
+            # `output` by inserting that many padding bytes right before
+            # the first section's current raw data. This only changes
+            # FILE offsets, never RVAs/VAs -- every directory this module
+            # reads/writes by RVA (imports, relocations, exceptions, TLS,
+            # entry point, ...) is untouched by construction. The one
+            # exception checked here is the debug directory, whose own
+            # entries each carry a raw file-offset pointer
+            # (`PointerToRawData`, alongside the RVA-based
+            # `AddressOfRawData` this module doesn't otherwise touch)
+            # that's now stale and must shift by the same delta.
+            needed_header_bytes = len(new_sections) * 40
+            available_slack = first_raw_data_offset - (
                 section_table_offset + existing_section_count * 40
-            ):
-                raise ValueError(
-                    "not enough slack in the host's section header table to add "
-                    f"{len(new_sections)} new section(s)"
+            )
+            if needed_header_bytes > available_slack:
+                shortfall = needed_header_bytes - available_slack
+                delta = _align_up(shortfall, file_alignment)
+
+                output[first_raw_data_offset:first_raw_data_offset] = b"\x00" * delta
+
+                for sec in pe.sections:
+                    if sec.PointerToRawData:
+                        ptr_off = sec.get_field_absolute_offset("PointerToRawData")
+                        output[ptr_off:ptr_off + 4] = struct.pack(
+                            "<I", sec.PointerToRawData + delta
+                        )
+
+                if getattr(pe, "DIRECTORY_ENTRY_DEBUG", None):
+                    for dbg in pe.DIRECTORY_ENTRY_DEBUG:
+                        if dbg.struct.PointerToRawData:
+                            dbg_off = dbg.struct.get_field_absolute_offset("PointerToRawData")
+                            output[dbg_off:dbg_off + 4] = struct.pack(
+                                "<I", dbg.struct.PointerToRawData + delta
+                            )
+
+                szh_off = pe.OPTIONAL_HEADER.get_field_absolute_offset("SizeOfHeaders")
+                output[szh_off:szh_off + 4] = struct.pack(
+                    "<I", pe.OPTIONAL_HEADER.SizeOfHeaders + delta
                 )
+
+                first_raw_data_offset += delta
+                available_slack += delta
 
             for i, (name, data, rva, characteristics, virtual_size) in enumerate(new_sections):
                 size_of_raw_data = _align_up(len(data), file_alignment) if data else 0
