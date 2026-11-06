@@ -1,12 +1,23 @@
 """PE TLS-directory merge: Task 2 (phase 1) adopts a dependency's own
 IMAGE_DIRECTORY_ENTRY_TLS as the host's, when the host has none of its
 own. Task 5 (phase 2) handles the harder case -- the host *also* already
-has its own non-empty TLS directory -- by leaving the host's own
-directory untouched and giving the dependency's own TLS data a real,
-independent per-thread slot via a synthesized TLS callback (see
-build_windows_tls_fixup_callback's docstring in staticer/stubs/windows/
-pe_stub.py for the full mechanism and why a naive single combined
-raw-data range can't work).
+has its own non-empty TLS directory -- by combining both raw-data ranges
+into one contiguous range (host's bytes first, at their original
+offsets; dependency's appended after), repointing the host's own
+directory struct at the combined range, and patching the dependency's
+own COMPILED TLS-access byte-offset(s) to match via a byte-pattern
+scanner (see `_patch_dep_tls_access_offsets`'s docstring in
+staticer/pe_embedder.py). The host's real, loader-assigned `_tls_index`
+is copied into the dependency's own `_tls_index` variable once at
+process start via a tiny generated function (see
+`build_windows_tls_index_fixup`'s docstring in
+staticer/stubs/windows/pe_stub.py) -- only one real OS-assigned slot is
+ever needed, since both modules now share it. An earlier design
+(`TlsAlloc`-based, giving the dependency a fully separate dynamic slot)
+was tried, built, and run first; it silently produced wrong values
+without crashing because `TlsAlloc`/`TlsSetValue` manage a different TEB
+array than the one compiled `__declspec(thread)` access actually reads
+-- discarded in favor of the mechanism above.
 
 Phase 1's step 1 (synthetic fixture) proves the mechanism actually works
 end to end -- a __declspec(thread)/__thread counter, embedded into a
