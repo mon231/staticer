@@ -98,7 +98,14 @@
   entry point, ...) is untouched by construction, since this only moves
   *file* offsets. When the host already has enough slack (the common
   case), behavior is byte-for-byte unchanged — the growth path only
-  activates when the existing check would otherwise have raised.
+  activates when the existing check would otherwise have raised. Two
+  narrow, theoretical gaps, unreachable with any known real-world
+  linker's output but worth knowing about: the legacy COFF
+  `FILE_HEADER.PointerToSymbolTable` field is never shifted (always 0 in
+  every real linked EXE/DLL this project has seen); and the new
+  `SizeOfHeaders` math assumes the host's *original* `SizeOfHeaders`
+  equals its original first section's `PointerToRawData`, true for
+  every real toolchain observed so far but not asserted in code.
 - **The host-already-has-TLS merge's byte-pattern scanner
   (`_patch_dep_tls_access_offsets`) is narrower than its own docstring
   implies.** It was verified correct against this project's own
