@@ -61,9 +61,10 @@ untested correctness gap. ``ElfEmbedder.embed()`` currently never passes
 a non-empty set.
 """
 
-from typing import Dict, List, Set, Tuple
+from typing import List, Set, Tuple
 
-from keystone import KS_ARCH_X86, KS_MODE_32, KS_MODE_64, Ks
+from staticer.stubs._keystone_utils import assemble as _assemble
+from staticer.stubs._keystone_utils import assemble_with_immediate as _assemble_with_immediate
 
 # -- assembling via Keystone instead of hand-encoded opcode bytes --
 #
@@ -86,27 +87,15 @@ from keystone import KS_ARCH_X86, KS_MODE_32, KS_MODE_64, Ks
 # future, longer stub could reasonably grow into one without disturbing
 # this structure.
 #
-# A `Ks` instance is expensive-ish to construct and stateless once
-# built, so one is cached per architecture rather than rebuilt per call.
-_ks_cache: Dict[bool, Ks] = {}
-
-
-def _ks(is64: bool) -> Ks:
-    ks = _ks_cache.get(is64)
-    if ks is None:
-        ks = Ks(KS_ARCH_X86, KS_MODE_64 if is64 else KS_MODE_32)
-        _ks_cache[is64] = ks
-    return ks
-
-
-def _assemble(is64: bool, asm_text: str) -> bytes:
-    """Assemble `asm_text` (newline-separated x86/x86-64 instructions,
-    no embedded absolute-address immediate) for the i386 or x86-64 ABI
-    and return the raw machine code."""
-    encoding, _count = _ks(is64).asm(asm_text)
-    return bytes(encoding)
-
-
+# The actual Keystone-engine caching, assembly, and sentinel locate/
+# splice mechanics (`assemble`/`assemble_with_immediate` above) are not
+# defined in this module -- they live in
+# `staticer/stubs/_keystone_utils.py`, shared with the Windows (PE) stub
+# builder (`staticer/stubs/windows/pe_stub.py`), which independently
+# arrived at the same mechanism. Only the platform-specific assembly
+# mnemonics/registers for the SysV calling convention, and this module's
+# own sentinel constants, stay here.
+#
 # Sentinel immediates used only to *locate* an instruction's own
 # immediate-operand bytes within Keystone's assembled output -- never
 # actually written into a returned stub. Chosen to be maximally
@@ -116,56 +105,33 @@ def _assemble(is64: bool, asm_text: str) -> bytes:
 _SENTINEL_64 = 0x1122334455667788
 _SENTINEL_32 = 0x11223344
 
+# Cross-sentinel collision -- not applicable here: unlike pe_stub.py's
+# `_x64_call_dllmain`/etc (which assemble a *single* sequence containing
+# *two* independent VA sentinels, then must patch both against the same
+# pristine buffer -- see `_keystone_utils.patch_two_va_sentinels`), every
+# immediate this module emits (one per init call, plus the tail jump) is
+# assembled, located, and spliced by its own, separate `_assemble_with_imm`
+# call -- see `emit_call`/`emit_tail_jmp_via_cx` below -- before being
+# concatenated onto the growing stub. Each buffer `_assemble_with_imm`
+# touches holds exactly one sentinel at a time and is fully patched before
+# the next one is ever assembled, so there is never a second, still-live
+# sentinel left in a buffer for an already-applied splice to collide
+# with. This was verified by inspection of every call site below (`emit_call`,
+# `emit_tail_jmp_via_cx`, and `build_linux_init_array_stub`'s own
+# `emit_call`), not assumed -- if a future change to this module ever
+# assembles two sentinels into one shared buffer before patching either,
+# it must switch that call site to `_keystone_utils.patch_two_va_sentinels`
+# instead.
+
 
 def _assemble_with_imm(is64: bool, asm_template: str, addr: int) -> Tuple[bytes, int]:
-    """Assemble `asm_template` (an `str.format`-style template with a
-    single ``{imm}`` placeholder standing in for one embedded absolute-
-    address immediate) and return ``(code, offset)``, where `offset` is
-    the byte offset *within* `code` of that immediate's little-endian
-    encoding, with the real `addr` already spliced in.
-
-    Keystone's ``Ks.asm()`` needs a concrete immediate in the assembly
-    text to produce anything at all -- it has no notion of "leave this
-    slot open for the caller to fill in later" -- but this module's own
-    caller (``ElfEmbedder.embed()``) needs to know exactly where that
-    immediate landed, byte-for-byte, to register a new ``R_*_RELATIVE``
-    relocation there (load-bearing for ASLR correctness -- see this
-    module's own docstring; every fixture this project's own tests build
-    is PIE). Two approaches were considered:
-
-    1. Assemble directly with the real, caller-supplied `addr`, then
-       search the output for *its own* little-endian byte pattern.
-    2. Assemble with a distinctive SENTINEL value standing in for `addr`
-       (0x1122334455667788 for x86-64, 0x11223344 for i386), locate the
-       *sentinel's* byte pattern, then splice the real `addr` in at that
-       located offset.
-
-    This function uses (2): a real VA's own bytes could, in principle,
-    coincidentally recur elsewhere in the same short instruction
-    sequence (inside another instruction's opcode bytes, for instance),
-    which would make a byte-pattern search against it ambiguous -- and
-    wrong -- in a way with no symptom until the resulting stub is
-    actually run. A sentinel chosen to look like nothing else this
-    module ever emits removes that risk outright: the assertion below
-    confirms, for every template actually used in this module, that the
-    sentinel's byte pattern appears exactly once in Keystone's real
-    output (verified against Keystone's actual assembled bytes, not
-    assumed), so locating it is unambiguous.
-    """
+    """Thin wrapper choosing this module's own 64-/32-bit sentinel for
+    `_keystone_utils.assemble_with_immediate` -- see the module-level
+    comment above for why no cross-sentinel-collision handling is needed
+    here."""
     ptr_size = 8 if is64 else 4
     sentinel = _SENTINEL_64 if is64 else _SENTINEL_32
-    sentinel_bytes = sentinel.to_bytes(ptr_size, "little")
-
-    code = bytearray(_assemble(is64, asm_template.format(imm=sentinel)))
-    assert code.count(sentinel_bytes) == 1, (
-        f"sentinel byte pattern {sentinel_bytes.hex()} must appear exactly "
-        f"once in the assembled template {asm_template!r} -- found "
-        f"{code.count(sentinel_bytes)} occurrences; the offset-location "
-        f"logic below is unsound otherwise"
-    )
-    offset = code.index(sentinel_bytes)
-    code[offset : offset + ptr_size] = addr.to_bytes(ptr_size, "little")
-    return bytes(code), offset
+    return _assemble_with_immediate(is64, asm_template, sentinel, ptr_size, addr)
 
 
 def build_linux_init_array_stub(*, is64: bool, init_calls: List[int]) -> Tuple[bytes, List[int]]:
