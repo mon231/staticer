@@ -82,11 +82,25 @@ the two options the embedding task considered: real VAs are caller
 -controlled and not guaranteed to have a byte pattern absent elsewhere in
 the same short sequence, whereas the sentinels are chosen once, verified
 once (see ``tests/windows/test_pe_stub_keystone.py``), and never vary.
+
+The locate/splice mechanics themselves (``assemble``, ``patch_immediate``,
+``patch_va_sentinel``, ``patch_two_va_sentinels``) are not defined in this
+module -- they live in ``staticer/stubs/_keystone_utils.py``, shared with
+the Linux (ELF) stub builder (``staticer/stubs/linux/elf_stub.py``), which
+independently arrived at the same mechanism. Only the platform-specific
+parts -- which assembly mnemonics/registers a given calling convention
+needs, and which sentinel constants this module happens to use -- stay
+here.
 """
 
 from typing import Dict, List, Set, Tuple
 
-from keystone import Ks, KS_ARCH_X86, KS_MODE_32, KS_MODE_64
+from staticer.stubs._keystone_utils import (
+    assemble as _assemble,
+    patch_immediate as _patch_immediate,
+    patch_two_va_sentinels as _patch_two_va_sentinels,
+    patch_va_sentinel as _patch_va_sentinel,
+)
 
 # Each helper below returns (bytes, [byte offsets of embedded absolute-VA
 # immediates within that block]) -- moved essentially unchanged from
@@ -103,145 +117,13 @@ from keystone import Ks, KS_ARCH_X86, KS_MODE_32, KS_MODE_64
 # assembly -- see the module docstring's "Assembly mechanism" section.
 # "_A"/"_B" are used when a single instruction sequence embeds two
 # independent absolute addresses, so each can be located unambiguously.
+# The actual locate/splice/two-sentinel-collision mechanics live in
+# ``staticer/stubs/_keystone_utils.py``, shared with the Linux (ELF) stub
+# builder -- see that module's docstring for why.
 _X64_SENTINEL_A = 0x1122334455667788
 _X64_SENTINEL_B = 0x8877665544332211
 _X86_SENTINEL_A = 0x11223344
 _X86_SENTINEL_B = 0x44332211
-
-# Keystone engine instances are cheap to reuse and expensive-ish to
-# construct repeatedly (each wraps a native handle), so one per mode is
-# cached for the lifetime of the process.
-_ks_engines: Dict[int, Ks] = {}
-
-
-def _ks(is64: bool) -> Ks:
-    mode = KS_MODE_64 if is64 else KS_MODE_32
-    engine = _ks_engines.get(mode)
-    if engine is None:
-        engine = Ks(KS_ARCH_X86, mode)
-        _ks_engines[mode] = engine
-    return engine
-
-
-def _assemble(is64: bool, asm_text: str) -> bytes:
-    """Assemble `asm_text` (real x86/x64 assembly source) at a nominal
-    base address of 0 and return the resulting machine code as `bytes`.
-
-    The base address matters only for instructions whose encoding depends
-    on an absolute target address relative to where the instruction itself
-    sits (e.g. `jne <absolute address>`, used by the process-attach guards
-    below) -- assembling at 0 makes that address arithmetic exact and
-    reproducible. None of these stubs otherwise care what address they're
-    assembled "at", since every absolute VA they embed is a sentinel
-    placeholder spliced in after the fact (see module docstring).
-    """
-    encoding, _count = _ks(is64).asm(asm_text, 0)
-    if encoding is None:
-        raise ValueError(f"keystone failed to assemble: {asm_text!r}")
-    return bytes(encoding)
-
-
-def _patch_immediate(data: bytes, sentinel_bytes: bytes, replacement_bytes: bytes) -> Tuple[bytes, int]:
-    """Locate `sentinel_bytes` within `data`, assert it occurs exactly
-    once (a coincidental second occurrence would mean some *other* fixed
-    opcode/operand byte in this same short sequence happens to match the
-    sentinel pattern, which would make the splice below silently wrong --
-    see module docstring), and return `data` with that one occurrence
-    replaced by `replacement_bytes` (same length), plus the byte offset at
-    which the replacement now sits.
-
-    Caller beware: when a single assembled sequence embeds *more than one*
-    sentinel (e.g. `_x64_call_dllmain`'s two VA slots), do not call this
-    repeatedly against the *already-patched* buffer -- see
-    `_locate_sentinel`/`_splice_at` below and the "cross-sentinel
-    collision" note on `_patch_two_va_sentinels` for why, and use that helper
-    instead for any multi-sentinel sequence.
-    """
-    if len(sentinel_bytes) != len(replacement_bytes):
-        raise ValueError("internal error: sentinel and replacement must be the same width")
-    offset = _locate_sentinel(data, sentinel_bytes)
-    return _splice_at(data, offset, replacement_bytes), offset
-
-
-def _locate_sentinel(data: bytes, sentinel_bytes: bytes) -> int:
-    """Find `sentinel_bytes`'s one-and-only occurrence in `data` (without
-    modifying it) and return its offset. Raises `ValueError` -- an
-    internal-error message in this codebase's existing style (see e.g.
-    `elf_embedder.py`'s "internal error: ..." `ValueError`s for other
-    should-never-happen invariant violations) -- if the pattern is absent
-    or, more subtly, if it occurs more than once: a second occurrence
-    would mean some *other* fixed opcode/operand byte in this same short
-    sequence happens to coincide with the sentinel's own byte pattern,
-    which would make a blind splice silently wrong rather than loudly
-    wrong. This has never been observed for any of the sequences in this
-    module (verified empirically across typical, edge-case, and
-    sentinel-shaped-adversarial VA/skip_len values -- see
-    `tests/windows/test_pe_stub_keystone.py`), but is checked on every
-    call rather than assumed, since a future change to one of these
-    assembly strings could in principle introduce it.
-    """
-    first = data.find(sentinel_bytes)
-    if first == -1:
-        raise ValueError(f"internal error: sentinel pattern {sentinel_bytes.hex()} not found in assembled code {data.hex()}")
-    if data.find(sentinel_bytes, first + 1) != -1:
-        raise ValueError(
-            f"internal error: sentinel pattern {sentinel_bytes.hex()} occurs more than once in assembled code {data.hex()}"
-        )
-    return first
-
-
-def _splice_at(data: bytes, offset: int, replacement_bytes: bytes) -> bytes:
-    return data[:offset] + replacement_bytes + data[offset + len(replacement_bytes):]
-
-
-def _patch_va_sentinel(data: bytes, sentinel: int, width: int, real_va: int) -> Tuple[bytes, int]:
-    """`_patch_immediate` specialised for an absolute-VA immediate: both
-    the sentinel and the real value are encoded as unsigned, `width`-byte,
-    little-endian integers (matching how x86/x64 `mov reg, imm` and
-    `push imm32` encode their operands).
-
-    Single-sentinel use only -- see `_patch_two_va_sentinels` for sequences
-    embedding two.
-    """
-    sentinel_bytes = sentinel.to_bytes(width, "little")
-    real_bytes = real_va.to_bytes(width, "little")
-    return _patch_immediate(data, sentinel_bytes, real_bytes)
-
-
-def _patch_two_va_sentinels(
-    data: bytes,
-    sentinel_a: int,
-    real_va_a: int,
-    sentinel_b: int,
-    real_va_b: int,
-    width: int,
-) -> Tuple[bytes, int, int]:
-    """Patch two independent absolute-VA sentinels in one assembled
-    sequence (`_x64_call_dllmain`/`_x86_call_dllmain`/
-    `build_windows_tls_index_fixup`, each of which embeds a `hinst`-ish
-    slot and an `entry`-ish slot).
-
-    Cross-sentinel collision: locates *both* sentinels' offsets against
-    the original, unmodified `data` before splicing either one in. Doing
-    this instead of the simpler "patch A, then search the already-patched
-    buffer for B" is deliberate: if the caller-supplied real value for
-    slot A happens to equal sentinel B's own constant (astronomically
-    unlikely for loader/ASLR-assigned addresses, which are not
-    attacker-controlled input, but not impossible, and cheap to rule out
-    here), patching A first would plant sentinel B's own byte pattern a
-    *second* time, and the subsequent search for B would find two matches
-    instead of one -- a real, reachable `ValueError` from
-    `_locate_sentinel`, not a hypothetical one. Locating both offsets
-    up front, against data neither has touched yet, and only then
-    splicing each one in by its own already-known offset, makes that
-    scenario structurally impossible: the second lookup is never run
-    against a buffer the first patch could have perturbed.
-    """
-    offset_a = _locate_sentinel(data, sentinel_a.to_bytes(width, "little"))
-    offset_b = _locate_sentinel(data, sentinel_b.to_bytes(width, "little"))
-    data = _splice_at(data, offset_a, real_va_a.to_bytes(width, "little"))
-    data = _splice_at(data, offset_b, real_va_b.to_bytes(width, "little"))
-    return data, offset_a, offset_b
 
 
 def _x64_call_dllmain(hinst_va: int, entry_va: int) -> Tuple[bytes, List[int]]:
