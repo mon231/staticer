@@ -154,7 +154,7 @@ def _patch_immediate(data: bytes, sentinel_bytes: bytes, replacement_bytes: byte
     sentinel (e.g. `_x64_call_dllmain`'s two VA slots), do not call this
     repeatedly against the *already-patched* buffer -- see
     `_locate_sentinel`/`_splice_at` below and the "cross-sentinel
-    collision" note on `_patch_two_sentinels` for why, and use that helper
+    collision" note on `_patch_two_va_sentinels` for why, and use that helper
     instead for any multi-sentinel sequence.
     """
     if len(sentinel_bytes) != len(replacement_bytes):
