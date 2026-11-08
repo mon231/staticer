@@ -197,6 +197,22 @@ Ledger: `.superpowers/sdd/2026-11-01-staticer-core/progress.md`
   pointers (architectural limit, documented); MSVC half of Task 7's original
   self-contained-throw finding not re-tested after B4 (GCC/MinGW half
   confirmed fixed, MSVC half unconfirmed either way).
+- **Post-completion finding (2026-11-08), via local testing against real
+  010 Editor install**: found and fixed a real crash-causing bug --
+  `pe_embedder.py` was calling `pefile.PE(path).parse_data_directories()`
+  a redundant second time on an already-fully-parsed object, which
+  silently truncated the import-descriptor walk from 26 entries to 3 for
+  this binary's own densely-packed import table, corrupting the final
+  output (`c0000005` access violation on launch). Fixed by dropping all
+  three redundant re-parse calls (`list_pe_imports`, `embed()`'s host
+  parse, `embed()`'s per-dependency parse); full suite still green (117
+  passed). Commit `1143676`, not yet pushed. Also confirmed and
+  documented (not fixed, pre-existing known limitation) a real
+  multi-dependency-TLS case: 010 Editor ships 12 DLLs with genuine TLS
+  directories (8 Qt6 modules + astyle/pugixml/rapidjson/tidy-html), but
+  `embed()` supports merging only one TLS-bearing dependency per run --
+  true one-file output for this binary needs multi-dependency TLS
+  merging, not yet implemented. See `docs/limitations.md`.
 - A GitHub Actions PyPI publish workflow was added (`.github/workflows/publish.yml`,
   adapted from the `firstclass` project's own release workflow), triggered on
   `v*` tags. Needs a `PYPI_API_TOKEN` repo secret before a real publish can

@@ -29,7 +29,32 @@
   for ELF on either bit-width (nor for a second TLS-bearing dependency
   in one `embed()` call, on either platform); those cases are rejected
   with a clear error naming the dependency rather than embedded
-  incorrectly.
+  incorrectly. Confirmed a real, practical hit via local testing against
+  [010 Editor](https://www.sweetscape.com/010editor/) (a genuine Qt6
+  64-bit PE application): 8 of its Qt6 modules plus 4 further
+  dependencies (`astyle.dll`, `pugixml.dll`, `rapidjson.dll`,
+  `tidy-html.dll`) all carry real (non-empty) TLS directories, so at most
+  one of the 12 can currently be embedded in the same run — the rest
+  must stay ordinary dynamic imports, which also means the app's Qt
+  plugin folder (`platforms/`, `styles/`, `sqldrivers/`, plus `qt.conf`
+  pointing at it) still has to ship alongside the output, since those
+  plugin DLLs are themselves Qt6 modules with their own TLS directories
+  and were excluded from embedding for the same reason. True one-file
+  output for an app shaped like this needs multi-dependency TLS merging,
+  not yet implemented.
+- **Fixed, found via the same 010 Editor testing**: `pefile.PE(path)`
+  (`fast_load=False`, the default) already fully parses every data
+  directory at construction; `pe_embedder.py` used to call
+  `parse_data_directories()` a *second* time on the same already-parsed
+  object (in `list_pe_imports`, `embed()`'s host parse, and `embed()`'s
+  per-dependency parse). That redundant call is not a no-op: for 010
+  Editor's own densely-importing binary (26 real `IMAGE_IMPORT_DESCRIPTOR`
+  entries), the second walk silently gave up after too many entries it
+  failed to resolve imports for, truncating the parsed import list from
+  26 down to 3 — `build_dependency_graph` then saw only the host's first
+  3 imports, and the final rebuilt import table was missing the rest,
+  producing a real `c0000005` access-violation crash on launch. Fixed by
+  removing all three redundant re-parse calls.
 - ELF General/Local-Dynamic TLS model call-site relaxation
   (`R_X86_64_TLSGD`/`TLSLD`, types 19/20, and the i386 equivalents) is
   deliberately not implemented — not because it was overlooked, but
