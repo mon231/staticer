@@ -77,20 +77,27 @@
   forwards some of its own ANSI exports to its own wide-string ones) is
   explicitly excluded from this to avoid a spurious self-loop in
   `embed_order`'s cycle detector.
-  **Still real, newly exposed earlier by this fix**: a genuine import
-  CYCLE among embeddable dependencies (confirmed real, not hypothetical:
-  WS2_32.dll's own import table imports MSWSOCK.dll, while WS2_32.dll
-  also forwards some exports TO MSWSOCK.dll) has no valid single
-  topological order, so `embed_order()` raises `CyclicDependencyError`
-  rather than embed either side wrong. Since cross-dependency resolution
+  **Fixed**: a genuine import CYCLE among embeddable dependencies
+  (confirmed real, not hypothetical: WS2_32.dll's own import table
+  imports MSWSOCK.dll, while WS2_32.dll also forwards some exports TO
+  MSWSOCK.dll) has no valid single topological order, so
+  `embed_order()`'s strict default used to raise `CyclicDependencyError`
+  rather than embed either side wrong. Confirmed (by tracing every line
+  of `embed()`'s per-dependency loop) that cross-dependency resolution
   is already fully deferred to a finalize pass run after every
-  dependency is placed, a strict total order may not even be a real
-  technical requirement for the embedding mechanism itself — worth
-  confirming before changing `embed_order`'s contract — but that's not
-  yet done. See `tests/windows/test_pe_real_binaries.py`'s
-  `test_second_real_binary_full_closure` (still `xfail`, now for this
-  reason specifically — its two previous blockers, KERNELBASE.dll's TLS
-  directory and this exact forwarder-discovery gap, are both now fixed).
+  dependency is placed, so a strict total order is not a real technical
+  requirement for the embedding mechanism itself — `embed_order` gained
+  an additive `allow_cycles=True` opt-in (`common/depgraph.py`) that
+  groups mutually-cyclic nodes into strongly-connected components
+  (Tarjan's algorithm) instead of raising, keeping every component
+  dependencies-first relative to the rest of the graph; `pe_embedder.py`
+  opts into it, `elf_embedder.py` keeps calling the strict default
+  unchanged. See `tests/windows/test_pe_real_binaries.py`'s
+  `test_second_real_binary_full_closure` (still `xfail`, now for a
+  *different* reason — this cycle, and its two earlier blockers
+  (KERNELBASE.dll's TLS directory and the forwarder-discovery gap), are
+  all fixed; the current blocker is msvcrt.dll hitting the already-
+  documented TLS byte-pattern-scanner limitation below).
 - **Fixed, found via the same 010 Editor testing**: `pefile.PE(path)`
   (`fast_load=False`, the default) already fully parses every data
   directory at construction; `pe_embedder.py` used to call
@@ -248,6 +255,12 @@
   implementation materializing on real software, not a new kind of bug —
   but it means the host-already-has-TLS merge path, while safe, is
   currently narrower in practice than "works for 64-bit PE" suggests.
+  **Also now confirmed against a real Microsoft-shipped system DLL, not
+  just third-party ones**: once `embed_order`'s cycle-tolerance fix (see
+  above) stopped `test_second_real_binary_full_closure` from hitting
+  `CyclicDependencyError`, the next real dependency reached --
+  msvcrt.dll, itself TLS-bearing -- hits this exact same scanner gap,
+  now the test's current (still-`xfail`) blocker.
   (A previously-listed "extended x64 register (`r8d`-`r15d`) load" gap
   here was re-reviewed and confirmed NOT a real gap — the anchor match
   only looks at the ModRM reg-field bits, which a preceding REX prefix

@@ -1226,7 +1226,22 @@ class PortableExecutableEmbedder:
             self.input_path, _list_pe_import_graph_edges, resolve_pe, search_dirs, self.lib_dir,
             _CaseInsensitiveNameSet(self.exclude),
         )
-        order = embed_order(graph)
+        # allow_cycles=True: a real, confirmed cycle can exist among
+        # embeddable PE dependencies purely through export forwarding (see
+        # `global_raw_exports_by_dll`'s own comment below, and
+        # test_second_real_binary_full_closure) -- e.g. WS2_32.dll's own
+        # import table imports MSWSOCK.dll, while WS2_32.dll ALSO forwards
+        # some exports TO MSWSOCK.dll. The per-dependency loop below never
+        # reads another not-yet-processed node's blob/export table/
+        # placement inline -- every cross-dependency need (host-IAT
+        # patches, dependency-to-dependency IAT patches, export-forward
+        # resolution) is deferred to a finalize pass that runs only after
+        # every node in `order` has been placed -- so there is no real
+        # correctness requirement on a strict total order here, just
+        # determinism. `elf_embedder.py` calls the same shared
+        # `embed_order` without this flag and keeps the strict, cycle-
+        # raising default.
+        order = embed_order(graph, allow_cycles=True)
 
         if not order:
             self.output_path.write_bytes(self.input_path.read_bytes())

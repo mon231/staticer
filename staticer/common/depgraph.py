@@ -82,40 +82,131 @@ def build_dependency_graph(
     return nodes
 
 
-def embed_order(graph: Dict[str, DependencyNode]) -> List[DependencyNode]:
-    """Dependencies-first topological order over the embeddable subset of
-    ``graph``. Raises CyclicDependencyError, naming the cycle, if a cycle
-    exists among embeddable nodes."""
-    order: List[DependencyNode] = []
-    visited: Set[str] = set()
-    in_progress: List[str] = []
-    in_progress_set: Set[str] = set()
+def embed_order(graph: Dict[str, DependencyNode], allow_cycles: bool = False) -> List[DependencyNode]:
+    """Dependencies-first order over the embeddable subset of ``graph``.
 
-    def visit(name: str) -> None:
-        if name in visited:
-            return
-        if name in in_progress_set:
-            cycle = in_progress[in_progress.index(name):] + [name]
-            raise CyclicDependencyError(
-                "cyclic dependency detected: " + " -> ".join(cycle)
-            )
+    Default (``allow_cycles=False``, unchanged from this function's original
+    contract): a strict topological sort. Raises ``CyclicDependencyError``,
+    naming the cycle, if a cycle exists among embeddable nodes. Existing
+    callers (e.g. ``elf_embedder``) that rely on this strict all-or-nothing
+    check keep getting it exactly as before -- this is deliberately an
+    additive opt-in, not a change to the default call's behavior.
+
+    ``allow_cycles=True``: tolerate cycles among embeddable nodes instead of
+    raising. Nodes are grouped into strongly connected components (via
+    Tarjan's algorithm, over the embeddable subgraph) and the returned list
+    concatenates every component's nodes, with components themselves in
+    dependencies-first order relative to each other (for any edge A -> B
+    where A and B land in different components, B's component appears
+    before A's) -- the same guarantee the strict path gives for individual
+    nodes. Within one multi-node component (an actual cycle), there is by
+    definition no single valid order, so its nodes are grouped together,
+    adjacent, in whatever deterministic order Tarjan's algorithm discovers
+    them (itself fully determined by `graph`'s own iteration order and each
+    node's `imports` list order) -- callers that opt into this must already
+    be prepared to resolve any cross-dependency needs after every node in
+    the group has been placed, as ``pe_embedder.py`` does, rather than
+    relying on one group member being fully ready before another is
+    processed.
+    """
+    if not allow_cycles:
+        order: List[DependencyNode] = []
+        visited: Set[str] = set()
+        in_progress: List[str] = []
+        in_progress_set: Set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visited:
+                return
+            if name in in_progress_set:
+                cycle = in_progress[in_progress.index(name):] + [name]
+                raise CyclicDependencyError(
+                    "cyclic dependency detected: " + " -> ".join(cycle)
+                )
+
+            node = graph[name]
+            in_progress.append(name)
+            in_progress_set.add(name)
+
+            for imp_name in node.imports:
+                dep = graph.get(imp_name)
+                if dep is not None and dep.embeddable:
+                    visit(imp_name)
+
+            in_progress.pop()
+            in_progress_set.discard(name)
+            visited.add(name)
+            order.append(node)
+
+        for name, node in graph.items():
+            if node.embeddable:
+                visit(name)
+
+        return order
+
+    order = []
+    for component in _tarjan_sccs(graph):
+        order.extend(component)
+    return order
+
+
+def _tarjan_sccs(graph: Dict[str, DependencyNode]) -> List[List[DependencyNode]]:
+    """Tarjan's strongly-connected-components algorithm over the embeddable
+    subset of ``graph``, following each node's ``imports`` edges (A -> B
+    meaning "A imports B").
+
+    Returns a list of components (each a list of one or more
+    ``DependencyNode``), in an order where, for any edge A -> B crossing
+    between two different components, B's component is emitted before A's
+    -- i.e. dependencies-first between components, exactly like
+    ``embed_order``'s own strict-path guarantee for individual nodes (a
+    single-node component is just the degenerate, acyclic case of this same
+    property). This falls out of Tarjan's algorithm directly: a component is
+    only finalized (popped) once every component reachable from it via an
+    outgoing edge has already been finalized, since the DFS recurses into
+    those neighbors first.
+
+    A component with more than one node is a genuine cycle with no valid
+    single order among its own members; callers needing to tolerate that
+    (see ``embed_order(graph, allow_cycles=True)``) must not depend on
+    within-component ordering for correctness.
+    """
+    index_counter = [0]
+    indices: Dict[str, int] = {}
+    lowlink: Dict[str, int] = {}
+    stack: List[str] = []
+    on_stack: Set[str] = set()
+    sccs: List[List[DependencyNode]] = []
+
+    def strongconnect(name: str) -> None:
+        indices[name] = lowlink[name] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(name)
+        on_stack.add(name)
 
         node = graph[name]
-        in_progress.append(name)
-        in_progress_set.add(name)
-
         for imp_name in node.imports:
             dep = graph.get(imp_name)
-            if dep is not None and dep.embeddable:
-                visit(imp_name)
+            if dep is None or not dep.embeddable:
+                continue
+            if imp_name not in indices:
+                strongconnect(imp_name)
+                lowlink[name] = min(lowlink[name], lowlink[imp_name])
+            elif imp_name in on_stack:
+                lowlink[name] = min(lowlink[name], indices[imp_name])
 
-        in_progress.pop()
-        in_progress_set.discard(name)
-        visited.add(name)
-        order.append(node)
+        if lowlink[name] == indices[name]:
+            component: List[DependencyNode] = []
+            while True:
+                member = stack.pop()
+                on_stack.discard(member)
+                component.append(graph[member])
+                if member == name:
+                    break
+            sccs.append(component)
 
     for name, node in graph.items():
-        if node.embeddable:
-            visit(name)
+        if node.embeddable and name not in indices:
+            strongconnect(name)
 
-    return order
+    return sccs

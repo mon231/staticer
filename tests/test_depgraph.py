@@ -248,3 +248,114 @@ def test_embed_order_cycle_error_names_the_cycle():
     message = str(exc_info.value)
     assert "a.dll" in message
     assert "b.dll" in message
+
+
+# ---------------------------------------------------------------------------
+# embed_order(graph, allow_cycles=True) -- cycle-tolerant opt-in path
+# ---------------------------------------------------------------------------
+
+
+def test_embed_order_allow_cycles_groups_two_node_cycle():
+    # Same shape as test_embed_order_raises_on_cycle, but opted into the
+    # cycle-tolerant path: both nodes must still come out, grouped adjacent
+    # to each other, with no exception raised.
+    graph = {
+        "a.dll": DependencyNode(
+            name="a.dll", path=Path("/libs/a.dll"), embeddable=True, imports=["b.dll"]
+        ),
+        "b.dll": DependencyNode(
+            name="b.dll", path=Path("/libs/b.dll"), embeddable=True, imports=["a.dll"]
+        ),
+    }
+
+    order = embed_order(graph, allow_cycles=True)
+
+    assert len(order) == 2
+    assert graph["a.dll"] in order
+    assert graph["b.dll"] in order
+    # Grouped adjacent to each other (the whole order has only these two
+    # nodes here, so this is trivially true, but assert it explicitly).
+    assert abs(order.index(graph["a.dll"]) - order.index(graph["b.dll"])) == 1
+
+
+def test_embed_order_allow_cycles_groups_three_node_cycle():
+    # a -> b -> c -> a: a genuine 3-node cycle, not just the 2-node case.
+    graph = {
+        "a.dll": DependencyNode(
+            name="a.dll", path=Path("/libs/a.dll"), embeddable=True, imports=["b.dll"]
+        ),
+        "b.dll": DependencyNode(
+            name="b.dll", path=Path("/libs/b.dll"), embeddable=True, imports=["c.dll"]
+        ),
+        "c.dll": DependencyNode(
+            name="c.dll", path=Path("/libs/c.dll"), embeddable=True, imports=["a.dll"]
+        ),
+    }
+
+    order = embed_order(graph, allow_cycles=True)
+
+    assert len(order) == 3
+    for n in ("a.dll", "b.dll", "c.dll"):
+        assert graph[n] in order
+    indices = [order.index(graph[n]) for n in ("a.dll", "b.dll", "c.dll")]
+    # All three must be grouped adjacent to each other (contiguous indices).
+    assert sorted(indices) == [min(indices), min(indices) + 1, min(indices) + 2]
+
+
+def test_embed_order_allow_cycles_non_cyclic_node_depends_on_cycle():
+    # d.dll (not part of any cycle) imports a.dll, which is part of the
+    # a.dll <-> b.dll cycle. d.dll must still come out ordered correctly
+    # AFTER the whole cycle it depends on (dependencies-first between the
+    # cycle's SCC and the rest of the graph), even though no single order
+    # exists *within* the cycle itself.
+    graph = {
+        "a.dll": DependencyNode(
+            name="a.dll", path=Path("/libs/a.dll"), embeddable=True, imports=["b.dll"]
+        ),
+        "b.dll": DependencyNode(
+            name="b.dll", path=Path("/libs/b.dll"), embeddable=True, imports=["a.dll"]
+        ),
+        "d.dll": DependencyNode(
+            name="d.dll", path=Path("/libs/d.dll"), embeddable=True, imports=["a.dll"]
+        ),
+    }
+
+    order = embed_order(graph, allow_cycles=True)
+
+    assert len(order) == 3
+    for n in ("a.dll", "b.dll", "d.dll"):
+        assert graph[n] in order
+    assert order.index(graph["a.dll"]) < order.index(graph["d.dll"])
+    assert order.index(graph["b.dll"]) < order.index(graph["d.dll"])
+    # The cycle's own two members still land adjacent to each other.
+    assert abs(order.index(graph["a.dll"]) - order.index(graph["b.dll"])) == 1
+
+
+def test_embed_order_allow_cycles_still_orders_acyclic_part_correctly():
+    # No cycle at all: allow_cycles=True must still produce the same
+    # dependencies-first guarantee as the strict default for a purely
+    # acyclic graph.
+    graph = {
+        "b.dll": DependencyNode(name="b.dll", path=Path("/libs/b.dll"), embeddable=True),
+        "a.dll": DependencyNode(
+            name="a.dll", path=Path("/libs/a.dll"), embeddable=True, imports=["b.dll"]
+        ),
+    }
+
+    order = embed_order(graph, allow_cycles=True)
+
+    assert order.index(graph["b.dll"]) < order.index(graph["a.dll"])
+
+
+def test_embed_order_allow_cycles_still_skips_non_embeddable_nodes():
+    graph = {
+        "excluded.dll": DependencyNode(
+            name="excluded.dll", path=Path("/libs/excluded.dll"), embeddable=False
+        ),
+        "a.dll": DependencyNode(name="a.dll", path=Path("/libs/a.dll"), embeddable=True),
+    }
+
+    order = embed_order(graph, allow_cycles=True)
+
+    assert graph["excluded.dll"] not in order
+    assert graph["a.dll"] in order
