@@ -52,9 +52,19 @@ _SCN_UNINIT_RW = 0xC0000080  # CNT_UNINITIALIZED_DATA|MEM_READ|MEM_WRITE (".bss"
 def list_pe_imports(path: Path) -> List[str]:
     """Names of the DLLs a PE file imports, read from its IMPORT_DESCRIPTOR
     directory (empty list if it has none)."""
+    # `pefile.PE(path)` (fast_load=False, the default) already parses every
+    # data directory -- including imports -- during construction. A second,
+    # redundant `parse_data_directories()` call on an already-parsed object
+    # is not a no-op: for at least one real, densely-importing binary (a
+    # Qt6 application found via local testing) it corrupted the re-walk of
+    # the import descriptor array, silently truncating it from 26 real
+    # entries down to 3 (pefile's own `parse_import_directory` gives up
+    # after too many descriptors it fails to resolve imports for). That
+    # truncation cascaded into `build_dependency_graph` only ever seeing
+    # the input's first 3 imports, and a corrupted/crashing final binary.
+    # Never re-parse an already-constructed PE object.
     pe = pefile.PE(str(path))
     try:
-        pe.parse_data_directories(directories=[_IMAGE_DIRECTORY_ENTRY_IMPORT])
         if not hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
             return []
         return [entry.dll.decode("ascii") for entry in pe.DIRECTORY_ENTRY_IMPORT]
@@ -1144,7 +1154,11 @@ class PortableExecutableEmbedder:
 
         pe = pefile.PE(str(self.input_path))
         try:
-            pe.parse_data_directories()
+            # See `list_pe_imports`'s comment: `pefile.PE(...)` already fully
+            # parses every data directory at construction -- re-parsing
+            # here would silently corrupt the import-descriptor walk for
+            # some real-world binaries (confirmed via local testing against
+            # 010 Editor, a dense Qt6 PE).
 
             host_machine = pe.FILE_HEADER.Machine
             is64 = host_machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
@@ -1266,8 +1280,6 @@ class PortableExecutableEmbedder:
                             f"'{self.input_path}' is {hex(host_machine)}, dependency "
                             f"'{node.path}' is {hex(dep.FILE_HEADER.Machine)}"
                         )
-
-                    dep.parse_data_directories()
 
                     # TLS-directory handling (Task 2 phase 1 + Task 5 phase
                     # 2 of the design spec's PE merge mechanism): a
