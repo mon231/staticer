@@ -32,23 +32,35 @@
   platforms (see [Features](features.md)). Merging two *separate* TLS
   directories — one from the host itself and one from a dependency —
   into a single combined block is implemented for a 64-bit PE host
-  (see Features). It is still not implemented for a 32-bit PE host, or
-  for ELF on either bit-width (nor for a second TLS-bearing dependency
-  in one `embed()` call, on either platform); those cases are rejected
-  with a clear error naming the dependency rather than embedded
-  incorrectly. Confirmed a real, practical hit via local testing against
-  [010 Editor](https://www.sweetscape.com/010editor/) (a genuine Qt6
-  64-bit PE application): 8 of its Qt6 modules plus 4 further
-  dependencies (`astyle.dll`, `pugixml.dll`, `rapidjson.dll`,
-  `tidy-html.dll`) all carry real (non-empty) TLS directories, so at most
-  one of the 12 can currently be embedded in the same run — the rest
-  must stay ordinary dynamic imports, which also means the app's Qt
-  plugin folder (`platforms/`, `styles/`, `sqldrivers/`, plus `qt.conf`
-  pointing at it) still has to ship alongside the output, since those
-  plugin DLLs are themselves Qt6 modules with their own TLS directories
-  and were excluded from embedding for the same reason. True one-file
-  output for an app shaped like this needs multi-dependency TLS merging,
-  not yet implemented.
+  (see Features). **Update: no longer capped at one TLS-bearing
+  dependency per run.** The 64-bit PE merge mechanism now chains any
+  number of TLS-bearing dependencies into the same combined raw-data
+  range in one `embed()` call (host-has-none-of-its-own + N
+  dependencies, host-already-has-its-own + N dependencies, or any mix),
+  each one's own compiled TLS-access offset shifted by however many
+  bytes already precede it in the chain and each one's own `_tls_index`
+  fixed up at process start to match whichever module ended up holding
+  the one real, loader-assigned slot — proven via real embed()+run
+  fixtures with two and three independently-TLS-bearing dependencies
+  (`tests/windows/test_pe_tls.py`), including a three-way host+dep+dep
+  merge. Still not implemented: a 32-bit PE host (whether the 32-bit
+  limit comes from the host already having its own TLS directory, or
+  from a *second* TLS-bearing dependency showing up with a TLS-less
+  host — either now rejected with the same 64-bit-only error, since the
+  synthesized index-fixup callback is x64 machine code either way), and
+  ELF on either bit-width (ELF still rejects at exactly one TLS-bearing
+  dependency, and still has no merge-with-host-TLS mechanism at all —
+  see the ELF-specific TLS gaps below). Separately, and still real: even
+  with the N-way cap gone, a *real* MSVC-compiled dependency DLL (as
+  opposed to this project's own mingw-w64 test fixtures) can still fail
+  the byte-pattern scanner this merge depends on to find and shift its
+  compiled TLS-access instruction(s) — see "The host-already-has-TLS
+  merge's byte-pattern scanner... is narrower than its own docstring
+  implies" below, which is unaffected by this change and was confirmed
+  via the same local 010 Editor testing that originally found the
+  one-dependency cap: 8 of its Qt6 modules plus 4 further dependencies
+  (`astyle.dll`, `pugixml.dll`, `rapidjson.dll`, `tidy-html.dll`) all
+  carry real (non-empty) TLS directories, and all are real MSVC builds.
 - **Fixed, found via the same 010 Editor testing**: `pefile.PE(path)`
   (`fast_load=False`, the default) already fully parses every data
   directory at construction; `pe_embedder.py` used to call

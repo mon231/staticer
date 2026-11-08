@@ -96,15 +96,19 @@ A dependency's TLS directory can also be merged with a *64-bit PE host's own*
 pre-existing TLS directory, rather than only adopted by a TLS-less host: both
 raw-data ranges are combined, both halves share the one `_tls_index` slot the
 loader actually assigns, and the dependency's compiled TLS-access offsets are
-patched to their new position within the combined range.
+patched to their new position within the combined range. This chains to any
+number of TLS-bearing dependencies in the same `embed()` call, not just one:
+each additional one's own raw data is appended to the end of the
+already-combined range, its own compiled TLS-access offset(s) shifted by
+however many bytes already precede it, and its own `_tls_index` fixed up to
+match whichever module ended up holding the one real, loader-assigned slot.
 
 !!! note
     Merging the host's *own* TLS directory with a dependency's separate one
-    is not yet implemented for a 32-bit PE host, or for ELF on either
-    bit-width (nor for a second TLS-bearing dependency in one `embed()`
-    call) — see [Limitations](limitations.md). For those cases, the
-    supported path is still a TLS-less host adopting a dependency's TLS
-    directory as its own.
+    (or chaining in more than one TLS-bearing dependency) is not yet
+    implemented for a 32-bit PE host, or for ELF on either bit-width (ELF
+    still supports only a single TLS-bearing dependency into a TLS-less
+    host) — see [Limitations](limitations.md).
 
 ## Generated entrypoint stub
 
