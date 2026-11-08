@@ -7,14 +7,12 @@ This module knows nothing about PE or ELF; those formats supply their own
 ``elf_embedder``) and call into ``build_dependency_graph``/``embed_order``.
 """
 
-from dataclasses import field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
-from firstclass import firstclass
 
-
-@firstclass
+@dataclass
 class DependencyNode:
     name: str
     path: Path
