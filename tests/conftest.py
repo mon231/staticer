@@ -9,6 +9,7 @@ import lzma
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import urllib.error
 import urllib.request
@@ -19,6 +20,12 @@ import pefile
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 1:
+        return value
+    return (value + alignment - 1) // alignment * alignment
 
 
 def _find_compiler() -> Optional[Tuple[str, Optional[str]]]:
@@ -137,6 +144,85 @@ def _strip_pe_relocations(path: Path) -> None:
     data = bytearray(path.read_bytes())
     data[va_off:va_off + 4] = b"\x00\x00\x00\x00"
     data[sz_off:sz_off + 4] = b"\x00\x00\x00\x00"
+    path.write_bytes(bytes(data))
+
+
+def shrink_pe_section_header_slack(path: Path) -> None:
+    """Doctors a built PE in place so its section-header table has almost
+    no slack left -- simulating the "original linker packed this region
+    tight" real-world case (see ``docs/limitations.md``'s entry on PE
+    section-header-table growth, found via local testing against a real
+    Qt6-based application) without needing a specific third-party linker
+    on hand.
+
+    Every real compiler/linker leaves the gap between the end of the
+    (existing) section-header table and the first section's own raw file
+    data as plain zero padding, there purely because ``PointerToRawData``
+    must be a multiple of ``FileAlignment`` and the header table itself
+    rarely lands exactly on such a boundary. That gap can't be shrunk by
+    moving ``PointerToRawData`` earlier without violating that alignment
+    rule (and real binaries just leave it as slack) -- so this doesn't
+    touch any raw file data at all. Instead it fills that existing slack
+    with harmless *dummy* section-header entries, consuming the slack
+    down to less than one more 40-byte entry's worth -- exactly the
+    "nowhere near enough for even one dependency's worth of new
+    sections" scenario ``embed()``'s "not enough slack" check guards
+    against. Each dummy also bumps ``NumberOfSections``, so the file
+    stays internally consistent.
+
+    Each dummy is given its own non-overlapping virtual-address range
+    (one ``SectionAlignment`` page past wherever the real sections end)
+    and the same ``IMAGE_SCN_CNT_UNINITIALIZED_DATA | MEM_READ |
+    MEM_WRITE`` characteristics real ``.bss`` sections carry, with no
+    raw file backing (``PointerToRawData``/``SizeOfRawData`` both 0, the
+    same convention this project's own embedder uses for a "no raw file
+    backing" filler section) -- an all-zero section-header entry
+    (0 VirtualAddress, 0 Characteristics) is not a section Windows'
+    real loader accepts (confirmed directly: a host doctored that way
+    fails to start at all, with ``%1 is not a valid Win32
+    application``), so this mimics a real, loader-valid empty section
+    instead.
+    """
+    pe = pefile.PE(str(path))
+    fh = pe.FILE_HEADER
+    section_alignment = pe.OPTIONAL_HEADER.SectionAlignment
+    section_table_offset = fh.get_file_offset() + fh.sizeof() + fh.SizeOfOptionalHeader
+    existing_section_count = fh.NumberOfSections
+    first_raw_data_offset = min(s.PointerToRawData for s in pe.sections if s.PointerToRawData)
+    slack = first_raw_data_offset - (section_table_offset + existing_section_count * 40)
+    num_dummies = slack // 40
+    noff = fh.get_field_absolute_offset("NumberOfSections")
+
+    last_section = max(pe.sections, key=lambda s: s.VirtualAddress)
+    next_rva = _align_up(
+        last_section.VirtualAddress + max(last_section.Misc_VirtualSize, last_section.SizeOfRawData),
+        section_alignment,
+    )
+    size_off = pe.OPTIONAL_HEADER.get_field_absolute_offset("SizeOfImage")
+    pe.close()
+
+    if num_dummies <= 0:
+        raise RuntimeError(
+            f"'{path}' already has less than one section-header entry's "
+            f"worth of slack ({slack} bytes) -- nothing to shrink"
+        )
+
+    data = bytearray(path.read_bytes())
+    IMAGE_SCN_CNT_UNINITIALIZED_DATA = 0x00000080
+    IMAGE_SCN_MEM_READ = 0x40000000
+    IMAGE_SCN_MEM_WRITE = 0x80000000
+    characteristics = IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE
+    dummies_offset = section_table_offset + existing_section_count * 40
+    for i in range(num_dummies):
+        va = next_rva + i * section_alignment
+        header = struct.pack(
+            "<8sIIIIIIHHI", b".pad\x00\x00\x00\x00", section_alignment, va,
+            0, 0, 0, 0, 0, 0, characteristics,
+        )
+        data[dummies_offset + i * 40:dummies_offset + (i + 1) * 40] = header
+    data[noff:noff + 2] = struct.pack("<H", existing_section_count + num_dummies)
+    new_size_of_image = _align_up(next_rva + num_dummies * section_alignment, section_alignment)
+    data[size_off:size_off + 4] = struct.pack("<I", new_size_of_image)
     path.write_bytes(bytes(data))
 
 

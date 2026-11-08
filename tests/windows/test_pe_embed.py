@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from conftest import FIXTURES, build_exe, build_shared_lib
+from conftest import FIXTURES, build_exe, build_shared_lib, shrink_pe_section_header_slack
 
 from staticer.pe_embedder import PortableExecutableEmbedder, list_pe_imports
 
@@ -63,6 +63,28 @@ def test_architecture_mismatch_fails_loudly(tmp_path, c_compiler, bits):
 
     with pytest.raises(ValueError):
         PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), lib_dir=tmp_path).embed()
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_embed_succeeds_when_host_section_header_table_is_packed_tight(tmp_path, c_compiler, bits):
+    """See docs/limitations.md's "PE's section-header table has no growth
+    mechanism" entry: a host whose original linker left almost no slack
+    between the section-header table and the first section's own raw file
+    data used to make embed() fail loudly with "not enough slack ..." no
+    matter what. embed() now grows that slack (shifting every section's
+    PointerToRawData, and SizeOfHeaders, forward) when it's insufficient,
+    so this now succeeds -- and the output still actually runs."""
+    dll = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=True, bits=bits)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main.exe", [dll], pic=True, bits=bits)
+    shrink_pe_section_header_slack(exe)
+    out = tmp_path / "static.exe"
+
+    PortableExecutableEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+
+    assert "lib.dll" not in list_pe_imports(out)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 42
 
 
 # NOTE: a dependency with no relocation data at all used to fail loudly

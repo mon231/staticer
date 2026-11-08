@@ -78,6 +78,34 @@ the host and an embedded dependency.
     ordinary cross-boundary unwinding (the common case) is fully
     supported and tested.
 
+## Thread Local Storage
+
+A dependency's Thread Local Storage directory (PE `IMAGE_DIRECTORY_ENTRY_TLS`
+/ ELF `PT_TLS`) is adopted as a *TLS-less* host's own: the dependency's raw
+TLS data template is merged into the host's own TLS block and its
+TLS-relative relocations (ELF `R_X86_64_DTPMOD64`/`DTPOFF64`/`TPOFF64`; PE's
+raw-data/index patch-up) are resolved against the single combined module, so
+each OS thread still gets its own correctly-initialized slot.
+
+On PE, this also handles a dependency's TLS callback array
+(`AddressOfCallBacks`) rather than only the callback-free case — verified
+against a real-world dependency (frida-gadget, below) whose own TLS
+directory carries three real callback entries.
+
+A dependency's TLS directory can also be merged with a *64-bit PE host's own*
+pre-existing TLS directory, rather than only adopted by a TLS-less host: both
+raw-data ranges are combined, both halves share the one `_tls_index` slot the
+loader actually assigns, and the dependency's compiled TLS-access offsets are
+patched to their new position within the combined range.
+
+!!! note
+    Merging the host's *own* TLS directory with a dependency's separate one
+    is not yet implemented for a 32-bit PE host, or for ELF on either
+    bit-width (nor for a second TLS-bearing dependency in one `embed()`
+    call) — see [Limitations](limitations.md). For those cases, the
+    supported path is still a TLS-less host adopting a dependency's TLS
+    directory as its own.
+
 ## Generated entrypoint stub
 
 The output's entrypoint is replaced with a small generated stub that
@@ -121,18 +149,32 @@ Also tried, for real, against a genuine third-party *instrumentation*
 library — Frida's own `frida-gadget`, downloaded directly from its GitHub
 release assets rather than synthesized (see
 `tests/windows/test_pe_frida_gadget.py` /
-`tests/linux/test_elf_frida_gadget.py`). It doesn't embed end-to-end yet:
-frida-gadget carries its own TLS directory on both PE and ELF, which hits
-the already-documented TLS limitation (see
-[Limitations](limitations.md)) rather than a new bug. Investigating it
-did turn up one real, useful fact worth recording even though the test
-can't exercise it yet: frida-gadget resolves its own `.config` file by
-asking the OS which loaded module contains its own running code, then
-looking next to that module's path. Once embedded, that code no longer
-belongs to a separate module at all — it's part of the host — so, in
-principle, that lookup would resolve to the *host binary's own* path
-rather than the gadget's, meaning the config file would need to be named
-after the host's own filename stem, not the gadget's. That's confirmed
-by reading frida-core's own config-resolution source, not guessed, and
-is documented here so it isn't re-derived from scratch once TLS merging
-makes the rest of this actually runnable.
+`tests/linux/test_elf_frida_gadget.py`). It now embeds and runs genuinely
+end-to-end on **both** platforms:
+
+- frida-gadget carries its own TLS directory on both PE and ELF (a real
+  `AddressOfCallBacks`-bearing PE TLS directory, a real `PT_TLS` segment
+  with 14 `R_X86_64_DTPMOD64` relocations on ELF) — handled by the TLS
+  merge above rather than rejected.
+- Past that, frida-gadget's documented config-file-driven "Script"
+  interaction (auto-running a JS file on load, no external Frida client
+  needed) runs for real. frida-gadget resolves its own `.config` file by
+  asking the OS which loaded module contains its own running code, then
+  looking next to that module's path (confirmed by reading frida-core's
+  own config-resolution source). Once embedded, that code no longer
+  belongs to a separate module at all — it's part of the host — so that
+  lookup resolves to the *host binary's own* path rather than the
+  gadget's, meaning the config file needs to be named after the host's
+  own filename stem, not the gadget's. With the config named that way,
+  the embedded gadget loads it, runs the configured script, and the
+  script's own `NativeFunction`-wrapped `exit(845)` call genuinely
+  executes — confirmed by actually running the embedded binary (and, on
+  Linux, by tracing it with `strace`).
+- The two platforms report the script's exit code differently, for a
+  reason with nothing to do with staticer or frida-gadget: Windows
+  process exit codes are a full 32-bit `DWORD`
+  (`GetExitCodeProcess`), so the PE test observes `845` directly: POSIX
+  process exit statuses are truncated to the low 8 bits by the kernel
+  itself (`man 2 wait`), so the ELF test observes `845 & 0xFF == 77`
+  instead — both are the same underlying `exit(845)` call, genuinely
+  executed.

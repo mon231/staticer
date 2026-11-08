@@ -120,6 +120,15 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# superpowers SDD scratch workspace (plans/specs/findings/ledgers) --
+# process artifacts, not shipped product; key findings get written up
+# properly into docs/ instead
+/.superpowers/
+
+# per-branch task-status ledger -- session-local scratch, not shipped
+# product; same reasoning as .superpowers/ above
+/PLAN.md
+
 # mypy
 .mypy_cache/
 .dmypy.json

@@ -42,6 +42,7 @@ from .stubs.linux.elf_stub import build_linux_init_array_stub, build_linux_stub
 PT_LOAD = 1
 PT_DYNAMIC = 2
 PT_PHDR = 6
+PT_TLS = 7
 PT_GNU_EH_FRAME = 0x6474E550
 PF_X, PF_W, PF_R = 1, 2, 4
 
@@ -58,6 +59,56 @@ R_COPY = 5  # R_X86_64_COPY / R_386_COPY: copy `st_size` bytes from the definiti
 R_GLOB_DAT = 6
 R_JUMP_SLOT = 7
 R_RELATIVE = 8
+
+# TLS GOT-slot-data-patch relocation type numbers -- UNLIKE every type
+# above, these do NOT share the same numeric value between EM_X86_64 and
+# EM_386 (e.g. R_386_TLS_DTPMOD32 is type 35, not 16), so they're only
+# ever recognized when host_machine == "EM_X86_64" -- see where they're
+# used, further down, for why a 32-bit TLS-bearing dependency just falls
+# through to the ordinary "unsupported relocation type" error instead
+# of being misinterpreted. Per Task 1's findings
+# (.superpowers/findings/2026-11-04-frida-gadget-tls-shape.md), only
+# R_X86_64_DTPMOD64 is ever actually seen in practice (frida-gadget: 14
+# occurrences, 0 DTPOFF64/TPOFF64) -- DTPOFF64/TPOFF64 are handled too,
+# for whatever other TLS-bearing dependency might emit them, but
+# R_X86_64_TLSGD/TLSLD (the call-site General/Local-Dynamic relaxation
+# types, 19/20) are explicitly OUT of this task's scope (phase 2/Task 6).
+R_X86_64_DTPMOD64 = 16
+R_X86_64_DTPOFF64 = 17
+R_X86_64_TPOFF64 = 18
+
+# The call-site General/Local-Dynamic relaxation relocation types
+# (Task 6). Investigated, not guessed: these exist ONLY as a directive
+# from the compiler to the STATIC LINKER inside an unlinked relocatable
+# object file (.o) -- confirmed with `readelf -r` against a `gcc -c`
+# .o built from a source file carrying
+# `__attribute__((tls_model("global-dynamic")))`, which genuinely does
+# emit R_X86_64_TLSGD there. But every linker tried against the *linked*
+# .so built from that same .o (GNU ld/bfd, lld; gold wasn't installed to
+# test but there is no reason to expect it differs -- the ELF TLS ABI
+# itself, not a particular linker's heuristic, requires this) always
+# consumes/resolves the TLSGD/TLSLD relocation at link time and replaces
+# it with an ordinary DTPMOD64/DTPOFF64 GOT-slot pair (what Task 3 above
+# already handles) -- even for the one case that should structurally
+# defeat link-time resolution: a `.so` whose `extern __thread` variable
+# is defined in a wholly different, unlinked shared object (so its
+# module id genuinely cannot be known until load time) still comes out
+# as DTPMOD64/DTPOFF64 against the undefined symbol, never TLSGD/TLSLD.
+# So R_X86_64_TLSGD/TLSLD (and the i386 equivalents, R_386_TLS_GD/
+# R_386_TLS_LDM, including their _PUSH/_CALL/_POP sequence variants)
+# cannot appear in any ELF file `embed()` actually ever opens -- every
+# dependency it processes is already a linked `.so`, never a raw `.o` --
+# regardless of source code shape, compiler flags, or GCC version.
+# Checked for explicitly anyway, right before the generic "unsupported
+# relocation type" fallback, so that IF this analysis is ever wrong -- a future
+# toolchain, a hand-crafted/malicious input, or a target this project
+# doesn't support yet -- the error names the specific relocation type
+# and explains why GD/LD relaxation isn't implemented, instead of the
+# much less specific generic message.
+R_X86_64_TLSGD = 19
+R_X86_64_TLSLD = 20
+R_386_TLS_GD = 18
+R_386_TLS_LDM = 19
 
 _SUPPORTED_MACHINES = ("EM_X86_64", "EM_386")
 
@@ -887,6 +938,23 @@ class ElfEmbedder:
         # under ASLR and a fixed-base dependency's untracked references
         # silently go stale by the same amount the rest of the image moved.
         fixed_base_segments: List[Tuple[int, bytes]] = []  # (X, blob) -- each gets its own new PT_LOAD entry
+        # Set at most once, by whichever embedded dependency turns out to
+        # carry its own PT_TLS segment (X, dep_base, that segment, the
+        # dependency's own name) -- None if no dependency has one, or if
+        # the host already has its own (see `host_has_tls` above; that
+        # case raises instead of reaching this). A *second* TLS-bearing
+        # dependency also raises (merging more than one into a single
+        # combined block needs a real layout/offset-renumbering scheme
+        # phase 1 doesn't implement -- see the per-dependency loop).
+        # Needs its own new PT_PHDR entry exactly like `fixed_base_
+        # segments` does (see the "reserve room for a grown program
+        # header array" block, further down) -- but unlike those, its
+        # *data* is never a separately-placed blob: the dependency's own
+        # TLS bytes are already physically part of its ordinary blob,
+        # appended into `new_sections` (i.e. into `ext`'s own extension)
+        # exactly like the rest of that same dependency, so only a new
+        # *descriptor* pointing into that already-placed data is needed.
+        new_tls_entry: Optional[Tuple[int, int, object, str]] = None
         reserved_ranges: List[Tuple[int, int, str]] = [
             (seg["p_vaddr"], seg["p_vaddr"] + seg["p_memsz"], f"the host image ('{self.input_path}')")
             for seg in host_load_segments
@@ -901,6 +969,17 @@ class ElfEmbedder:
         # share whatever segment-specific skew AT_PHDR's derivation
         # actually keys off) risks landing AT_PHDR on a bogus address.
         all_host_segments = [elf.get_segment(i) for i in range(elf.num_segments())]
+        # Whether the HOST itself already carries its own PT_TLS segment
+        # -- if so, a TLS-bearing dependency's own PT_TLS can't be
+        # adopted as described below (there'd be two real TLS blocks to
+        # merge into one, needing a real combined-layout/offset-
+        # renumbering scheme this phase-1 merge doesn't implement -- see
+        # where this is checked, further down, and
+        # test_host_with_own_tls_directory_fails_loudly's PE sibling for
+        # the same phase-1/phase-2 scope split). This is independent of
+        # `ext`/`ext_idx` below (a TLS-less host's lack of PT_TLS has
+        # nothing to do with which PT_LOAD segment is last in the file).
+        host_has_tls = any(s["p_type"] == "PT_TLS" for s in all_host_segments)
         host_load_indices = [i for i, s in enumerate(all_host_segments) if s["p_type"] == "PT_LOAD"]
         ext_idx = max(host_load_indices, key=lambda i: all_host_segments[i]["p_vaddr"] + all_host_segments[i]["p_memsz"])
         ext = all_host_segments[ext_idx]
@@ -1151,6 +1230,34 @@ class ElfEmbedder:
                 if dep_dyn is None:
                     raise ValueError(f"dependency '{node.name}' has no PT_DYNAMIC segment")
 
+                # This dependency's own PT_TLS segment, if it has one --
+                # see `new_tls_entry`'s own declaration for what adopting
+                # it as the (TLS-less) host's own PT_TLS actually
+                # involves, and the DTPMOD64/DTPOFF64/TPOFF64 relocation
+                # handling just below for why detecting it here, before
+                # that loop runs, matters even though its phdr entry
+                # itself is only built much further down.
+                dep_tls_seg = next(dep.iter_segments(type="PT_TLS"), None)
+                if dep_tls_seg is not None:
+                    if host_has_tls:
+                        raise ValueError(
+                            f"dependency '{node.name}' has its own TLS directory (PT_TLS "
+                            f"segment), but '{self.input_path}' already has one of its own; "
+                            "merging two real TLS directories into one isn't supported yet"
+                        )
+                    if new_tls_entry is not None:
+                        raise ValueError(
+                            f"both '{new_tls_entry[3]}' and '{node.name}' carry their own "
+                            "PT_TLS segment; merging more than one TLS-bearing dependency "
+                            "into a single combined block isn't supported yet (phase 1 scope)"
+                        )
+                    if is_fixed_base:
+                        raise ValueError(
+                            f"dependency '{node.name}' is a fixed-base (non-PIC) ELF object "
+                            "with its own TLS directory; unsupported"
+                        )
+                    new_tls_entry = (X, dep_base, dep_tls_seg, node.name)
+
                 dep_reloc_tables = dep_dyn.get_relocation_tables()
 
                 for key in ("RELA", "REL"):
@@ -1177,6 +1284,165 @@ class ElfEmbedder:
                             _write_int(blob, blob_offset, ptr_size, new_val)
                             new_reloc_entries.append((X + blob_offset, new_val))
                             continue
+                        if host_machine == "EM_X86_64" and rtype in (
+                            R_X86_64_DTPMOD64, R_X86_64_DTPOFF64, R_X86_64_TPOFF64,
+                        ):
+                            # GOT-slot-data-patch TLS relocations (see
+                            # Task 1's findings, this module's module-
+                            # level docstring note above
+                            # R_X86_64_DTPMOD64's own declaration, and
+                            # `new_tls_entry`'s declaration) -- reached
+                            # only once `dep_tls_seg is not None` already
+                            # passed every check above (host_has_tls/
+                            # multiple-TLS-dependency/fixed-base), so a
+                            # dependency that reaches here always has a
+                            # PT_TLS segment of its own, now becoming the
+                            # host's own sole PT_TLS.
+                            #
+                            # Unlike every relocation type handled above,
+                            # none of these three ever need a new runtime
+                            # (R_*_RELATIVE-style) relocation entry of
+                            # their own: both the merged module's id and
+                            # any variable's static offset within the
+                            # combined TLS block are fixed, load-bias-
+                            # independent constants once the dependency
+                            # is no longer an independently-loaded module
+                            # -- they're simply written directly into the
+                            # blob, once, here.
+                            if rtype == R_X86_64_DTPMOD64:
+                                # The real .so (independently loaded) had
+                                # this filled in at load time by ld.so
+                                # with whatever module id *that* load
+                                # happened to assign it (frida-gadget's
+                                # own 14 occurrences are all against
+                                # symbol index 0 -- a "my own module"
+                                # self-relocation, confirmed via `readelf
+                                # -r` against the real downloaded .so).
+                                # Once merged, this dependency's TLS data
+                                # becomes part of the HOST's own static,
+                                # initial TLS block (no separate module/
+                                # dlopen-time registration exists anymore
+                                # -- exactly glibc's own main-executable
+                                # case): glibc's dynamic linker always
+                                # assigns TLS module id 1 to the main
+                                # executable's own PT_TLS (it's the first
+                                # link map `_dl_next_tls_modid` is ever
+                                # called for, in `_dl_start`/`dl_main`'s
+                                # own object-processing order, before any
+                                # DT_NEEDED dependency) -- the id this
+                                # merge creates a brand-new PT_TLS for IS
+                                # that executable's own, so 1 is the
+                                # correct constant here, not a guess.
+                                # Verified for real: the synthetic
+                                # `lib_tls_simple.so`/`main_tls_simple`
+                                # fixture pair (test_elf_tls.py) and the
+                                # real, genuine frida-gadget .so both run
+                                # to their expected results on actual
+                                # Linux (WSL) once this is wired in -- a
+                                # wrong module id would either crash
+                                # inside __tls_get_addr's own dtv lookup
+                                # or silently read back the wrong thread's
+                                # slot, neither of which happens.
+                                #
+                                # Same external-symbol guard as the
+                                # DTPOFF64/TPOFF64 branch below: a
+                                # DTPMOD64 relocation against an
+                                # SHN_UNDEF (external, not-embedded) TLS
+                                # symbol belongs to some OTHER module, not
+                                # this merge's module-id-1 host -- without
+                                # this check, it would silently get
+                                # assigned module id 1 anyway instead of
+                                # failing loudly.
+                                sym_idx = reloc["r_info_sym"]
+                                if sym_idx != 0:
+                                    tls_sym = dep_dyn.get_symbol(sym_idx)
+                                    if tls_sym["st_shndx"] == "SHN_UNDEF":
+                                        raise ValueError(
+                                            f"dependency '{node.name}' has a TLS relocation "
+                                            f"referencing an external (not embedded) TLS "
+                                            f"symbol '{tls_sym.name}'; unsupported"
+                                        )
+                                new_val = 1
+                            else:
+                                sym_idx = reloc["r_info_sym"]
+                                if sym_idx != 0:
+                                    tls_sym = dep_dyn.get_symbol(sym_idx)
+                                    if tls_sym["st_shndx"] == "SHN_UNDEF":
+                                        raise ValueError(
+                                            f"dependency '{node.name}' has a TLS relocation "
+                                            f"referencing an external (not embedded) TLS "
+                                            f"symbol '{tls_sym.name}'; unsupported"
+                                        )
+                                    # An STT_TLS symbol's st_value is
+                                    # already its offset within its own
+                                    # module's TLS block, per the ELF TLS
+                                    # ABI -- unaffected by `delta`/`X`,
+                                    # since adopting this PT_TLS as the
+                                    # host's own moves the whole block's
+                                    # base address, not its own internal
+                                    # layout.
+                                    tls_offset = tls_sym["st_value"]
+                                else:
+                                    tls_offset = 0
+                                addend = reloc["r_addend"] if is_rela else 0
+                                if rtype == R_X86_64_DTPOFF64:
+                                    new_val = (tls_offset + addend) & ptr_mask
+                                else:  # R_X86_64_TPOFF64
+                                    # Initial-Exec model: a direct, fixed
+                                    # %fs-relative offset (ELF TLS ABI
+                                    # variant II: a *negative* offset from
+                                    # the thread pointer, computed from
+                                    # the combined static TLS block's own
+                                    # total size) -- genuinely needs that
+                                    # real static-TLS-layout computation,
+                                    # which this phase-1 merge doesn't
+                                    # implement (Task 1's findings: zero
+                                    # occurrences in frida-gadget, and the
+                                    # synthetic fixture built for this
+                                    # task doesn't produce any either --
+                                    # see test_elf_tls.py). Failing loudly
+                                    # here is strictly better than writing
+                                    # a plausible-looking but wrong offset.
+                                    raise ValueError(
+                                        f"dependency '{node.name}' has an R_X86_64_TPOFF64 "
+                                        "TLS relocation; this phase-1 merge doesn't support "
+                                        "the Initial-Exec TLS model yet"
+                                    )
+                            _write_int(blob, blob_offset, ptr_size, new_val)
+                            continue
+                        is_tlsgd_or_tlsld = (
+                            (host_machine == "EM_X86_64" and rtype in (R_X86_64_TLSGD, R_X86_64_TLSLD))
+                            or (host_machine == "EM_386" and rtype in (R_386_TLS_GD, R_386_TLS_LDM))
+                        )
+                        if is_tlsgd_or_tlsld:
+                            # See R_X86_64_TLSGD's own declaration above
+                            # (Task 6) for the investigation backing this:
+                            # a linked .so can never actually carry this
+                            # relocation type (the static linker always
+                            # consumes/resolves it, replacing it with an
+                            # ordinary DTPMOD64/DTPOFF64 GOT-slot pair,
+                            # handled above) -- reaching this line means
+                            # either a hand-crafted/malicious input, or an
+                            # assumption here turning out wrong for some
+                            # future toolchain. Named explicitly rather
+                            # than falling into the generic "unsupported
+                            # relocation type" message below: General/
+                            # Local-Dynamic TLS call-site relaxation
+                            # (rewriting the `lea ...@tlsgd; call
+                            # __tls_get_addr` sequence into a direct
+                            # thread-pointer-relative access) is not
+                            # implemented.
+                            gd_ld_names = (
+                                "R_X86_64_TLSGD/TLSLD"
+                                if host_machine == "EM_X86_64"
+                                else "R_386_TLS_GD/TLS_LDM"
+                            )
+                            raise ValueError(
+                                f"dependency '{node.name}' has an {gd_ld_names} "
+                                f"(type {rtype}) call-site General/Local-Dynamic TLS "
+                                "relocation; GD/LD instruction-sequence relaxation is not "
+                                "implemented (see docs/limitations.md)"
+                            )
                         if rtype not in (R_ABS_PLUS_ADDEND, R_GLOB_DAT):
                             raise ValueError(
                                 f"unsupported relocation type {rtype} in dependency '{node.name}'"
@@ -1886,9 +2152,18 @@ class ElfEmbedder:
         #    zero-filled placeholder goes here for now and gets overwritten
         #    in place, once that size is known, right before this method
         #    returns.
-        if fixed_base_segments:
+        # A brand-new PT_TLS entry (see `new_tls_entry`'s own declaration)
+        # needs exactly the same program-header-array growth as a
+        # fixed-base dependency's own new PT_LOAD entry does -- one more
+        # slot in the grown array, reserved the same way -- even though,
+        # unlike `fixed_base_segments`, its own *data* never needs a
+        # separately-placed blob (see further down, where the array
+        # itself is actually built, for where that one difference shows
+        # up).
+        _extra_phdr_entries = len(fixed_base_segments) + (1 if new_tls_entry is not None else 0)
+        if _extra_phdr_entries:
             old_phnum = elf.num_segments()
-            new_phnum = old_phnum + len(fixed_base_segments)
+            new_phnum = old_phnum + _extra_phdr_entries
             phdr_array_size = new_phnum * elf["e_phentsize"]
             phdr_array_vaddr = next_vaddr
             new_sections.append((phdr_array_vaddr, b"\x00" * phdr_array_size))
@@ -2017,7 +2292,7 @@ class ElfEmbedder:
                         f"image (grown to {hex(ext_final_lo)}-{hex(ext_final_hi)})"
                     )
 
-        if not fixed_base_segments:
+        if not _extra_phdr_entries:
             entry_off = elf["e_phoff"] + ext_idx * elf["e_phentsize"]
             raw[entry_off:entry_off + len(extended_entry)] = extended_entry
             if eh_hdr_update is not None:
@@ -2094,6 +2369,30 @@ class ElfEmbedder:
                 raw.extend(blob)
                 new_array += _pack_phdr(is64, PT_LOAD, PF_R | PF_W | PF_X, offset, X, X, len(blob), len(blob), _PAGE)
 
+            # The new PT_TLS entry (see `new_tls_entry`'s own
+            # declaration): unlike `fixed_base_segments` just above, its
+            # data is never appended here -- it's already physically
+            # present, as part of its owning dependency's own ordinary
+            # blob, somewhere inside `ext`'s own just-finished extension
+            # (that dependency was never a fixed-base node -- see where
+            # `new_tls_entry` is set, which raises instead for that case
+            # -- so its blob went through the ordinary `new_sections`
+            # path, not `fixed_base_segments`). Only a descriptor,
+            # pointing at that already-placed data, is needed: its own
+            # vaddr shifted by the same `tls_X - tls_dep_base` delta
+            # every other part of that dependency's blob already got,
+            # and a file offset keeping `ext_skew` (same skew as every
+            # other entry inside `ext`'s extension, including this very
+            # placeholder) so AT_PHDR's computation stays correct.
+            if new_tls_entry is not None:
+                tls_X, tls_dep_base, dep_tls_seg, _tls_dep_name = new_tls_entry
+                tls_vaddr = tls_X + (dep_tls_seg["p_vaddr"] - tls_dep_base)
+                tls_file_offset = tls_vaddr - ext_skew
+                new_array += _pack_phdr(
+                    is64, PT_TLS, dep_tls_seg["p_flags"], tls_file_offset, tls_vaddr, tls_vaddr,
+                    dep_tls_seg["p_filesz"], dep_tls_seg["p_memsz"], dep_tls_seg["p_align"],
+                )
+
             if len(new_array) != phdr_array_size:
                 raise ValueError("internal error: grown ELF program header array size mismatch")
             raw[placeholder_file_offset:placeholder_file_offset + len(new_array)] = new_array
@@ -2112,7 +2411,7 @@ class ElfEmbedder:
             e_phoff_off = 16 + 2 + 2 + 4 + ptr_size
             e_phnum_off = e_phoff_off + ptr_size * 2 + 4 + 2 + 2
             _write_int(raw, e_phoff_off, ptr_size, placeholder_file_offset)
-            _write_int(raw, e_phnum_off, 2, old_phnum + len(fixed_base_segments))
+            _write_int(raw, e_phnum_off, 2, old_phnum + _extra_phdr_entries)
 
         # e_entry is overwritten to point at the generated stub only when
         # one was actually built as an EXE/PIE-exe entrypoint stub

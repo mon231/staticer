@@ -102,23 +102,23 @@ def test_self_contained_throw_in_embedded_dll(tmp_path, c_compiler):
     (rather than returncode 42) under GCC/MinGW, B4 is the first thing to
     re-check.
 
-    Under MSVC this is skipped, not asserted -- see this module's UPDATE 2
-    note: MSVC's (at least 14.5x/VS2026's) __CxxFrameHandler4 state tables
-    embed further, undocumented, version-specific inline data of their own
-    that this project's unwind-info relocation does not (and, without
-    reverse-engineering that private format, cannot) fix up, so this
-    reliably crashes under MSVC. Confirmed by real execution against a
-    bootstrapped MSVC x64 toolchain, not assumed."""
-    if c_compiler[0] == "msvc":
-        pytest.skip(
-            "self-contained throw/catch inside an embedded MSVC-built DLL "
-            "is a confirmed-real, out-of-scope limitation (MSVC's "
-            "__CxxFrameHandler4 state tables embed further undocumented "
-            "RVA/offset-relative data this project's unwind-info "
-            "relocation doesn't parse) -- see this module's UPDATE 2 note; "
-            "not a missing-fix, re-test only if that format is ever "
-            "reverse-engineered and handled"
-        )
+    UPDATE 3 (MSVC __CxxFrameHandler4 FuncInfo4 relocation): the MSVC skip
+    this test used to have is gone -- _adjust_unwind_info
+    (staticer/pe_embedder.py) now also relocates __CxxFrameHandler4's own
+    further data. Reverse-engineered for real against a bootstrapped MSVC
+    x64 toolchain: MSVC ships its own on-disk-format reference for this
+    (``ehdata4_export.h``, under ``VC/Tools/MSVC/<ver>/include/`` alongside
+    cl.exe itself), cross-checked against ``dumpbin /unwindinfo``,
+    ``dumpbin /relocations`` on several deliberately differently-shaped
+    freshly-compiled EH functions, and a tiny harness calling MSVC's own
+    ``FH4::DecompFuncInfo`` directly -- see
+    ``_adjust_cxx_frame_handler4_funcinfo``'s docstring for the full
+    finding. UPDATE 2's root cause (the undocumented-looking DWORD right
+    after the handler RVA) turned out to be a real, fully-documented-by-
+    MSVC-itself field: an RVA to a separately-comdat'd FuncInfo4 blob,
+    itself containing the state-table RVAs (UnwindMap actions,
+    TryBlockMap handler-array pointers, HandlerMap catch/RTTI/
+    continuation addresses) that needed relocating."""
     dll = build_shared_lib(
         tmp_path, FIXTURES / "exc_lib_selfcontained.c", "exc_sc.dll", pic=True, bits=64, cpp=True,
     )

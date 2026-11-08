@@ -1,3 +1,4 @@
 firstclass<0.3
 pefile
 pyelftools
+keystone-engine

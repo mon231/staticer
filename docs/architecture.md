@@ -59,3 +59,22 @@ done by reading and rewriting the binary format directly:
 The only place a C compiler is used anywhere in this project is to build
 the tiny synthetic test fixtures the test suite compiles on the fly — a
 test/CI-time concern, not something the installed package ever invokes.
+
+## The one deliberate exception: `keystone-engine`
+
+Both generated entrypoint stubs (`staticer/stubs/windows/pe_stub.py`,
+`staticer/stubs/linux/elf_stub.py`) are assembled from real x86/x86-64
+assembly text via [Keystone](https://www.keystone-engine.org/)
+(`keystone-engine` on PyPI) rather than hand-encoded as raw opcode byte
+literals. This is a deliberate, explicit exception to the "pure Python,
+no compiled C extensions" rule above — the same rule that excluded
+`lief` early in this project's history — since `keystone-engine` ships a
+compiled assembler engine under its Python bindings. It does not,
+however, reintroduce the "needs a C toolchain" problem that rule exists
+to prevent: `keystone-engine` publishes prebuilt wheels (confirmed:
+`manylinux1_x86_64` and `win_amd64`, among
+others) with the compiled engine already bundled, so installing it —
+like `pefile`/`pyelftools` — never requires the end user to have a C
+compiler. Its use is scoped narrowly: only for assembling the small,
+fixed, generated entrypoint stubs on both the PE and ELF sides, never
+for anything else in the embedding pipeline.

@@ -63,6 +63,76 @@ a non-empty set.
 
 from typing import List, Set, Tuple
 
+from staticer.stubs._keystone_utils import assemble as _assemble
+from staticer.stubs._keystone_utils import assemble_with_immediate as _assemble_with_immediate
+
+# -- assembling via Keystone instead of hand-encoded opcode bytes --
+#
+# This module used to spell out every instruction as raw hex literals
+# (`b"\x48\xB8"` for "mov rax, imm64", etc.) with a comment naming the
+# mnemonic next to each one. That's now inverted: the mnemonics below are
+# real x86/x86-64 assembly text, assembled by Keystone
+# (https://www.keystone-engine.org/) into the actual bytes. This is a
+# deliberate, explicit exception to this project's otherwise-strict
+# "pure Python, no compiled C extensions" rule (the same rule that
+# excluded `lief` early in this project's history) -- `keystone-engine`
+# ships a compiled assembler engine under its Python bindings. See
+# `docs/architecture.md` for why this specific exception was made and
+# why it doesn't compromise the "no C toolchain required to install or
+# run this project" property that rule exists to protect.
+#
+# None of this module's instruction sequences are long enough to
+# justify a separate `.asm` file -- they're inlined as short strings
+# below -- but each one is still written as its own named helper so a
+# future, longer stub could reasonably grow into one without disturbing
+# this structure.
+#
+# The actual Keystone-engine caching, assembly, and sentinel locate/
+# splice mechanics (`assemble`/`assemble_with_immediate` above) are not
+# defined in this module -- they live in
+# `staticer/stubs/_keystone_utils.py`, shared with the Windows (PE) stub
+# builder (`staticer/stubs/windows/pe_stub.py`), which independently
+# arrived at the same mechanism. Only the platform-specific assembly
+# mnemonics/registers for the SysV calling convention, and this module's
+# own sentinel constants, stay here.
+#
+# Sentinel immediates used only to *locate* an instruction's own
+# immediate-operand bytes within Keystone's assembled output -- never
+# actually written into a returned stub. Chosen to be maximally
+# distinctive (no repeated byte, nothing resembling a plausible VA) so
+# their own little-endian byte pattern cannot plausibly recur anywhere
+# else in the same handful of instructions.
+_SENTINEL_64 = 0x1122334455667788
+_SENTINEL_32 = 0x11223344
+
+# Cross-sentinel collision -- not applicable here: unlike pe_stub.py's
+# `_x64_call_dllmain`/etc (which assemble a *single* sequence containing
+# *two* independent VA sentinels, then must patch both against the same
+# pristine buffer -- see `_keystone_utils.patch_two_va_sentinels`), every
+# immediate this module emits (one per init call, plus the tail jump) is
+# assembled, located, and spliced by its own, separate `_assemble_with_imm`
+# call -- see `emit_call`/`emit_tail_jmp_via_cx` below -- before being
+# concatenated onto the growing stub. Each buffer `_assemble_with_imm`
+# touches holds exactly one sentinel at a time and is fully patched before
+# the next one is ever assembled, so there is never a second, still-live
+# sentinel left in a buffer for an already-applied splice to collide
+# with. This was verified by inspection of every call site below (`emit_call`,
+# `emit_tail_jmp_via_cx`, and `build_linux_init_array_stub`'s own
+# `emit_call`), not assumed -- if a future change to this module ever
+# assembles two sentinels into one shared buffer before patching either,
+# it must switch that call site to `_keystone_utils.patch_two_va_sentinels`
+# instead.
+
+
+def _assemble_with_imm(is64: bool, asm_template: str, addr: int) -> Tuple[bytes, int]:
+    """Thin wrapper choosing this module's own 64-/32-bit sentinel for
+    `_keystone_utils.assemble_with_immediate` -- see the module-level
+    comment above for why no cross-sentinel-collision handling is needed
+    here."""
+    ptr_size = 8 if is64 else 4
+    sentinel = _SENTINEL_64 if is64 else _SENTINEL_32
+    return _assemble_with_immediate(is64, asm_template, sentinel, ptr_size, addr)
+
 
 def build_linux_init_array_stub(*, is64: bool, init_calls: List[int]) -> Tuple[bytes, List[int]]:
     """B6-ELF: the ``.so``-as-input counterpart of ``build_linux_stub``.
@@ -107,37 +177,39 @@ def build_linux_init_array_stub(*, is64: bool, init_calls: List[int]) -> Tuple[b
     reloc_offsets: List[int] = []
     out = bytearray()
 
+    # "mov rax/eax, {imm}; call rax/eax" -- {imm} is filled in per-call via
+    # _assemble_with_imm, which also reports the immediate's byte offset.
+    call_template = "mov rax, {imm}\ncall rax" if is64 else "mov eax, {imm}\ncall eax"
+
     def emit_call(addr: int) -> None:
-        if is64:
-            reloc_offsets.append(len(out) + 2)  # +2: past "mov rax," opcode bytes
-            out.extend(b"\x48\xB8")  # mov rax, imm64
-            out.extend(addr.to_bytes(8, "little"))
-            out.extend(b"\xFF\xD0")  # call rax
-        else:
-            reloc_offsets.append(len(out) + 1)  # +1: past "mov eax," opcode byte
-            out.extend(b"\xB8")  # mov eax, imm32
-            out.extend(addr.to_bytes(4, "little"))
-            out.extend(b"\xFF\xD0")  # call eax
+        code, imm_offset = _assemble_with_imm(is64, call_template, addr)
+        reloc_offsets.append(len(out) + imm_offset)
+        out.extend(code)
 
     if is64:
-        out.extend(b"\x41\x54")  # push r12  (save caller's r12 -- callee-saved under SysV x86-64)
-        out.extend(b"\x49\x89\xE4")  # mov r12, rsp  (remember our own restore point)
-        out.extend(b"\x48\x83\xE4\xF0")  # and rsp, -16  (defensive call-site realignment)
+        # push r12  (save caller's r12 -- callee-saved under SysV x86-64)
+        # mov r12, rsp  (remember our own restore point)
+        # and rsp, -16  (defensive call-site realignment)
+        out.extend(_assemble(is64, "push r12\nmov r12, rsp\nand rsp, -16"))
     else:
-        out.extend(b"\x57")  # push edi  (save caller's edi -- callee-saved under cdecl)
-        out.extend(b"\x89\xE7")  # mov edi, esp  (remember our own restore point)
-        out.extend(b"\x83\xE4\xF0")  # and esp, -16  (defensive call-site realignment)
+        # push edi  (save caller's edi -- callee-saved under cdecl)
+        # mov edi, esp  (remember our own restore point)
+        # and esp, -16  (defensive call-site realignment)
+        out.extend(_assemble(is64, "push edi\nmov edi, esp\nand esp, -16"))
 
     for addr in init_calls:
         emit_call(addr)
 
     if is64:
-        out.extend(b"\x4C\x89\xE4")  # mov rsp, r12  (restore our own restore point)
-        out.extend(b"\x41\x5C")  # pop r12  (restore caller's r12)
+        # mov rsp, r12  (restore our own restore point)
+        # pop r12  (restore caller's r12)
+        # ret  (ordinary return to _dl_init)
+        out.extend(_assemble(is64, "mov rsp, r12\npop r12\nret"))
     else:
-        out.extend(b"\x89\xFC")  # mov esp, edi  (restore our own restore point)
-        out.extend(b"\x5F")  # pop edi  (restore caller's edi)
-    out.extend(b"\xC3")  # ret  (ordinary return to _dl_init)
+        # mov esp, edi  (restore our own restore point)
+        # pop edi  (restore caller's edi)
+        # ret  (ordinary return to _dl_init)
+        out.extend(_assemble(is64, "mov esp, edi\npop edi\nret"))
 
     return bytes(out), reloc_offsets
 
@@ -245,38 +317,31 @@ def build_linux_stub(
     out = bytearray()
     ptr_size = 8 if is64 else 4
 
+    # "mov rax/eax, {imm}; call rax/eax" -- {imm} is filled in per-call via
+    # _assemble_with_imm, which also reports the immediate's byte offset.
+    call_template = "mov rax, {imm}\ncall rax" if is64 else "mov eax, {imm}\ncall eax"
+
     def emit_call(addr: int) -> None:
-        if is64:
-            reloc_offsets.append(len(out) + 2)  # +2: past the "mov rax," opcode bytes
-            out.extend(b"\x48\xB8")  # mov rax, imm64
-            out.extend(addr.to_bytes(8, "little"))
-            out.extend(b"\xFF\xD0")  # call rax
-        else:
-            reloc_offsets.append(len(out) + 1)  # +1: past the "mov eax," opcode byte
-            out.extend(b"\xB8")  # mov eax, imm32
-            out.extend(addr.to_bytes(4, "little"))
-            out.extend(b"\xFF\xD0")  # call eax
+        code, imm_offset = _assemble_with_imm(is64, call_template, addr)
+        reloc_offsets.append(len(out) + imm_offset)
+        out.extend(code)
+
+    # "mov rcx/ecx, {imm}; jmp rcx/ecx" -- deliberately NOT the same
+    # "mov eax/rax, imm; jmp eax/rax" shape emit_call uses -- eax/rax is
+    # where this function's *own* restore of the ld.so-provided
+    # rtld_fini register lands (see the big comment below), immediately
+    # before this jump; clobbering it again right here to hold the jump
+    # target would silently discard that restore one instruction before
+    # it would have mattered. ecx/rcx is free (nothing else in this
+    # stub's tail still needs it) and ABI-irrelevant for a jump (unlike
+    # eax/rax, it's not where any incoming-register convention expects
+    # anything).
+    tail_jmp_template = "mov rcx, {imm}\njmp rcx" if is64 else "mov ecx, {imm}\njmp ecx"
 
     def emit_tail_jmp_via_cx(addr: int) -> None:
-        # Deliberately NOT the same "mov eax/rax, imm; jmp eax/rax" shape
-        # emit_call uses -- eax/rax is where this function's *own* restore
-        # of the ld.so-provided rtld_fini register lands (see the big
-        # comment below), immediately before this jump; clobbering it
-        # again right here to hold the jump target would silently discard
-        # that restore one instruction before it would have mattered.
-        # ecx/rcx is free (nothing else in this stub's tail still needs
-        # it) and ABI-irrelevant for a jump (unlike eax/rax, it's not
-        # where any incoming-register convention expects anything).
-        if is64:
-            reloc_offsets.append(len(out) + 2)
-            out.extend(b"\x48\xB9")  # mov rcx, imm64
-            out.extend(addr.to_bytes(8, "little"))
-            out.extend(b"\xFF\xE1")  # jmp rcx
-        else:
-            reloc_offsets.append(len(out) + 1)
-            out.extend(b"\xB9")  # mov ecx, imm32
-            out.extend(addr.to_bytes(4, "little"))
-            out.extend(b"\xFF\xE1")  # jmp ecx
+        code, imm_offset = _assemble_with_imm(is64, tail_jmp_template, addr)
+        reloc_offsets.append(len(out) + imm_offset)
+        out.extend(code)
 
     # -- stack realignment around the call sequence --
     #
@@ -350,23 +415,27 @@ def build_linux_stub(
     # %eax/%rax again for its own purposes (see emit_tail_jmp_via_cx) --
     # immediately ahead of the tail-jump to original_entry.
     if is64:
-        out.extend(b"\x49\x89\xE7")  # mov r15, rsp  (save; r15 is callee-saved)
-        out.extend(b"\x48\x89\xD3")  # mov rbx, rdx  (save rtld_fini; rbx is callee-saved)
-        out.extend(b"\x48\x83\xE4\xF0")  # and rsp, -16  (-> rsp == 0 (mod 16), correct pre-call)
+        # mov r15, rsp  (save; r15 is callee-saved)
+        # mov rbx, rdx  (save rtld_fini; rbx is callee-saved)
+        # and rsp, -16  (-> rsp == 0 (mod 16), correct pre-call)
+        out.extend(_assemble(is64, "mov r15, rsp\nmov rbx, rdx\nand rsp, -16"))
     else:
-        out.extend(b"\x89\xE7")  # mov edi, esp  (save; edi is callee-saved under cdecl)
-        out.extend(b"\x89\xD6")  # mov esi, edx  (save rtld_fini; esi is callee-saved)
-        out.extend(b"\x83\xE4\xF0")  # and esp, -16  (-> esp == 0 (mod 16), correct pre-call)
+        # mov edi, esp  (save; edi is callee-saved under cdecl)
+        # mov esi, edx  (save rtld_fini; esi is callee-saved)
+        # and esp, -16  (-> esp == 0 (mod 16), correct pre-call)
+        out.extend(_assemble(is64, "mov edi, esp\nmov esi, edx\nand esp, -16"))
 
     for addr in init_calls:
         emit_call(addr)
 
     if is64:
-        out.extend(b"\x48\x89\xDA")  # mov rdx, rbx  (restore rtld_fini)
-        out.extend(b"\x4C\x89\xFC")  # mov rsp, r15  (restore stack pointer)
+        # mov rdx, rbx  (restore rtld_fini)
+        # mov rsp, r15  (restore stack pointer)
+        out.extend(_assemble(is64, "mov rdx, rbx\nmov rsp, r15"))
     else:
-        out.extend(b"\x89\xF2")  # mov edx, esi  (restore rtld_fini)
-        out.extend(b"\x89\xFC")  # mov esp, edi  (restore stack pointer)
+        # mov edx, esi  (restore rtld_fini)
+        # mov esp, edi  (restore stack pointer)
+        out.extend(_assemble(is64, "mov edx, esi\nmov esp, edi"))
 
     emit_tail_jmp_via_cx(original_entry)
 

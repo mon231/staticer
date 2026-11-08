@@ -9,7 +9,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest migrated to 26.04, which actions/setup-python has no
+    # 3.9 build for; pin 22.04 so the declared python_requires>=3.9 floor
+    # in setup.py is still actually exercised, not silently dropped.
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ["3.9", "3.13"]

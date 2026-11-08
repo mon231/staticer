@@ -7,7 +7,7 @@ import pytest
 
 from conftest import FIXTURES, build_exe, build_shared_lib
 
-from staticer.pe_embedder import PortableExecutableEmbedder
+from staticer.pe_embedder import PortableExecutableEmbedder, list_pe_imports
 
 pytestmark = pytest.mark.skipif(platform.system() != "Windows", reason="PE embedding is Windows-only")
 
@@ -77,11 +77,16 @@ def test_base_address_conflict_inside_alignment_gap_filler_fails_loudly(tmp_path
     range) is just as real a collision as any other, and must be rejected
     the same way.
 
-    `main_two_libs.c` calls `lib_value()` then `lib_b_value()`, but
-    `list_pe_imports`/`embed_order` process `lib_b.dll` before `lib.dll`
-    for this fixture (confirmed empirically) -- so `lib_b.dll` gets the
-    far address (creating the wide filler) and `lib.dll` gets the address
-    that lands inside it.
+    `main_two_libs.c` calls `lib_value()` then `lib_b_value()`; which of
+    `lib.dll`/`lib_b.dll` the linker lists first in the host's own import
+    table (and so which `list_pe_imports`/`embed_order` process first)
+    isn't guaranteed stable across linkers/toolchain versions -- confirmed
+    via a real CI run where it flipped from what local testing had seen,
+    silently turning this regression test into a no-op (neither dependency's
+    address collided with anything, so `embed()` raised nothing). Query the
+    host's own actual import order instead of hardcoding which name is
+    "first", so the far/wide-filler address always lands on whichever
+    dependency the real embed() processes first, regardless of toolchain.
     """
     dll_a = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=False, bits=bits, strip_relocs=True)
     dll_b = build_shared_lib(tmp_path, FIXTURES / "lib_b.c", "lib_b.dll", pic=False, bits=bits, strip_relocs=True)
@@ -91,13 +96,17 @@ def test_base_address_conflict_inside_alignment_gap_filler_fails_loudly(tmp_path
     exe_image_base = exe_pe.OPTIONAL_HEADER.ImageBase
     exe_pe.close()
 
-    # lib_b.dll (processed first) gets a far address -- wide enough that
-    # the gap between the host's own sections and it needs a filler --
-    # and lib.dll (processed second) gets an address inside that filler's
-    # range, well clear of both the host's own range and lib_b.dll's own
-    # data range.
-    _set_pe_image_base(dll_b, exe_image_base + 0x40000000)
-    _set_pe_image_base(dll_a, exe_image_base + 0x20000000)
+    # Whichever of lib.dll/lib_b.dll the host's own import table lists
+    # first is the one embed_order() processes first -- give *that* one
+    # the far address (wide enough to need a filler bridging the gap from
+    # the host's own sections) and the other the address that lands
+    # inside that filler's range, well clear of both the host's own range
+    # and the first dependency's own data range.
+    import_order = [name.lower() for name in list_pe_imports(exe)]
+    dlls_by_name = {"lib.dll": dll_a, "lib_b.dll": dll_b}
+    first_name, second_name = sorted(dlls_by_name, key=lambda n: import_order.index(n))
+    _set_pe_image_base(dlls_by_name[first_name], exe_image_base + 0x40000000)
+    _set_pe_image_base(dlls_by_name[second_name], exe_image_base + 0x20000000)
 
     with pytest.raises(ValueError):
         PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), tmp_path).embed()
