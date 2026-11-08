@@ -1390,24 +1390,28 @@ class ElfEmbedder:
                                 else:  # R_X86_64_TPOFF64
                                     # Initial-Exec model: a direct, fixed
                                     # %fs-relative offset (ELF TLS ABI
-                                    # variant II: a *negative* offset from
-                                    # the thread pointer, computed from
-                                    # the combined static TLS block's own
-                                    # total size) -- genuinely needs that
-                                    # real static-TLS-layout computation,
-                                    # which this phase-1 merge doesn't
-                                    # implement (Task 1's findings: zero
-                                    # occurrences in frida-gadget, and the
-                                    # synthetic fixture built for this
-                                    # task doesn't produce any either --
-                                    # see test_elf_tls.py). Failing loudly
-                                    # here is strictly better than writing
-                                    # a plausible-looking but wrong offset.
-                                    raise ValueError(
-                                        f"dependency '{node.name}' has an R_X86_64_TPOFF64 "
-                                        "TLS relocation; this phase-1 merge doesn't support "
-                                        "the Initial-Exec TLS model yet"
-                                    )
+                                    # variant II, x86-64 TLS_TCB_AT_TP):
+                                    # since this dependency's PT_TLS
+                                    # becomes the sole (module-1) PT_TLS
+                                    # once merged (host_has_tls/second-
+                                    # TLS-dependency are already rejected
+                                    # above), the static block sits
+                                    # immediately below the thread
+                                    # pointer with no other module ahead
+                                    # of it, so the offset is a fixed,
+                                    # load-bias-independent constant:
+                                    # (symbol's own module-relative
+                                    # st_value + addend) minus the whole
+                                    # block's own page/align-rounded
+                                    # size. Confirmed empirically (not
+                                    # just derived from the ABI docs)
+                                    # against a real glibc process's
+                                    # actual %fs-relative address for a
+                                    # single-module Initial-Exec
+                                    # variable -- see
+                                    # test_initial_exec_tls_dependency_merges_into_tls_less_host.
+                                    block_size = _align_up(dep_tls_seg["p_memsz"], dep_tls_seg["p_align"])
+                                    new_val = (tls_offset + addend - block_size) & ptr_mask
                             _write_int(blob, blob_offset, ptr_size, new_val)
                             continue
                         is_tlsgd_or_tlsld = (

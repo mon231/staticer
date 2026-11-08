@@ -77,6 +77,34 @@ def test_host_with_own_tls_directory_fails_loudly(tmp_path, c_compiler):
         ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
 
 
+def test_initial_exec_tls_dependency_merges_into_tls_less_host(tmp_path, c_compiler):
+    """R_X86_64_TPOFF64 (Initial-Exec TLS model): a dependency carrying a
+    `__thread` variable compiled under `tls_model("initial-exec")` emits
+    a GOTTPOFF/TPOFF64 relocation instead of the General-Dynamic
+    DTPMOD64/DTPOFF64 pair every other TLS fixture in this suite uses.
+    Once merged, the dependency's PT_TLS becomes the sole (module-1)
+    PT_TLS, so the real static-TLS offset is a fixed, load-bias-
+    independent constant: the ELF TLS ABI's variant II layout places
+    module 1's own block immediately below the thread pointer, so the
+    offset is (symbol's own st_value + addend) - roundup(combined
+    p_memsz, p_align) -- confirmed empirically (not just derived) against
+    a real glibc process's actual %fs-relative address for a single-
+    module Initial-Exec variable. A wrong offset would read/write an
+    unrelated memory location instead of the counter, and very likely
+    not read back 3."""
+    so = build_shared_lib(tmp_path, FIXTURES / "lib_tls_ie.c", "lib_tls_ie.so", pic=True, bits=64)
+    exe = build_exe(tmp_path, FIXTURES / "main_tls_ie.c", "main_tls_ie", [so], pic=True, bits=64)
+    out = tmp_path / "static_tls_ie"
+
+    ElfEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+    out.chmod(0o755)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 3, (
+        f"embedded Initial-Exec TLS counter didn't read back 3; stderr={result.stderr!r}"
+    )
+
+
 def _patch_dtpmod64_to_tlsgd(so_path):
     """Rewrite the type field of the first R_X86_64_DTPMOD64 (16)
     relocation entry found in `so_path`'s own .rela.dyn into
