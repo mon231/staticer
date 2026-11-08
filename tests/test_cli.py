@@ -120,6 +120,30 @@ def test_main_reports_clean_error_on_truncated_elf(tmp_path, capsys):
     assert err.strip() and "Traceback" not in err
 
 
+def test_main_rejects_same_input_and_output_path(tmp_path, capsys):
+    p = tmp_path / "x.exe"
+    p.write_bytes(b"MZ" + b"\x00" * 100)
+
+    code = main([str(p), "-o", str(p)])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "same" in err.lower() and "Traceback" not in err
+    # Must not have touched the file.
+    assert p.read_bytes() == b"MZ" + b"\x00" * 100
+
+
+def test_main_rejects_same_input_and_output_path_different_spelling(tmp_path, capsys):
+    p = tmp_path / "x.exe"
+    p.write_bytes(b"MZ" + b"\x00" * 100)
+
+    code = main([str(p), "-o", str(tmp_path / "." / "x.exe")])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "same" in err.lower()
+
+
 def test_main_overwrites_existing_output(tmp_path, monkeypatch):
     out = tmp_path / "out.exe"
     out.write_bytes(b"old")

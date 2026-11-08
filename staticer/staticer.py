@@ -52,6 +52,10 @@ def sniff_format(path: Path) -> Literal["pe", "elf"]:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
+    if args.input.resolve() == args.output.resolve():
+        print(f'error: input and output must not be the same path ({args.output})', file=sys.stderr)
+        return 1
+
     try:
         fmt = sniff_format(args.input)
 
