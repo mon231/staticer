@@ -180,3 +180,86 @@ def test_tls_merge_when_host_already_has_its_own_tls_directory(tmp_path, c_compi
         f"expected host_counter(7)*1000 + dep_tls_counter(5) == 7005, got "
         f"{result.returncode}; stderr={result.stderr!r}"
     )
+
+
+def test_two_tls_dependencies_merge_into_tls_less_host(tmp_path, c_compiler):
+    """N-way generalization (removal of the former 'more than one
+    dependency' cap): a TLS-less host importing *two* independently
+    TLS-bearing dependencies in the same embed() run must no longer raise,
+    and each dependency's own TLS slot must read back correctly and
+    independently -- a merge bug that aliases the two onto the same
+    storage would leak dep_a's bumps into dep_b's count and change the
+    result (see main_two_tls_deps.c's own comment for exactly why 3007 is
+    the only value a correct, non-aliasing merge can produce)."""
+    dll_a = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep_a.c", "lib_tls_dep_a.dll", pic=True, bits=64)
+    dll_b = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep_b.c", "lib_tls_dep_b.dll", pic=True, bits=64)
+    exe = build_exe(
+        tmp_path, FIXTURES / "main_two_tls_deps.c", "main_two_tls_deps.exe", [dll_a, dll_b], pic=True, bits=64,
+    )
+    out = tmp_path / "static_two_tls_deps.exe"
+
+    PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
+    assert "lib_tls_dep_a.dll" not in list_pe_imports(out)
+    assert "lib_tls_dep_b.dll" not in list_pe_imports(out)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 3007, (
+        f"expected dep_a_final(3)*1000 + dep_b_final(7) == 3007, got "
+        f"{result.returncode}; stderr={result.stderr!r}"
+    )
+
+
+def test_three_tls_dependencies_merge_into_tls_less_host(tmp_path, c_compiler):
+    """Stronger non-aliasing proof than the two-dependency case above:
+    three independently TLS-bearing dependencies embedded into the same
+    TLS-less host, each bumped a different number of times. Any pairwise
+    or three-way aliasing bug in the N-way chained merge changes the
+    packed result (see main_three_tls_deps.c's own comment)."""
+    dll_a = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep_a.c", "lib_tls_dep_a.dll", pic=True, bits=64)
+    dll_b = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep_b.c", "lib_tls_dep_b.dll", pic=True, bits=64)
+    dll_c = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep_c.c", "lib_tls_dep_c.dll", pic=True, bits=64)
+    exe = build_exe(
+        tmp_path, FIXTURES / "main_three_tls_deps.c", "main_three_tls_deps.exe",
+        [dll_a, dll_b, dll_c], pic=True, bits=64,
+    )
+    out = tmp_path / "static_three_tls_deps.exe"
+
+    PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
+    assert "lib_tls_dep_a.dll" not in list_pe_imports(out)
+    assert "lib_tls_dep_b.dll" not in list_pe_imports(out)
+    assert "lib_tls_dep_c.dll" not in list_pe_imports(out)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 3007011, (
+        f"expected dep_a_final(3)*1e6 + dep_b_final(7)*1000 + dep_c_final(11) "
+        f"== 3007011, got {result.returncode}; stderr={result.stderr!r}"
+    )
+
+
+def test_host_own_tls_plus_two_tls_dependencies_three_way_merge(tmp_path, c_compiler):
+    """The three-way merge: the HOST already carries its own TLS
+    directory *and* imports two separate TLS-bearing dependencies, all
+    three combined into one raw-data range. Generalizes
+    test_tls_merge_when_host_already_has_its_own_tls_directory from one
+    dependency to two; a merge bug that mis-chains the second
+    dependency's own shift (e.g. reusing the first dependency's shift
+    instead of the cumulative host+dep1 length) would misalign its TLS
+    access and change the packed result (see
+    main_host_own_tls_two_deps.c's own comment)."""
+    dll1 = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep.c", "lib_tls_dep.dll", pic=True, bits=64)
+    dll2 = build_shared_lib(tmp_path, FIXTURES / "lib_tls_dep2.c", "lib_tls_dep2.dll", pic=True, bits=64)
+    exe = build_exe(
+        tmp_path, FIXTURES / "main_host_own_tls_two_deps.c", "main_host_own_tls_two_deps.exe",
+        [dll1, dll2], pic=True, bits=64,
+    )
+    out = tmp_path / "static_host_own_tls_two_deps.exe"
+
+    PortableExecutableEmbedder(exe, out, set(), tmp_path).embed()
+    assert "lib_tls_dep.dll" not in list_pe_imports(out)
+    assert "lib_tls_dep2.dll" not in list_pe_imports(out)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 7005009, (
+        f"expected host_counter(7)*1e6 + dep1(5)*1000 + dep2(9) == 7005009, "
+        f"got {result.returncode}; stderr={result.stderr!r}"
+    )
