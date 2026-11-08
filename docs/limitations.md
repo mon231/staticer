@@ -61,6 +61,36 @@
   one-dependency cap: 8 of its Qt6 modules plus 4 further dependencies
   (`astyle.dll`, `pugixml.dll`, `rapidjson.dll`, `tidy-html.dll`) all
   carry real (non-empty) TLS directories, and all are real MSVC builds.
+- **Fixed**: PE's dependency graph previously only discovered a dependency
+  via ordinary import-table edges, so a DLL reachable *only* as another
+  dependency's export-forward TARGET (e.g. SHLWAPI.dll forwards some
+  exports to SHCORE.dll, which SHLWAPI.dll's own import table never
+  mentions at all) was never added to the graph at all, and
+  `_resolve_raw_export`'s finalize pass hit a hard, unconditional dead
+  end resolving it ("isn't an already-embedded dependency"). Fixed by
+  having the PE embedder's own `list_imports` callback
+  (`_list_pe_import_graph_edges`) also surface forwarder-target DLL
+  names as graph edges, so a forward-only dependency gets discovered,
+  resolved, and embedded exactly like any ordinary one — found and fixed
+  while pushing a real `python.exe`+`python313.dll` full-System32-closure
+  embed further; a self-forward (a real shape too, e.g. RPCRT4.dll
+  forwards some of its own ANSI exports to its own wide-string ones) is
+  explicitly excluded from this to avoid a spurious self-loop in
+  `embed_order`'s cycle detector.
+  **Still real, newly exposed earlier by this fix**: a genuine import
+  CYCLE among embeddable dependencies (confirmed real, not hypothetical:
+  WS2_32.dll's own import table imports MSWSOCK.dll, while WS2_32.dll
+  also forwards some exports TO MSWSOCK.dll) has no valid single
+  topological order, so `embed_order()` raises `CyclicDependencyError`
+  rather than embed either side wrong. Since cross-dependency resolution
+  is already fully deferred to a finalize pass run after every
+  dependency is placed, a strict total order may not even be a real
+  technical requirement for the embedding mechanism itself — worth
+  confirming before changing `embed_order`'s contract — but that's not
+  yet done. See `tests/windows/test_pe_real_binaries.py`'s
+  `test_second_real_binary_full_closure` (still `xfail`, now for this
+  reason specifically — its two previous blockers, KERNELBASE.dll's TLS
+  directory and this exact forwarder-discovery gap, are both now fixed).
 - **Fixed, found via the same 010 Editor testing**: `pefile.PE(path)`
   (`fast_load=False`, the default) already fully parses every data
   directory at construction; `pe_embedder.py` used to call

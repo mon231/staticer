@@ -92,6 +92,66 @@ def list_pe_imports(path: Path) -> List[str]:
         pe.close()
 
 
+def _list_pe_import_graph_edges(path: Path) -> List[str]:
+    """Like `list_pe_imports`, but also includes forwarder-TARGET DLL names
+    from this PE's own export table, so the dependency graph can discover
+    and embed a DLL that nothing in the closure directly imports but that
+    IS needed purely as a forward target of some embedded dependency's own
+    export (a real, observed shape: e.g. SHLWAPI.dll forwards some exports
+    to SHCORE.dll, which SHLWAPI.dll's own import table never mentions at
+    all). Without this, `_resolve_raw_export`'s finalize pass can only ever
+    resolve a forward whose target DLL happens to ALSO be reachable via an
+    ordinary import edge from somewhere in the closure -- a forward-only
+    target was previously an unconditional dead end ("isn't an
+    already-embedded dependency"), even though it's perfectly embeddable
+    once added to the graph the exact same way as any other dependency.
+
+    Deliberately NOT folded into `list_pe_imports` itself: that function's
+    contract (used directly by tests to assert on a PE file's *actual*
+    import table) must keep meaning exactly that, not "every DLL name this
+    graph might want to visit." Only used as `build_dependency_graph`'s
+    `list_imports` callback.
+
+    Re-implements (rather than calls) `list_pe_imports`'s own import-table
+    scan to do both scans against one `pefile.PE()` construction -- see
+    `list_pe_imports`'s own docstring for why a *second*, independent
+    parse of the same already-parsed object is unsafe; two independent
+    `pefile.PE()` constructions from the same path are fine, just wasteful
+    I/O-wise for every node in a large graph, avoided here instead."""
+    pe = pefile.PE(str(path))
+    try:
+        names: List[str] = []
+        if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+            names.extend(entry.dll.decode("ascii") for entry in pe.DIRECTORY_ENTRY_IMPORT)
+        if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+            own_name_lower = path.name.lower()
+            seen_lower = {n.lower() for n in names}
+            for sym in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if not sym.forwarder:
+                    continue
+                forwarder = sym.forwarder.decode("ascii")
+                fwd_dll, _, _ = forwarder.rpartition(".")
+                if not fwd_dll.lower().endswith(".dll"):
+                    fwd_dll += ".dll"
+                fwd_dll_lower = fwd_dll.lower()
+                # A self-forward (a real, observed shape -- e.g. RPCRT4.dll
+                # forwards some of its own ANSI exports to its own wide-
+                # string ones) needs no graph edge at all: it's already
+                # its own node, and `_resolve_raw_export`'s finalize pass
+                # resolves it trivially once this same dependency's own
+                # raw export table is populated. An edge here would be a
+                # self-loop, which `embed_order`'s cycle detector (rightly)
+                # rejects as a cycle even though no real ordering
+                # constraint exists.
+                if fwd_dll_lower == own_name_lower or fwd_dll_lower in seen_lower:
+                    continue
+                seen_lower.add(fwd_dll_lower)
+                names.append(fwd_dll)
+        return names
+    finally:
+        pe.close()
+
+
 class _CaseInsensitiveNameSet:
     """A read-only, case-insensitive view over a set of DLL names, for
     passing as ``build_dependency_graph``'s ``exclude`` argument from the
@@ -1163,7 +1223,7 @@ class PortableExecutableEmbedder:
         """
         search_dirs = self._search_dirs()
         graph = build_dependency_graph(
-            self.input_path, list_pe_imports, resolve_pe, search_dirs, self.lib_dir,
+            self.input_path, _list_pe_import_graph_edges, resolve_pe, search_dirs, self.lib_dir,
             _CaseInsensitiveNameSet(self.exclude),
         )
         order = embed_order(graph)
