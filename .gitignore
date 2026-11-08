@@ -125,6 +125,10 @@ venv.bak/
 # properly into docs/ instead
 /.superpowers/
 
+# per-branch task-status ledger -- session-local scratch, not shipped
+# product; same reasoning as .superpowers/ above
+/PLAN.md
+
 # mypy
 .mypy_cache/
 .dmypy.json
