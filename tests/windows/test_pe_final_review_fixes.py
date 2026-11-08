@@ -128,6 +128,29 @@ def test_adversarial_dependency_size_of_image_fails_loudly_not_oom(tmp_path, c_c
         PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), tmp_path).embed()
 
 
+def test_unsupported_host_architecture_fails_loudly(tmp_path, c_compiler):
+    """PE counterpart of the ELF suite's architecture-allow-list guard:
+    PE's embed() only checked that host and dependency *agree* with each
+    other, never that their shared architecture is one this project has
+    actually been exercised against (e.g. ARM64 PE would otherwise be
+    silently accepted). Binary-surgery a real exe's own FILE_HEADER.Machine
+    to IMAGE_FILE_MACHINE_ARM64 and confirm embed() now rejects it."""
+    dll = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=True, bits=64)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main.exe", [dll], pic=True, bits=64)
+
+    pe = pefile.PE(str(exe))
+    try:
+        machine_off = pe.FILE_HEADER.get_field_absolute_offset("Machine")
+    finally:
+        pe.close()
+    data = bytearray(exe.read_bytes())
+    struct.pack_into("<H", data, machine_off, pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_ARM64"])
+    exe.write_bytes(bytes(data))
+
+    with pytest.raises(ValueError, match="unsupported host architecture"):
+        PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), tmp_path).embed()
+
+
 def test_resolve_pe_rejects_path_traversal_name(tmp_path):
     """Dropped-finding fix (CWE-22): `name` in `resolve_pe` comes straight
     from the TARGET BINARY's own Import Directory -- attacker-controlled,

@@ -38,6 +38,16 @@ _IMAGE_DIRECTORY_ENTRY_TLS = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_TLS"]
 _IMAGE_DIRECTORY_ENTRY_SECURITY = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
 _IMAGE_FILE_DLL = 0x2000  # FILE_HEADER.Characteristics bit: this image is a DLL
 
+# Mirrors elf_embedder.py's _SUPPORTED_MACHINES: only architectures this
+# project has actually been exercised against, not merely "host and
+# dependency agree with each other" (a separate, pre-existing mismatch
+# guard below). Without this, e.g. an untested ARM64 PE pair would be
+# silently accepted.
+_SUPPORTED_MACHINES = (
+    pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_I386"],
+    pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"],
+)
+
 # x64 UNWIND_INFO flags (IMAGE_DIRECTORY_ENTRY_EXCEPTION's RUNTIME_FUNCTION
 # entries point at one of these per function) -- see _adjust_unwind_info.
 _UNW_FLAG_EHANDLER = 0x1
@@ -1161,6 +1171,11 @@ class PortableExecutableEmbedder:
             # 010 Editor, a dense Qt6 PE).
 
             host_machine = pe.FILE_HEADER.Machine
+            if host_machine not in _SUPPORTED_MACHINES:
+                raise ValueError(
+                    f"unsupported host architecture {hex(host_machine)}; only "
+                    f"{tuple(hex(m) for m in _SUPPORTED_MACHINES)} are supported"
+                )
             is64 = host_machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
             ptr_size = 8 if is64 else 4
             image_base = pe.OPTIONAL_HEADER.ImageBase
