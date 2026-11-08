@@ -2287,7 +2287,31 @@ class PortableExecutableEmbedder:
                 if getattr(pe, "DIRECTORY_ENTRY_DEBUG", None):
                     for dbg in pe.DIRECTORY_ENTRY_DEBUG:
                         if dbg.struct.PointerToRawData:
-                            dbg_off = dbg.struct.get_field_absolute_offset("PointerToRawData")
+                            # The IMAGE_DEBUG_DIRECTORY array itself lives
+                            # inside a section's raw data (e.g. `.rdata`),
+                            # not in the headers region before
+                            # `first_raw_data_offset` -- unlike
+                            # `sec`/`SizeOfHeaders` above, whose own fields
+                            # live in the *headers*, before the insert
+                            # point, and so need no adjustment. This
+                            # struct's own absolute file offset, read from
+                            # the original (pre-insert) `pe` parse, was
+                            # just pushed forward by `delta` along with
+                            # every other byte at/after
+                            # `first_raw_data_offset` by the insert above
+                            # -- so the offset being written to must be
+                            # shifted by the same `delta`, exactly like the
+                            # *value* already being written there.
+                            # Omitting this (B8-PE) silently corrupted
+                            # whatever real data now sits at the stale,
+                            # pre-shift offset instead -- confirmed via a
+                            # real CPython 3.13 python.exe + python313.dll
+                            # embed (enough dependencies to overflow the
+                            # section-header slack), which clobbered a
+                            # Control Flow Guard support global sitting
+                            # `delta` bytes earlier in `.rdata`, segfaulting
+                            # on first use.
+                            dbg_off = dbg.struct.get_field_absolute_offset("PointerToRawData") + delta
                             output[dbg_off:dbg_off + 4] = struct.pack(
                                 "<I", dbg.struct.PointerToRawData + delta
                             )
