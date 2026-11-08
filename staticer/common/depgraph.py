@@ -68,7 +68,14 @@ def build_dependency_graph(
             if resolved is None:
                 continue
             node.imports.append(imp_name)
-            visit(imp_name, resolved, force_excluded=is_excluded)
+            # Deliberately re-read node.embeddable on every iteration rather
+            # than reusing the `is_excluded` captured above: a cycle back to
+            # this same node (via an earlier import in this same loop) can
+            # cascade-exclude it mid-loop, through the `node in nodes`
+            # branch below. A still-Imports-to-visit import discovered
+            # *after* that cascade must see the now-current exclusion state,
+            # not the stale value from before the cascade ran.
+            visit(imp_name, resolved, force_excluded=not node.embeddable)
 
     for imp_name in list_imports(root_path):
         resolved = resolve(imp_name, search_dirs)

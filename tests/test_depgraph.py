@@ -114,6 +114,45 @@ def test_exclusion_cascades_through_already_visited_node():
     assert graph["c.dll"].embeddable is False
 
 
+def test_exclusion_cascades_to_sibling_import_discovered_after_a_cycle():
+    # root -> a.dll -> [b.dll, d.dll]  (a.dll imports b.dll FIRST, then d.dll)
+    #         b.dll -> c.dll
+    #         c.dll -> a.dll            (cycle back to a.dll)
+    #         c.dll excluded by name
+    #
+    # Visiting c.dll (excluded) re-visits the already-in-progress a.dll
+    # before a.dll's own import loop has reached d.dll yet -- that re-visit
+    # must cascade a.dll's new exclusion into b.dll (already recorded)
+    # correctly, but the real regression is d.dll: a.dll's own loop reads
+    # a.dll's exclusion state fresh on each iteration, so the *not-yet-
+    # visited* d.dll (processed only after the cascade from the cycle has
+    # already excluded a.dll) must also come out excluded -- not stay
+    # embeddable because the loop captured a stale "not excluded" flag
+    # from before the cascade happened.
+    root = Path("root.exe")
+    list_imports, resolve = _fake(
+        imports_by_name={
+            "root.exe": ["a.dll"],
+            "a.dll": ["b.dll", "d.dll"],
+            "b.dll": ["c.dll"],
+            "c.dll": ["a.dll"],
+            "d.dll": [],
+        },
+        resolvable_paths={
+            "a.dll": Path("/libs/a.dll"),
+            "b.dll": Path("/libs/b.dll"),
+            "c.dll": Path("/libs/c.dll"),
+            "d.dll": Path("/libs/d.dll"),
+        },
+    )
+
+    graph = build_dependency_graph(root, list_imports, resolve, [], None, {"c.dll"})
+
+    assert graph["a.dll"].embeddable is False
+    assert graph["b.dll"].embeddable is False
+    assert graph["d.dll"].embeddable is False
+
+
 def test_lib_dir_scopes_embedding():
     # root -> A (path inside lib_dir), root -> B (path outside lib_dir)
     root = Path("root.exe")
