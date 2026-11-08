@@ -34,9 +34,21 @@ jobs:
     # Windows runners ship MSVC but do not put cl.exe on PATH by default.
     # The compiler is only used by the test suite to build fixtures; the
     # installed staticer package stays pure-Python.
+    #
+    # Pinned to a specific toolset (not "whatever's newest on the image")
+    # because the TLS-variable-access pattern matcher in pe_embedder.py
+    # recognizes a specific, verified compiled instruction sequence --
+    # confirmed via local testing that MSVC 14.51.36231 (what a prior,
+    # unpinned run of this job picked up) emits a different pattern that
+    # matcher doesn't recognize, failing loudly (by design) rather than
+    # silently mis-patching. 14.44.35207 is confirmed working locally;
+    # bump this deliberately, verifying the pattern matcher against the
+    # new toolset first, rather than letting it drift silently.
     - name: Put MSVC cl.exe on PATH (Windows)
       if: runner.os == 'Windows'
       uses: ilammy/msvc-dev-cmd@v1
+      with:
+        toolset: 14.44
 
     # ubuntu-latest ships gcc/clang for 64-bit builds, but not the 32-bit
     # multilib support the test suite's [32]-parametrized ELF fixtures
