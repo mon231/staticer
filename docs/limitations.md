@@ -6,7 +6,14 @@
   embedded.
 - A "full closure" embed on ELF still bottoms out at glibc's own dynamic
   linker/loader internals, which stay dynamically linked rather than
-  embedded.
+  embedded. Root cause confirmed concrete, not a vague "loader internals"
+  handwave: glibc (and `ld-linux` itself) use `R_X86_64_IRELATIVE` (GNU
+  indirect-function/IFUNC) relocations, which `embed()` doesn't support
+  at all — the full-closure case fails loudly with `"unsupported
+  relocation type 37"` (confirmed via `test_bash_full_closure`/
+  `test_grep_full_closure`, both `xfail`). IFUNC is a general mechanism
+  that can appear in other modern-glibc-linked binaries too, not only
+  glibc/ld-linux specifically.
 - Process-detach cleanup (`elf-destructor` / `DllMain`
   `DLL_PROCESS_DETACH`) is not invoked for embedded dependencies, and
   thread attach/detach notifications may never be supported.
@@ -81,6 +88,46 @@
   falling into the generic "unsupported relocation type" error, and
   raises a specific `ValueError` naming the relocation type if it's ever
   encountered.
+- Three further ELF TLS gaps, none yet implemented (distinct from the
+  already-documented "second TLS-bearing dependency"/GD-LD-relaxation
+  cases above):
+  - `R_X86_64_TPOFF64` (the Initial-Exec TLS model) is completely
+    unimplemented — `embed()` raises a `ValueError` naming it explicitly
+    rather than mis-handling it (`elf_embedder.py`).
+  - A TLS-bearing dependency that itself references an *external* (not
+    embedded, not the host's own) TLS symbol is rejected outright, for
+    both the module-ID (`DTPMOD64`) and offset (`DTPOFF64`) relocation
+    halves.
+  - A fixed-base (non-PIC, `ET_EXEC`) ELF dependency that carries its own
+    TLS directory is unconditionally rejected.
+- PE's `blob_size` (derived from a dependency's `SizeOfImage`) has no
+  upper-bound sanity check, unlike ELF's equivalent `p_memsz`-derived
+  size, which is capped at 16 GiB against a malformed/adversarial value
+  triggering an unbounded allocation. This asymmetry (PE side missing
+  the same guard ELF already has) is a real, currently open gap.
+- PE has no dependency-architecture allow-list. ELF explicitly rejects
+  any machine type other than x86/x86-64
+  (`_SUPPORTED_MACHINES`); PE's `embed()` only checks that the host and
+  dependency *agree* with each other (a mismatch guard), never that the
+  shared architecture is one staticer has ever actually been exercised
+  against (e.g. ARM64 PE would currently be accepted untested).
+- No guard against passing the same path as both `--input` and
+  `--output`; doing so likely surfaces as a raw, unhelpful Python
+  traceback (e.g. a file-handle conflict) rather than a clean CLI error.
+- **Real system-DLL `DllMain` invocation has an unresolved, nondeterministic
+  crash risk** — the most severe open item in this list, since it's not
+  reproducible on demand. Embedding `WS2_32.dll` alone into `hostname.exe`
+  (no TLS involved, previously verified working) crashed with
+  `STATUS_ACCESS_VIOLATION` on one real Windows build (Server 2025,
+  build 26100) while passing reliably across 15/15 runs on a different
+  build (26300). No concrete bug has been identified; the leading theory
+  is that invoking a real system DLL's own `DllMain` out-of-band (this
+  project's whole embedding design, not what the real Windows loader
+  does) is sensitive to that exact DLL's build — properly diagnosing or
+  fixing this would need either the exact crashing build's `System32`
+  image or a substantially more complete PE loader than `embed()`
+  implements. Treat embedding real, non-trivial system DLLs as currently
+  unreliable, not merely "untested."
 - A fully self-contained module that both throws *and* catches a C++
   exception entirely within itself can still hit compiler-internal
   personality-routine details beyond the documented unwind ABI — ordinary
@@ -93,6 +140,22 @@
   interior pointer fields, doesn't get relocation entries for those
   interior pointers — a genuine architectural limit, since ELF carries no
   type/layout metadata for a COPY-relocated symbol beyond a byte count.
+- Minor, acknowledged-unfixed correctness nitpick in the dependency
+  graph (`common/depgraph.py`): in a cycle, `is_excluded` can go stale
+  in an already-visited parent DFS frame. Low risk in practice —
+  `embed_order` independently raises on any cycle among embeddable
+  nodes regardless, so this can't silently produce a wrong embed.
+- The ELF unwind-metadata-preservation scan for `_CxxThrowException`
+  call sites (`_fh4_scan_for_throw_info_candidates`-equivalent logic in
+  the MSVC unwind-fix path) is scoped per-function (each
+  `RUNTIME_FUNCTION`/`.pdata` entry's own byte range), not a whole-
+  section scan. Reliable for any function with its own `.pdata` entry
+  (effectively all x64 functions), but not a complete, generic
+  throw-site finder in the abstract. Every candidate is structurally
+  validated before any write, so the failure mode is "misses a throw
+  site" (then falls back to not patching it), never data corruption.
+  Distinct from the already-documented self-contained throw+catch
+  personality-routine limitation above.
 - A PLT entry resolved under lazy binding is only handled for the
   ordinary `R_*_JUMP_SLOT` case; an `R_*_GLOB_DAT`/`R_*_IRELATIVE` entry
   inside the PLT relocation table under lazy binding (not seen in any
@@ -143,6 +206,10 @@
   implementation materializing on real software, not a new kind of bug —
   but it means the host-already-has-TLS merge path, while safe, is
   currently narrower in practice than "works for 64-bit PE" suggests.
+  One specific, named gap within this: the scanner doesn't recognize the
+  compiled TLS-index-load idiom when it uses an extended x64 register
+  (`r8d`-`r15d`) rather than one of the original 8 (`eax`-`edi`) — a real
+  compiler can legitimately allocate either.
   **Planned, not yet implemented**: broaden the scanner to recognize the
   compiled-TLS-access idiom across more real compilers/optimization
   levels (at minimum real MSVC-emitted code, not just mingw-w64), or add
