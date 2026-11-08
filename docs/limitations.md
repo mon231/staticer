@@ -206,10 +206,13 @@
   implementation materializing on real software, not a new kind of bug —
   but it means the host-already-has-TLS merge path, while safe, is
   currently narrower in practice than "works for 64-bit PE" suggests.
-  One specific, named gap within this: the scanner doesn't recognize the
-  compiled TLS-index-load idiom when it uses an extended x64 register
-  (`r8d`-`r15d`) rather than one of the original 8 (`eax`-`edi`) — a real
-  compiler can legitimately allocate either.
+  (A previously-listed "extended x64 register (`r8d`-`r15d`) load" gap
+  here was re-reviewed and confirmed NOT a real gap — the anchor match
+  only looks at the ModRM reg-field bits, which a preceding REX prefix
+  byte doesn't affect — and is now covered by an automated test,
+  `tests/test_pe_tls_scanner_unit.py`; it was a stale claim that got
+  re-introduced by this file's own 2026-11-08 consolidation pass after
+  already being corrected once, on 2026-11-06.)
   **Planned, not yet implemented**: broaden the scanner to recognize the
   compiled-TLS-access idiom across more real compilers/optimization
   levels (at minimum real MSVC-emitted code, not just mingw-w64), or add
