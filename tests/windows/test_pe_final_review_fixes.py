@@ -11,6 +11,7 @@ whole-branch close-out.
 
 import ctypes
 import platform
+import struct
 import subprocess
 import threading
 
@@ -101,6 +102,30 @@ def test_dependency_header_region_is_copied_into_blob(tmp_path, c_compiler):
 
     result = subprocess.run([str(out)], capture_output=True)
     assert result.returncode == 42
+
+
+def test_adversarial_dependency_size_of_image_fails_loudly_not_oom(tmp_path, c_compiler):
+    """PE counterpart of the ELF suite's
+    test_adversarial_dependency_memsz_fails_loudly_not_oom: a dependency's
+    own SizeOfImage is attacker-controlled (read straight from the
+    dependency file, no inherent upper bound), and used directly as
+    `bytearray(blob_size)`'s size. Binary-surgery a real .dll's own
+    SizeOfImage up to an absurd value and confirm embed() raises a clean
+    ValueError instead of attempting that allocation."""
+    dll = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=True, bits=64)
+    exe = build_exe(tmp_path, FIXTURES / "main.c", "main.exe", [dll], pic=True, bits=64)
+
+    pe = pefile.PE(str(dll))
+    try:
+        szoff = pe.OPTIONAL_HEADER.get_field_absolute_offset("SizeOfImage")
+    finally:
+        pe.close()
+    data = bytearray(dll.read_bytes())
+    struct.pack_into("<I", data, szoff, 3 << 30)  # 3 GiB -- still fits a DWORD, above the cap
+    dll.write_bytes(bytes(data))
+
+    with pytest.raises(ValueError, match="implausibly large"):
+        PortableExecutableEmbedder(exe, tmp_path / "out.exe", set(), tmp_path).embed()
 
 
 def test_resolve_pe_rejects_path_traversal_name(tmp_path):

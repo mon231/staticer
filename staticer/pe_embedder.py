@@ -1333,6 +1333,21 @@ class PortableExecutableEmbedder:
 
                     dep_image_base = dep.OPTIONAL_HEADER.ImageBase
                     blob_size = _align_up(dep.OPTIONAL_HEADER.SizeOfImage, section_alignment)
+                    # SizeOfImage is attacker-controlled (read directly from
+                    # the dependency file, no sanity check of its own) and
+                    # used directly as `bytearray(blob_size)`'s size below.
+                    # It's a DWORD (max ~4 GiB), so it can't reach ELF
+                    # embedder's 16 GiB `_MAX_SANE_BLOB_SIZE` threshold for
+                    # `p_memsz` (a 64-bit field) -- but a multi-gigabyte
+                    # allocation per dependency is still a real DoS lever no
+                    # genuine PE module ever needs; cap it well below the
+                    # field's own ceiling instead.
+                    _MAX_SANE_BLOB_SIZE = 1 << 31  # 2 GiB
+                    if blob_size > _MAX_SANE_BLOB_SIZE:
+                        raise ValueError(
+                            f"dependency '{node.name}' declares an implausibly large mapped "
+                            f"size ({blob_size} bytes); refusing to allocate it"
+                        )
                     blob = bytearray(blob_size)
 
                     # B4: the dependency's own PE header region (DOS header
