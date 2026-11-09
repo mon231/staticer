@@ -32,11 +32,11 @@ def test_scanner_shifts_mingw_style_access_with_ordinary_register_load():
     blob, disp_off = _mingw_blob(load_reg_modrm=0x0D, dep_index_rva=dep_index_rva,
                                   access_disp=8, shift=shift)
 
-    count = _patch_dep_tls_access_offsets(blob, dep_index_rva, shift)
+    patched, anchors_found = _patch_dep_tls_access_offsets(blob, dep_index_rva, shift)
 
-    assert count == 1
-    patched = int.from_bytes(blob[disp_off:disp_off + 4], "little", signed=True)
-    assert patched == 8 + shift
+    assert (patched, anchors_found) == (1, 1)
+    result = int.from_bytes(blob[disp_off:disp_off + 4], "little", signed=True)
+    assert result == 8 + shift
 
 
 def test_scanner_shifts_mingw_style_access_with_extended_register_load():
@@ -63,9 +63,128 @@ def test_scanner_shifts_mingw_style_access_with_extended_register_load():
     new_disp = dep_index_rva - (anchor + 1 + 6)
     rex_blob[disp_field_off:disp_field_off + 4] = new_disp.to_bytes(4, "little", signed=True)
 
-    count = _patch_dep_tls_access_offsets(rex_blob, dep_index_rva, shift)
+    patched, anchors_found = _patch_dep_tls_access_offsets(rex_blob, dep_index_rva, shift)
 
-    assert count == 1
+    assert (patched, anchors_found) == (1, 1)
     patched_off = disp_off + 1  # shifted by the inserted REX byte
-    patched = int.from_bytes(rex_blob[patched_off:patched_off + 4], "little", signed=True)
-    assert patched == 16 + shift
+    result = int.from_bytes(rex_blob[patched_off:patched_off + 4], "little", signed=True)
+    assert result == 16 + shift
+
+
+def _msvc_blob_with_hazardous_anchor_disp(access_offset: int, shift: int):
+    """Builds the exact real-world instruction shape found in SHLWAPI.dll's
+    own compiled TLS access (see `_try_patch_msvc_style_tls_access`'s own
+    docstring example and `_patch_dep_tls_access_offsets`'s long comment
+    about this): the anchor's own disp32 (`0x0005bde2`, the real value
+    observed) has `0xbd` as its second byte -- squarely inside `0xB8-0xBF`,
+    the opcode range `_try_patch_msvc_style_tls_access`'s backward window
+    scan looks for a `mov r32, imm32` in. This is the regression case for
+    the bug where that scan walked *into* the anchor's own 6 bytes and
+    misread part of its disp32 (plus the start of the following real `mov
+    r64, gs:[0x58]` instruction) as an unrelated immediate, corrupting
+    both instead of finding the real `mov edx, <access_offset>` that
+    follows the TEB load. Returns `(blob, imm_off, anchor_begin,
+    tls_index_load_end)`.
+    """
+    blob = bytearray(4)  # leading padding
+    anchor = len(blob)
+    hazardous_disp = 0x0005BDE2
+    dep_index_rva = anchor + 6 + hazardous_disp
+    blob += bytes([0x8B, 0x0D])  # mov ecx, [rip+disp32]
+    blob += hazardous_disp.to_bytes(4, "little", signed=True)
+    tls_index_load_end = len(blob)
+    blob += bytes([0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00])  # mov rax, gs:[0x58]
+    imm_off = len(blob) + 1
+    blob += bytes([0xBA]) + access_offset.to_bytes(4, "little", signed=True)  # mov edx, imm32
+    blob += bytes([0x48, 0x8B, 0x04, 0xC8])  # mov rax, [rax+rcx*8]
+    blob += bytes(8)  # trailing padding
+    return blob, imm_off, anchor, tls_index_load_end, dep_index_rva
+
+
+def test_scanner_does_not_misparse_anchor_disp32_as_msvc_immediate():
+    """Regression test for the real 010 Editor / SHLWAPI.dll crash: a
+    hazardous anchor disp32 byte must not be mistaken for a `mov r32,
+    imm32` opcode, and the anchor's own bytes (nor the following real
+    instruction's opcode bytes) must come out unmodified -- only the
+    genuine `mov edx, <access_offset>` later in the sequence gets shifted.
+    """
+    access_offset = 0x148
+    shift = 0x1000
+    blob, imm_off, anchor, tls_index_load_end, dep_index_rva = _msvc_blob_with_hazardous_anchor_disp(
+        access_offset, shift
+    )
+    anchor_bytes_before = bytes(blob[anchor:tls_index_load_end])
+
+    patched, anchors_found = _patch_dep_tls_access_offsets(blob, dep_index_rva, shift)
+
+    assert (patched, anchors_found) == (1, 1)
+    # The anchor's own 6 bytes (including its hazardous disp32) must be
+    # untouched -- `_tls_index` still loads from the correct address.
+    assert bytes(blob[anchor:tls_index_load_end]) == anchor_bytes_before
+    # The real per-variable offset constant is the one that got shifted.
+    result = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
+    assert result == access_offset + shift
+
+
+def _msvc_blob_with_hazardous_intervening_instruction(access_offset: int, shift: int):
+    """Builds the exact real-world instruction shape found in
+    SHELL32.dll's own compiled TLS access (see
+    `_try_patch_msvc_style_tls_access`'s own docstring): the anchor is
+    immediately followed by a handful of *genuinely unrelated*
+    instructions (an `inc eax`, then a `mov [rip+disp32], eax` store
+    whose own disp32 happens to contain `0xba`, squarely in the
+    `0xB8-0xBF` opcode range `_try_patch_msvc_style_tls_access` looks
+    for), *before* the real `mov r64, gs:[0x58]` TEB load and the real
+    `mov r9d, <access_offset>` offset-load that immediately precedes the
+    real scale-8 SIB load. A scanner that accepts any `mov r32, imm32`-
+    shaped match merely because a `gs:[0x58]` access exists *somewhere*
+    in the same window (rather than requiring the match to be the one
+    immediately followed by the real scale-8 SIB load) finds and
+    corrupts the store's disp32 instead of the real offset-load. Returns
+    `(blob, imm_off, store_disp_off, dep_index_rva)`.
+    """
+    blob = bytearray(4)  # leading padding
+    anchor = len(blob)
+    dep_index_rva = 0x1000
+    disp = dep_index_rva - (anchor + 6)
+    blob += bytes([0x8B, 0x15])  # mov edx, [rip+disp32] (_tls_index anchor)
+    blob += disp.to_bytes(4, "little", signed=True)
+    blob += bytes([0xFF, 0xC0])  # inc eax -- unrelated filler
+    # mov [rip+disp32], eax -- unrelated store whose disp32 (the exact
+    # real bytes found in SHELL32.dll) has 0xba as its second byte,
+    # squarely in the 0xB8-0xBF range a naive scan misreads as a `mov
+    # r32, imm32` opcode.
+    store_disp_off = len(blob) + 2
+    blob += bytes([0x89, 0x05, 0x37, 0xBA, 0x53, 0x00])
+    blob += bytes([0x89, 0x03])  # mov [rbx], eax -- more unrelated filler
+    blob += bytes([0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00])  # mov rax, gs:[0x58]
+    imm_off = len(blob) + 2  # +2: past the REX.B (0x41) and the 0xB9 opcode byte
+    blob += bytes([0x41, 0xB9]) + access_offset.to_bytes(4, "little")  # mov r9d, imm32
+    blob += bytes([0x4C, 0x8B, 0x04, 0xD0])  # mov r8, [rax+rdx*8] -- the real scale-8 SIB load
+    blob += bytes(8)  # trailing padding
+    return blob, imm_off, store_disp_off, dep_index_rva
+
+
+def test_scanner_does_not_misparse_intervening_instruction_as_msvc_immediate():
+    """Regression test for the real 010 Editor / SHELL32.dll crash: a
+    false `mov r32, imm32` match inside an unrelated, intervening
+    instruction (found before the real offset-load, but merely because a
+    `gs:[0x58]` access exists somewhere nearby) must be rejected, and
+    only the real offset-load -- the one immediately followed by the
+    real scale-8 SIB load -- gets shifted.
+    """
+    access_offset = 0x10
+    shift = 0x1000
+    blob, imm_off, store_disp_off, dep_index_rva = _msvc_blob_with_hazardous_intervening_instruction(
+        access_offset, shift
+    )
+    store_disp_before = bytes(blob[store_disp_off:store_disp_off + 4])
+
+    patched, anchors_found = _patch_dep_tls_access_offsets(blob, dep_index_rva, shift)
+
+    assert (patched, anchors_found) == (1, 1)
+    # The unrelated store's own disp32 must be untouched.
+    assert bytes(blob[store_disp_off:store_disp_off + 4]) == store_disp_before
+    # The real per-variable offset constant is the one that got shifted.
+    result = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
+    assert result == access_offset + shift

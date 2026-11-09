@@ -275,3 +275,61 @@
   instruction's full surrounding byte context, not just the first
   candidate) so a genuine non-match still fails loudly but a near-miss
   doesn't silently misfire.
+  **Update, fixed**: pushing the 010 Editor embed further (adding
+  ADVAPI32.dll/SHELL32.dll/COMDLG32.dll/MSVCP140.dll/VCRUNTIME140.dll
+  alongside the already-working Qt6Core/Gui/Widgets, 8 real dependencies
+  pulling in 57 total once their own transitive imports are included)
+  turned up exactly the "near-miss silently misfires" risk the paragraph
+  above already flagged as a theoretical concern -- this time for real,
+  twice, both causing genuine `c0000005` crashes (one inside
+  `010Editor+0x1a9bd24`, a `mov rax, [rax+rcx*8]` reading a bogus
+  RVA-sized address; the other inside `010Editor+0x1e50afe`, a RIP-
+  relative load whose own disp32 had been corrupted). Root-caused via
+  disassembling the exact crash sites and mapping them back to specific
+  `.sdepN` sections (`SHLWAPI.dll` and `SHELL32.dll` respectively, both
+  real Windows system DLLs, not Qt or MSVC-CRT modules) and comparing the
+  live crashing bytes against those same DLLs' own on-disk originals:
+  - `_try_patch_msvc_style_tls_access`'s backward ("unoptimized-build")
+    window scan could walk *into the anchor's own 6 bytes* (its disp32
+    is arbitrary data with no structural meaning as machine code) and
+    misread one of those bytes as a `mov r32, imm32` opcode purely by
+    coincidence (confirmed: SHLWAPI.dll's real anchor disp32,
+    `0x0005bde2`, has `0xbd` as its second byte, squarely in the
+    `0xB8-0xBF` range being scanned for) -- corrupting the anchor's own
+    `_tls_index` load and the start of the following real instruction.
+  - Separately, the same function's forward scan (and the "before"
+    window too) could land on a coincidental `0xB8-0xBF` byte inside a
+    completely unrelated, genuinely different instruction sitting
+    between the anchor and the real offset-load (confirmed: SHELL32.dll
+    has an ordinary, unrelated `mov [rip+disp32], eax` store between its
+    anchor and its real `mov r9d, 0x10` offset-load, whose own disp32
+    byte `0xba` got misread and corrupted the same way) -- a corroboration
+    check ("does a `gs:[0x58]` access exist somewhere in the window")
+    that's necessary but not remotely sufficient on its own.
+  Fixed by replacing the byte-anywhere-in-a-window scan with a much
+  narrower, strongly-corroborated match: a `mov r32, imm32` candidate is
+  now only accepted when it's immediately (zero-gap) followed by the one
+  instruction shape every real compiled access actually observed shares
+  right after loading the offset -- a scale-8 SIB-addressed load using
+  that register (`REX.W 8B modrm(mod=00,rm=100) sib(scale=11)`, e.g.
+  `48 8B 04 C8` / `4C 8B 04 D0`), plus never starting a candidate inside
+  the anchor's own 6 bytes at all. Verified against the real SHLWAPI.dll
+  and SHELL32.dll bytes (the exact false matches no longer fire, the
+  exact real matches still do) and covered by two new hand-crafted
+  regression tests in `tests/test_pe_tls_scanner_unit.py`
+  (`test_scanner_does_not_misparse_anchor_disp32_as_msvc_immediate`,
+  `test_scanner_does_not_misparse_intervening_instruction_as_msvc_immediate`).
+  Trading recall for precision this way means a real anchor can now
+  legitimately go unmatched (confirmed: patching only 10 of 15 real
+  anchors in SHLWAPI.dll and 25 of 26 in SHELL32.dll with real-world
+  `shift` values) without the whole merge being treated as unsupported
+  -- `_patch_dep_tls_access_offsets` only raises when *none* of a
+  dependency's anchors matched, same as before this fix, deliberately
+  *not* tightened to "all anchors must match": nearly every real system
+  DLL embeds several TLS-bearing access sites, and refusing on any
+  partial miss would make real-system-DLL embedding impractical. A
+  missed anchor leaves that one specific TLS variable reading/writing a
+  stale (but still in-bounds) offset rather than crashing -- a real,
+  accepted correctness gap, not a new crash risk, and exactly the kind
+  of gap the "second, independent verification pass" note above already
+  anticipated.

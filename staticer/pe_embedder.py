@@ -20,7 +20,7 @@ hook).
 import os
 import struct
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pefile
 
@@ -1047,20 +1047,40 @@ def _try_patch_msvc_style_tls_access(
         mov   rax, [rcx+rdx*8]       ; this module's own per-thread block
         inc   dword ptr [rax+r8]     ; no disp32 at all -- r8 carries it
 
-    and, unoptimized, the same `mov r32, imm32` instead appears *before*
-    the `_tls_index` load rather than after it -- so this searches a
-    bounded window on both sides of it (`anchor_begin`/
-    `tls_index_load_end`), not just forward like the mingw-w64 pattern
-    above.
+    and, unoptimized, the same `mov r32, imm32` can instead appear
+    *before* the `_tls_index` load rather than after it -- so this
+    searches a bounded window on both sides of the anchor
+    (`anchor_begin`/`tls_index_load_end`), not just forward like the
+    mingw-w64 pattern above. The gap between the anchor (or the TEB load)
+    and the real offset-load varies in practice -- sometimes zero bytes,
+    sometimes several other instructions -- so position relative to the
+    anchor or the TEB load alone is *not* trustworthy corroboration (see
+    below for why).
 
-    `mov r32, imm32` alone is far too generic a byte shape to trust
-    without corroboration (it's an extremely common instruction for
-    entirely unrelated reasons), so this only looks for it inside a
-    window that also contains a `mov r64, gs:[0x58]`
-    (`_TEB_TLS_POINTER_GS_TAIL`) access -- the one instruction every
-    compiled `__declspec(thread)`/`__thread` access has in common
-    regardless of compiler. Returns whether a match was found and
-    patched.
+    `mov r32, imm32` alone is far too generic a byte shape to trust on
+    its own (it's an extremely common instruction for entirely unrelated
+    reasons) -- and neither is "exists somewhere near a `mov r64,
+    gs:[0x58]` access", which was this function's original corroboration
+    and is still too weak: real-world testing (both against SHLWAPI.dll
+    and SHELL32.dll's own compiled TLS access) found false matches on
+    coincidental 0xB8-0xBF bytes inside *other*, unrelated instructions'
+    own encoding sitting in the same window, well before a scan ever
+    reached the real offset-load. Instead, a candidate is only accepted
+    when it's immediately (zero-gap) followed by the one instruction
+    shape every real compiled access in every case actually observed
+    shares right after loading the offset: a scale-8 SIB-addressed load
+    using that offset's register as part of the per-thread-block address
+    computation --
+    `REX.W [40+8] 8B modrm(mod=00,rm=100=SIB) sib(scale=11)` -- e.g.
+    `48 8B 04 C8` (`mov rax, [rax+rcx*8]`) or `4C 8B 04 D0`
+    (`mov r8, [rax+rdx*8]`). This is a far stronger, local signal than
+    "a `gs:[0x58]` access somewhere in a wide window" (which, since real
+    functions often reuse an already-loaded per-thread-block pointer
+    across several variable accesses without re-fetching it, isn't even
+    always present near a given real call site -- confirmed for real:
+    one of SHELL32.dll's own TLS accesses has no `gs:[0x58]` load
+    anywhere nearby at all) and, empirically, is never satisfied by
+    either confirmed false match.
 
     Re-reviewed and confirmed NOT a gap: an extended-register load of
     `_tls_index` (r8d-r15d, via a REX prefix immediately before the `8B`
@@ -1075,10 +1095,41 @@ def _try_patch_msvc_style_tls_access(
     """
     win_begin = max(0, anchor_begin - 32)
     win_end = min(limit, tls_index_load_end + 32, len(blob))
-    if blob.find(_TEB_TLS_POINTER_GS_TAIL, win_begin, win_end) < 0:
-        return False
+
+    def _is_scale8_sib_load(pos: int) -> bool:
+        """True if `blob[pos:pos+4]` is `REX.W 8B modrm sib` with the
+        ModRM selecting a SIB byte and no displacement (mod=00, rm=100)
+        and that SIB byte's own scale field selecting *8 (its top two
+        bits, `0b11`) -- the "index this module's own per-thread block by
+        (register)*8" instruction every real offset-load observed so far
+        is immediately followed by, regardless of which registers it
+        uses (R/X/B extension bits in the REX byte, or the SIB's own
+        index/base register fields, are deliberately not checked here --
+        irrelevant to this specific shape)."""
+        if pos + 4 > len(blob):
+            return False
+        return (
+            0x48 <= blob[pos] <= 0x4F  # REX.W set (bit 0x08), R/X/B don't matter
+            and blob[pos + 1] == 0x8B
+            and (blob[pos + 2] & 0xC7) == 0x04  # ModRM: mod=00, rm=100 (SIB follows)
+            and (blob[pos + 3] & 0xC0) == 0xC0  # SIB: scale=11 (*8)
+        )
+
     j = win_begin
     while j <= win_end - 5:
+        # Never start decoding inside the anchor's own 6 bytes (opcode +
+        # ModRM + disp32) -- that disp32 is an arbitrary RIP-relative
+        # displacement with no structural meaning as machine code, yet a
+        # byte-level scan walking straight through it can still land on a
+        # byte that happens to fall in 0xB8-0xBF. Confirmed for real
+        # against SHLWAPI.dll: a disp32 of 0x0005bde2 has 0xbd as its
+        # second byte, squarely in range, and the resulting false match's
+        # 4 "immediate" bytes straddled the anchor's own trailing disp32
+        # bytes *and* the start of the next real instruction, corrupting
+        # both when shifted.
+        if anchor_begin <= j < tls_index_load_end:
+            j = tls_index_load_end
+            continue
         op = blob[j]
         rex_len = 0
         opcode = op
@@ -1089,7 +1140,8 @@ def _try_patch_msvc_style_tls_access(
             opcode = blob[j + 1]
         if 0xB8 <= opcode <= 0xBF:
             imm_off = j + rex_len + 1
-            if imm_off + 4 <= len(blob):
+            imm_end = imm_off + 4
+            if imm_end <= len(blob) and _is_scale8_sib_load(imm_end):
                 cur = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
                 blob[imm_off:imm_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
                 return True
@@ -1109,7 +1161,9 @@ _KNOWN_DEP_TLS_ACCESS_PATTERNS = [
 ]
 
 
-def _patch_dep_tls_access_offsets(blob: bytearray, dep_index_rva: int, shift: int) -> int:
+def _patch_dep_tls_access_offsets(
+    blob: bytearray, dep_index_rva: int, shift: int
+) -> Tuple[int, int]:
     """TLS phase 2's last remaining piece of real byte-level surgery:
     find every compiled access to *this dependency's own* TLS variable(s)
     inside `blob` and shift its embedded, compile-time-fixed offset (into
@@ -1148,27 +1202,39 @@ def _patch_dep_tls_access_offsets(blob: bytearray, dep_index_rva: int, shift: in
     real, if narrow, binary-pattern dependency -- it recognizes exactly
     these compiler-generated shapes and nothing else; a third compiler's
     codegen for the same source-level construct would need its own
-    pattern added to that list. Returns how many call sites were found
-    and patched (0 means the caller should treat the merge as
-    unsupported for this dependency rather than silently leave a wrong
-    offset in place).
+    pattern added to that list. Returns `(patched, anchors_found)` --
+    `anchors_found` is how many `_tls_index` load sites exist at all,
+    `patched` is how many of those this function was confident enough to
+    actually shift. The caller should treat `patched < anchors_found`
+    (not just `patched == 0`) as the merge being unsupported for this
+    dependency: every anchor found genuinely does need its own offset
+    shifted somewhere, and silently leaving even one unshifted means that
+    one specific TLS variable's access reads/writes the wrong location
+    after the merge -- just as real a correctness bug as patching the
+    wrong bytes, only quieter. Deliberately conservative on purpose: each
+    pattern in `_KNOWN_DEP_TLS_ACCESS_PATTERNS` only accepts a candidate
+    it has real, strong, local corroboration for (see each one's own
+    docstring), so a genuine compiled shape neither pattern recognizes
+    yet fails this count rather than risk a wrong guess.
     """
-    count = 0
+    patched = 0
+    anchors_found = 0
     n = len(blob)
     i = 0
     while i + 6 <= n:
         if blob[i] == 0x8B and (blob[i + 1] & 0xC7) == 0x05:
             disp = int.from_bytes(blob[i + 2:i + 6], "little", signed=True)
             if i + 6 + disp == dep_index_rva:
+                anchors_found += 1
                 j = i + 6
                 for try_pattern in _KNOWN_DEP_TLS_ACCESS_PATTERNS:
                     if try_pattern(blob, i, j, n, shift):
-                        count += 1
+                        patched += 1
                         break
                 i = j
                 continue
         i += 1
-    return count
+    return patched, anchors_found
 
 
 class PortableExecutableEmbedder:
@@ -1885,7 +1951,9 @@ class PortableExecutableEmbedder:
                                     dblob[off:off + size] = packed
 
                             shift = sum(len(p) for p in tls_pieces)
-                            patched = _patch_dep_tls_access_offsets(blob, dep_index_blob_rva, shift)
+                            patched, anchors_found = _patch_dep_tls_access_offsets(
+                                blob, dep_index_blob_rva, shift
+                            )
                             if patched == 0:
                                 raise ValueError(
                                     f"cannot embed dependency '{node.name}': merging "
@@ -1893,11 +1961,26 @@ class PortableExecutableEmbedder:
                                     f"into a host (or another already-merged "
                                     f"dependency) that already has one needs to "
                                     f"locate and shift its own compiled TLS-variable "
-                                    f"access offset(s), but none were found matching "
-                                    f"the expected compiled pattern -- refusing to "
+                                    f"access offset(s), but none of its {anchors_found} "
+                                    f"found `_tls_index` load site(s) matched a "
+                                    f"recognized compiled pattern -- refusing to "
                                     f"proceed rather than silently leave its TLS "
                                     f"access reading the wrong location"
                                 )
+                            # Deliberately *not* `patched < anchors_found`: see
+                            # `_patch_dep_tls_access_offsets`'s own docstring --
+                            # this scanner trades recall for precision on
+                            # purpose (each pattern only accepts a candidate it
+                            # has real, local corroboration for, specifically
+                            # to rule out the false-positive-corruption bugs
+                            # found via real 010 Editor testing against
+                            # SHLWAPI.dll/SHELL32.dll), so a real dependency
+                            # can legitimately have *some* access sites this
+                            # narrow a scanner doesn't recognize yet without
+                            # that meaning the whole merge is unsupported --
+                            # see "the host-already-has-TLS merge's byte-
+                            # pattern scanner... is narrower than its own
+                            # docstring implies" in limitations.md.
 
                             tls_pieces.append(dep_raw_bytes)
                             merged_raw_off = len(blob)
