@@ -2130,8 +2130,11 @@ class PortableExecutableEmbedder:
                                 pending_host_iat_patches.append((iat_slot_rva, node.name.lower(), key))
                             removed_dll_names_lower.add(node.name.lower())
 
+                    # Shared by both the ordinary-import thunk-rebase loop
+                    # right below and the delay-import one further down.
+                    ordinal_flag = (1 << 63) if is64 else (1 << 31)
+
                     if hasattr(dep, "DIRECTORY_ENTRY_IMPORT"):
-                        ordinal_flag = (1 << 63) if is64 else (1 << 31)
                         for entry in dep.DIRECTORY_ENTRY_IMPORT:
                             entry_dll_lower = entry.dll.decode("ascii").lower()
                             # B1: if this dependency's own import target is
@@ -2208,6 +2211,92 @@ class PortableExecutableEmbedder:
                                     ),
                                     "first_thunk_rva": X + entry.struct.FirstThunk,
                                 })
+
+                    # Delay-loaded imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
+                    # the linker's `/DELAYLOAD` feature) got no handling at
+                    # all here originally -- a real, confirmed crash source,
+                    # not a theoretical gap: embedding a real OLEAUT32.dll
+                    # (which delay-loads several API-set DLLs, e.g.
+                    # `api-ms-win-core-com-l1-1-0.dll`, for COM interop) as
+                    # part of a real 010 Editor build, 010 Editor's own
+                    # startup path actually calls one of those delay-loaded
+                    # functions, and the compiler-generated thunk -- on that
+                    # first use -- calls `ntdll!LdrResolveDelayLoadedAPI`
+                    # passing this dependency's own embedded placement as if
+                    # it were a real, separately `LoadLibrary`'d module's
+                    # `HMODULE`, which it isn't (it's just appended code/data
+                    # inside the host's own image, with no corresponding
+                    # entry in the process's real loaded-module list) --
+                    # confirmed via live single-stepping under a debugger to
+                    # lead to an indirect call through a null pointer a few
+                    # frames further in (the host crashed with RIP becoming
+                    # exactly 0).
+                    #
+                    # An early fix attempt overwrote every delay-import IAT
+                    # slot with a tiny generated stub that unconditionally
+                    # "fails" (returns 0) rather than ever reaching that
+                    # dangerous path -- which did stop the crash, but then
+                    # 010 Editor's own startup treated that forced failure
+                    # (of what turned out to be a real, actually-needed COM
+                    # call) as fatal and exited on its own (confirmed: this
+                    # stub-based build no longer crashes at all, but exits
+                    # immediately with code -1, while the unmodified original
+                    # 010Editor.exe -- even just renamed/run from a different
+                    # location -- stays running normally). So this delay-
+                    # import really does need a genuine resolved address, not
+                    # just a safe non-crashing placeholder.
+                    #
+                    # The real fix: the modern (VS2005+) delay-import
+                    # descriptor format already mirrors an ordinary
+                    # IMAGE_IMPORT_DESCRIPTOR almost exactly -- `pINT` (the
+                    # Import *Name* Table) is the same shape as an ordinary
+                    # descriptor's `OriginalFirstThunk`, and `pIAT` (the
+                    # Import *Address* Table, what the compiled thunk code
+                    # actually reads through) is the same shape as its
+                    # `FirstThunk`. So each delay-import module is folded
+                    # into the very same combined/merged ordinary-import
+                    # machinery as this dependency's own *ordinary* remaining
+                    # imports (just above) -- its name-table thunk entries
+                    # get the same `+X` rebase, and it becomes one more
+                    # `merged_descriptors` entry. The real Windows loader
+                    # then resolves it as an ordinary import, at process
+                    # load, before any application code runs at all -- so
+                    # by the time the delay-load thunk's own compiled "is
+                    # this already resolved?" fast-path check runs, the slot
+                    # already holds the real function's address, and the
+                    # thunk never calls into the delay-load helper (hence
+                    # never touches the dangerous fake-HMODULE path) at all.
+                    # None of this project's current dependency-graph
+                    # discovery walks delay imports (`_list_pe_import_graph_edges`
+                    # only covers ordinary imports and export forwards), so a
+                    # delay-import's target is never itself one of this run's
+                    # embedded dependencies -- there is no "target_is_embedded"
+                    # case to handle here, unlike the ordinary-import merge
+                    # right above.
+                    if hasattr(dep, "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                        for delay_mod in dep.DIRECTORY_ENTRY_DELAY_IMPORT:
+                            int_rva = delay_mod.struct.pINT
+                            iat_rva = delay_mod.struct.pIAT
+                            if not int_rva or not iat_rva:
+                                continue
+                            for thunk_rva in (int_rva, iat_rva):
+                                idx = 0
+                                while True:
+                                    off = thunk_rva + idx * ptr_size
+                                    if off + ptr_size > blob_size:
+                                        break
+                                    raw = int.from_bytes(blob[off:off + ptr_size], "little")
+                                    if raw == 0:
+                                        break
+                                    if not (raw & ordinal_flag):
+                                        new_val = raw + X
+                                        blob[off:off + ptr_size] = new_val.to_bytes(ptr_size, "little")
+                                    idx += 1
+                            merged_descriptors.append({
+                                "name_rva": X + delay_mod.struct.szName,
+                                "orig_first_thunk_rva": X + int_rva,
+                                "first_thunk_rva": X + iat_rva,
+                            })
 
                     entry_rva = dep.OPTIONAL_HEADER.AddressOfEntryPoint
                     if entry_rva:

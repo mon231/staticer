@@ -333,3 +333,75 @@
   accepted correctness gap, not a new crash risk, and exactly the kind
   of gap the "second, independent verification pass" note above already
   anticipated.
+- **Fixed, found via the same 010 Editor testing**: the PE embedder had
+  no handling at all for `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT` (the
+  linker's `/DELAYLOAD` feature) -- a second, independent real crash
+  source, unrelated to the TLS scanner bugs above. Left alone, a
+  delay-imported function's compiled thunk, on its first actual use,
+  calls `ntdll!LdrResolveDelayLoadedAPI` passing the embedded
+  dependency's own placement as if it were a real, separately
+  `LoadLibrary`'d module's `HMODULE` -- which it isn't (it's just
+  appended code/data inside the host's own single image, with no
+  corresponding entry in the process's real loaded-module list).
+  Confirmed via live single-stepping under a debugger (embedding a real
+  `OLEAUT32.dll`, which delay-loads several API-set DLLs for COM
+  interop, as part of a real 010 Editor build) that this leads to an
+  indirect call through a null pointer a few frames further in, with
+  the host crashing with RIP becoming exactly `0`. Checked against every
+  dependency a real 010 Editor embed pulls in: 38 of 57 have a
+  non-empty delay-import directory, so refusing to embed any dependency
+  that has one isn't viable -- nearly every real Windows system DLL uses
+  `/DELAYLOAD` for at least a handful of imports. An intermediate fix
+  attempt (overwriting every delay-import IAT slot with a tiny stub that
+  unconditionally "fails") did stop the crash but broke 010 Editor's own
+  startup, which treats one specific forced-failed COM call as fatal and
+  exits on its own -- confirmed by comparing against the unmodified
+  original `010Editor.exe` (even just renamed/run from a different
+  location), which starts normally. Properly fixed instead by folding
+  each delay-import module into the very same merged/combined
+  ordinary-import mechanism already used for a dependency's own
+  *remaining* (non-embedded) ordinary imports: the modern (VS2005+)
+  delay-import descriptor format already mirrors an ordinary
+  `IMAGE_IMPORT_DESCRIPTOR` almost exactly (`pINT` is the same shape as
+  `OriginalFirstThunk`, `pIAT` the same shape as `FirstThunk`), so its
+  name-table thunk entries get the same `+X` rebase as an ordinary
+  import's and it becomes one more merged descriptor entry. The real
+  Windows loader then resolves it like any ordinary import, at process
+  load, before any application code runs -- so by the time the
+  delay-load thunk's own compiled "already resolved?" fast-path check
+  runs, the slot already holds the real function's address, and the
+  thunk never calls into the delay-load helper (hence never touches the
+  dangerous fake-HMODULE path) at all. No dependency-graph change was
+  needed: delay-import targets are never themselves one of this run's
+  embedded dependencies (nothing currently walks delay imports when
+  discovering the graph), so there's no "target is itself embedded" case
+  to handle here, unlike the ordinary-import merge.
+- **Found, not yet fixed**: with both TLS-scanner false-positives and
+  the delay-import gap above fixed, the full real 010 Editor embed (all
+  8 originally-requested dependencies, 57 once transitive imports are
+  included, excluding only
+  `kernel32.dll,msvcrt.dll,ntdll.dll,USER32.dll,ole32.dll`) no longer
+  crashes with an access violation, but still doesn't run cleanly: it
+  now terminates a few seconds into startup with exit code `0xC0000417`
+  (`STATUS_INVALID_CRUNTIME_PARAMETER`) -- the UCRT's own fatal
+  invalid-parameter fast-fail path, not an unhandled SEH exception (it
+  generates no Windows Error Reporting / Application-Error event log
+  entry at all, consistent with a deliberate `__fastfail`-style
+  termination rather than a wild crash). Not yet root-caused: it doesn't
+  reproduce reliably while single-stepping under a live debugger (cdb
+  sessions covering the relevant ~4-10 second real-time window
+  consistently failed to hit it at all, even with breakpoints on
+  `ntdll!RtlFailFast`/`RtlFailFast2`/`KERNELBASE!RaiseFailFastException`),
+  suggesting it's sensitive to real wall-clock timing (e.g. an
+  async/worker-thread race) in a way that a debugger's own overhead
+  disturbs. Confirmed real progress nonetheless: an earlier, intermediate
+  fix attempt (stubbing out delay imports instead of properly resolving
+  them, see above) got only as far as a clean, immediate `exit(-1)`
+  before even this point was reached, so properly resolving delay
+  imports did fix a real, further startup step (likely COM
+  initialization) before this next, distinct issue surfaces. Future work:
+  reproduce under a lower-overhead instrumentation approach (e.g. a
+  logging `DllMain`/CRT-init shim rather than live single-stepping, per
+  this project's own established debug-instrumentation precedent) to
+  identify which specific CRT call and parameter trips the fast-fail
+  check.
