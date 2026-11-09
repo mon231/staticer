@@ -25,7 +25,11 @@ from typing import Dict, List, Optional, Set, Tuple
 import pefile
 
 from .common.depgraph import build_dependency_graph, embed_order
-from .stubs.windows.pe_stub import build_windows_stub, build_windows_tls_index_fixup
+from .stubs.windows.pe_stub import (
+    build_windows_delay_import_lazy_thunk,
+    build_windows_stub,
+    build_windows_tls_index_fixup,
+)
 
 IMAGE_REL_BASED_ABSOLUTE = 0
 IMAGE_REL_BASED_HIGHLOW = 3
@@ -1437,6 +1441,42 @@ class PortableExecutableEmbedder:
             # `dep_blobs_by_name_lower`) rather than left as a live import
             # descriptor.
             pending_dep_iat_patches: List[tuple] = []
+            # Same tuple shape as `pending_dep_iat_patches` immediately
+            # above, but for a *delay*-import (`/DELAYLOAD`) whose target
+            # happens to itself be one of this run's embedded dependencies
+            # -- kept in its own list, resolved by its own finalize pass,
+            # specifically so a resolution failure there can fall back to
+            # leaving that one entry's original, genuinely-lazy delay-load
+            # bytes untouched instead of hard-failing the whole embed (an
+            # ordinary import has no such fallback available -- its target
+            # DLL's own live descriptor was already unconditionally removed
+            # -- but a delay import's target DLL is still a real, loadable
+            # file on disk even once embedded, so "leave it exactly as the
+            # original binary had it" is always a safe, if imperfect,
+            # fallback here). See the delay-import handling below for why
+            # this distinction matters for a real, observed case (SHLWAPI.
+            # dll delay-importing SHELL32.dll's ordinal 102, which SHELL32
+            # itself can only re-export as a forward to a virtual API-set
+            # DLL with no real host at all -- a separate, pre-existing,
+            # out-of-scope limitation around forward resolution, not
+            # something this delay-import fix should turn into a hard
+            # failure).
+            pending_dep_delay_iat_patches: List[tuple] = []
+            # (dep_name_lower, slot_offset_in_dep_blob, dll_name_va,
+            # func_key_va_or_ordinal, func_key_is_ordinal) for every delay
+            # import whose target is a real, external DLL that ISN'T
+            # embedded this run -- the common case. Even though nothing
+            # about *this* target needs resolving at embed time, the
+            # compiler's own delay-load thunk still cannot be left in
+            # place (see the long comment on `build_windows_delay_import_
+            # lazy_thunk` for the real, confirmed crash this causes once
+            # the *owning* dependency, not the target, is embedded), so
+            # each of these needs a generated per-function lazy-resolution
+            # thunk instead -- deferred to its own finalize pass (after
+            # every dependency has an `X` placement, and after the merged
+            # import directory below adds the two fresh KERNEL32.dll
+            # IAT slots every such thunk calls through).
+            pending_dep_delay_lazy_thunks: List[tuple] = []
             # Every embedded dependency's own blob (bytearray, mutable even
             # once referenced from `new_sections`) and host RVA placement,
             # keyed by lowercased name -- so the finalize pass above can
@@ -2130,11 +2170,8 @@ class PortableExecutableEmbedder:
                                 pending_host_iat_patches.append((iat_slot_rva, node.name.lower(), key))
                             removed_dll_names_lower.add(node.name.lower())
 
-                    # Shared by both the ordinary-import thunk-rebase loop
-                    # right below and the delay-import one further down.
-                    ordinal_flag = (1 << 63) if is64 else (1 << 31)
-
                     if hasattr(dep, "DIRECTORY_ENTRY_IMPORT"):
+                        ordinal_flag = (1 << 63) if is64 else (1 << 31)
                         for entry in dep.DIRECTORY_ENTRY_IMPORT:
                             entry_dll_lower = entry.dll.decode("ascii").lower()
                             # B1: if this dependency's own import target is
@@ -2213,90 +2250,174 @@ class PortableExecutableEmbedder:
                                 })
 
                     # Delay-loaded imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
-                    # the linker's `/DELAYLOAD` feature) got no handling at
-                    # all here originally -- a real, confirmed crash source,
-                    # not a theoretical gap: embedding a real OLEAUT32.dll
-                    # (which delay-loads several API-set DLLs, e.g.
-                    # `api-ms-win-core-com-l1-1-0.dll`, for COM interop) as
-                    # part of a real 010 Editor build, 010 Editor's own
-                    # startup path actually calls one of those delay-loaded
-                    # functions, and the compiler-generated thunk -- on that
-                    # first use -- calls `ntdll!LdrResolveDelayLoadedAPI`
-                    # passing this dependency's own embedded placement as if
-                    # it were a real, separately `LoadLibrary`'d module's
-                    # `HMODULE`, which it isn't (it's just appended code/data
-                    # inside the host's own image, with no corresponding
-                    # entry in the process's real loaded-module list) --
-                    # confirmed via live single-stepping under a debugger to
-                    # lead to an indirect call through a null pointer a few
-                    # frames further in (the host crashed with RIP becoming
-                    # exactly 0).
+                    # the linker's `/DELAYLOAD` feature).
                     #
-                    # An early fix attempt overwrote every delay-import IAT
-                    # slot with a tiny generated stub that unconditionally
-                    # "fails" (returns 0) rather than ever reaching that
-                    # dangerous path -- which did stop the crash, but then
-                    # 010 Editor's own startup treated that forced failure
-                    # (of what turned out to be a real, actually-needed COM
-                    # call) as fatal and exited on its own (confirmed: this
-                    # stub-based build no longer crashes at all, but exits
-                    # immediately with code -1, while the unmodified original
-                    # 010Editor.exe -- even just renamed/run from a different
-                    # location -- stays running normally). So this delay-
-                    # import really does need a genuine resolved address, not
-                    # just a safe non-crashing placeholder.
+                    # A first fix attempt (since reverted -- see
+                    # limitations.md) folded every delay-import module into
+                    # the same merged/combined *ordinary* import mechanism
+                    # used for a dependency's own remaining external
+                    # imports, reasoning that the modern delay-import
+                    # descriptor shape (`pINT`/`pIAT`) mirrors an ordinary
+                    # one (`OriginalFirstThunk`/`FirstThunk`) closely enough
+                    # to reuse that machinery. That stopped the original
+                    # null-pointer-call crash (see below), but introduced a
+                    # different, equally real regression: it turns every
+                    # genuinely *lazy* delay-load into an *eager*, process-
+                    # init-time one, resolved by `LdrpInitializeProcess`
+                    # before any application code -- even the host's own
+                    # entry point -- ever runs. Confirmed via a real full
+                    # 010 Editor embed (57 transitive dependencies once
+                    # ADVAPI32/SHELL32/COMDLG32 are added) plus `gflags /i
+                    # <exe> +sls` (Show Loader Snaps): the build no longer
+                    # crashed, but hung forever behind a
+                    # `STATUS_DLL_INIT_FAILED` hard-error dialog, with the
+                    # loader snap log pinpointing the exact cause --
+                    #   LdrpPreprocessDllName - ERROR: ... for DLL
+                    #   ext-ms-win-security-chambers-l1-1-0.dll failed with
+                    #   status 0xc0000481 (STATUS_API_SET_NOT_PRESENT)
+                    #   LdrpInitializeProcess - ERROR: Walking the import
+                    #   tables of the executable and its static imports
+                    #   failed with status 0xc0000481
+                    # -- i.e. `SECHOST.dll` (itself one of the 57 embedded
+                    # dependencies here, pulled in as an export-forward
+                    # target of ADVAPI32.dll, nothing to do with delay
+                    # imports at all) has its own perfectly ordinary,
+                    # genuine `/DELAYLOAD` import of that API set --
+                    # independently confirmed to have no real host at all on
+                    # this machine (`LoadLibraryW` on it fails with
+                    # `ERROR_MODULE_NOT_FOUND`/126, outside this project
+                    # entirely). That's fine -- *expected*, even -- for a
+                    # real delay import: it's resolved only on an actual
+                    # first call, which evidently never happens during 010
+                    # Editor's own normal startup, so the original,
+                    # unmodified binary never cares that this particular
+                    # API set doesn't exist on this machine. Forced into the
+                    # *ordinary* import table instead, its absence became a
+                    # mandatory, unrecoverable process-startup failure.
                     #
-                    # The real fix: the modern (VS2005+) delay-import
-                    # descriptor format already mirrors an ordinary
-                    # IMAGE_IMPORT_DESCRIPTOR almost exactly -- `pINT` (the
-                    # Import *Name* Table) is the same shape as an ordinary
-                    # descriptor's `OriginalFirstThunk`, and `pIAT` (the
-                    # Import *Address* Table, what the compiled thunk code
-                    # actually reads through) is the same shape as its
-                    # `FirstThunk`. So each delay-import module is folded
-                    # into the very same combined/merged ordinary-import
-                    # machinery as this dependency's own *ordinary* remaining
-                    # imports (just above) -- its name-table thunk entries
-                    # get the same `+X` rebase, and it becomes one more
-                    # `merged_descriptors` entry. The real Windows loader
-                    # then resolves it as an ordinary import, at process
-                    # load, before any application code runs at all -- so
-                    # by the time the delay-load thunk's own compiled "is
-                    # this already resolved?" fast-path check runs, the slot
-                    # already holds the real function's address, and the
-                    # thunk never calls into the delay-load helper (hence
-                    # never touches the dangerous fake-HMODULE path) at all.
-                    # None of this project's current dependency-graph
-                    # discovery walks delay imports (`_list_pe_import_graph_edges`
-                    # only covers ordinary imports and export forwards), so a
-                    # delay-import's target is never itself one of this run's
-                    # embedded dependencies -- there is no "target_is_embedded"
-                    # case to handle here, unlike the ordinary-import merge
-                    # right above.
+                    # So delay imports must never be folded into
+                    # `merged_descriptors`. The natural next idea --
+                    # restore the pre-77ccd2e behavior and leave every
+                    # delay-import descriptor *completely untouched* -- was
+                    # tried next here and *also* empirically falsified by a
+                    # real crash, reproduced against the real 010 Editor
+                    # embed and root-caused live under `cdb`:
+                    #   LdrResolveDelayLoadedAPI - ERROR:
+                    #   LdrResolveDelayLoadedAPI:Unable to locate DLL based
+                    #   at 0x00000001425B0000. Status = 0xc0000135
+                    #   Access violation - code c0000005 (first chance)
+                    #   00000000`00000000 ??              ???
+                    # -- this is the *original* bug 77ccd2e set out to fix
+                    # in the first place (RIP becoming exactly 0), and it
+                    # turns out to be unavoidable for *any* embedded
+                    # dependency with its own delay imports, regardless of
+                    # the delay-import's target: the compiler's own
+                    # generated thunk calls `LdrResolveDelayLoadedAPI` with
+                    # `ParentModuleBase` computed as `&__ImageBase` (an
+                    # ordinary RIP-relative reference, which after
+                    # embedding correctly resolves to this dependency's own
+                    # placement *within* the host image -- the same
+                    # property that lets its entry point, export table, and
+                    # TLS directory all keep working untouched) -- but
+                    # `LdrResolveDelayLoadedAPI` needs that address to be a
+                    # *real, separately loaded module's* base, registered
+                    # in the process's own loaded-module list, which it
+                    # isn't once embedded, so the lookup fails and the
+                    # thunk's own handling of that failure dereferences a
+                    # null/garbage result. This has nothing to do with
+                    # whether the delay-import's *target* is a real,
+                    # always-loadable external DLL or itself embedded --
+                    # it's purely about the *owning* dependency's own
+                    # module identity being gone.
+                    #
+                    # So the compiler's own delay-load thunk can never be
+                    # allowed to run for *any* delay import belonging to an
+                    # embedded dependency. Two cases, split by what the
+                    # *target* is (mirroring the ordinary-import B1 split
+                    # above, but both sides now need active handling,
+                    # unlike B1 where the "not embedded" side is a no-op):
+                    #
+                    # 1. Target IS embedded this run: there's no live DLL
+                    #    by that name left to delay-load at all, so route
+                    #    each function through `pending_dep_delay_iat_
+                    #    patches` -- resolved directly to the embedded
+                    #    target's own final address in the finalize pass
+                    #    below, bypassing the delay-load thunk entirely (no
+                    #    thunk code ever runs, since the IAT slot already
+                    #    holds the real address by the time anything could
+                    #    call through it). See that list's own declaration
+                    #    above for the real, observed case (SHLWAPI.dll's
+                    #    delay import of SHELL32.dll's ordinal 102) that
+                    #    makes its soft-fail-on-resolve-failure fallback
+                    #    necessary.
+                    #
+                    # 2. Target NOT embedded this run (the common case:
+                    #    checked via the real DLL name, not merely a
+                    #    theoretical concern -- a scan of this same real
+                    #    010 Editor closure found >100 case-1 hits once
+                    #    ADVAPI32/SHELL32/COMDLG32/SHLWAPI/SHCORE/NETAPI32/
+                    #    etc. are all embedded, so case 2 -- everything
+                    #    else -- is the overwhelming majority): the target
+                    #    DLL is still perfectly real and loadable, so route
+                    #    each function through `pending_dep_delay_lazy_
+                    #    thunks` instead, resolved by its own finalize pass
+                    #    (after the merged import directory below adds two
+                    #    fresh KERNEL32.dll IAT slots for `LoadLibraryA`/
+                    #    `GetProcAddress`) into a tiny generated per-
+                    #    function replacement thunk -- see `build_windows_
+                    #    delay_import_lazy_thunk`'s own docstring for
+                    #    exactly what it does and why. Each such function's
+                    #    IAT slot is patched (in the same finalize pass) to
+                    #    point at that generated thunk instead of the
+                    #    compiler's own (which never runs), so genuine
+                    #    laziness is preserved -- nothing executes until
+                    #    the host's own code actually calls through that
+                    #    slot for the first time -- while what runs *then*
+                    #    is safe.
                     if hasattr(dep, "DIRECTORY_ENTRY_DELAY_IMPORT"):
                         for delay_mod in dep.DIRECTORY_ENTRY_DELAY_IMPORT:
-                            int_rva = delay_mod.struct.pINT
-                            iat_rva = delay_mod.struct.pIAT
-                            if not int_rva or not iat_rva:
+                            if not delay_mod.struct.pINT or not delay_mod.struct.pIAT:
                                 continue
-                            for thunk_rva in (int_rva, iat_rva):
-                                idx = 0
-                                while True:
-                                    off = thunk_rva + idx * ptr_size
-                                    if off + ptr_size > blob_size:
-                                        break
-                                    raw = int.from_bytes(blob[off:off + ptr_size], "little")
-                                    if raw == 0:
-                                        break
-                                    if not (raw & ordinal_flag):
-                                        new_val = raw + X
-                                        blob[off:off + ptr_size] = new_val.to_bytes(ptr_size, "little")
-                                    idx += 1
-                            merged_descriptors.append({
-                                "name_rva": X + delay_mod.struct.szName,
-                                "orig_first_thunk_rva": X + int_rva,
-                                "first_thunk_rva": X + iat_rva,
-                            })
+                            delay_dll_lower = delay_mod.dll.decode("ascii").lower()
+                            target_is_embedded = delay_dll_lower in embedded_names_lower
+                            if not target_is_embedded and not is64:
+                                raise ValueError(
+                                    f"cannot embed '{node.name}': its own delay "
+                                    f"import of '{delay_dll_lower}' (a real, "
+                                    f"external DLL, not itself embedded this run) "
+                                    f"needs a generated lazy-resolution thunk, "
+                                    f"which this project only implements for x64 "
+                                    f"so far -- see docs/limitations.md"
+                                )
+                            dll_name_va = image_base + X + delay_mod.struct.szName
+                            for imp in delay_mod.imports:
+                                if imp.import_by_ordinal:
+                                    key = imp.ordinal
+                                else:
+                                    if imp.name is None:
+                                        raise ValueError(
+                                            f"cannot embed '{node.name}': its own "
+                                            f"delay-import of '{delay_dll_lower}' has "
+                                            f"an entry with neither a name nor an "
+                                            f"ordinal"
+                                        )
+                                    key = imp.name.decode("ascii")
+                                slot_offset_in_blob = imp.address - dep_image_base
+                                if target_is_embedded:
+                                    pending_dep_delay_iat_patches.append(
+                                        (node.name.lower(), slot_offset_in_blob, delay_dll_lower, key)
+                                    )
+                                else:
+                                    if imp.import_by_ordinal:
+                                        func_key_va_or_ordinal = imp.ordinal
+                                        func_key_is_ordinal = True
+                                    else:
+                                        func_key_va_or_ordinal = image_base + X + imp.name_offset
+                                        func_key_is_ordinal = False
+                                    pending_dep_delay_lazy_thunks.append((
+                                        node.name.lower(), slot_offset_in_blob, dll_name_va,
+                                        func_key_va_or_ordinal, func_key_is_ordinal,
+                                    ))
 
                     entry_rva = dep.OPTIONAL_HEADER.AddressOfEntryPoint
                     if entry_rva:
@@ -2398,6 +2519,135 @@ class PortableExecutableEmbedder:
                     (dep_X + slot_offset_in_blob, IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW)
                 )
 
+            # -- finalize deferred dependency-to-dependency DELAY-IAT -------
+            # -- patches -----------------------------------------------------
+            # Same mechanism as the B1 finalize pass immediately above, for
+            # a delay-import whose target is itself one of this run's
+            # embedded dependencies (`pending_dep_delay_iat_patches`,
+            # recorded in the main loop above) -- except a resolution
+            # failure here is NOT fatal: unlike an ordinary import (whose
+            # target's live descriptor was already unconditionally removed,
+            # leaving no safe fallback), a delay import's target DLL is
+            # still a real, loadable file on disk even once it's also been
+            # embedded, so leaving this one IAT slot's original compiled
+            # bytes completely untouched -- the same "no special handling"
+            # treatment every delay import whose target ISN'T embedded
+            # already gets, above -- is always a safe fallback: in the
+            # worst case, that one specific function falls back to a real,
+            # genuinely lazy delay-load of a second, disk-resident copy of
+            # the target DLL if the host's own code ever actually calls it
+            # (the duplicate-live-copy case B1 otherwise guards against),
+            # rather than this embed() run failing outright over a function
+            # that may never even be called in practice. A real, observed
+            # case this matters for: SHLWAPI.dll genuinely delay-imports
+            # SHELL32.dll's ordinal 102 (`SHCoCreateInstance`), which
+            # SHELL32 itself can only re-export as a forward to
+            # `api-ms-win-shell-shellcom-l1-1-0.dll` -- a virtual API-set
+            # DLL with no real host at all on this machine (confirmed:
+            # `LoadLibraryW` on it fails with `ERROR_MODULE_NOT_FOUND`),
+            # hence never embeddable -- a separate, pre-existing, out-of-
+            # scope limitation around forward resolution (see
+            # limitations.md), not something this delay-import fix should
+            # turn into a hard failure merely because SHELL32.dll happens
+            # to also be embedded in this same run.
+            for dep_name_lower, slot_offset_in_blob, dll_lower, key in pending_dep_delay_iat_patches:
+                try:
+                    target_va = _resolve_raw_export(dll_lower, key)
+                except ValueError:
+                    continue
+                dep_blob = dep_blobs_by_name_lower[dep_name_lower]
+                dep_blob[slot_offset_in_blob:slot_offset_in_blob + ptr_size] = target_va.to_bytes(
+                    ptr_size, "little"
+                )
+                dep_X = dep_X_by_name_lower[dep_name_lower]
+                new_reloc_entries.append(
+                    (dep_X + slot_offset_in_blob, IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW)
+                )
+
+            # -- synthetic KERNEL32.dll LoadLibraryA/GetProcAddress import --
+            # Needed only if at least one delay import landed in
+            # `pending_dep_delay_lazy_thunks` above -- every such generated
+            # thunk calls through these two fresh IAT slots (see
+            # `build_windows_delay_import_lazy_thunk`'s own docstring) to
+            # do its own real, runtime LoadLibraryA+GetProcAddress
+            # resolution, entirely independent of whatever KERNEL32
+            # imports the host or any dependency already happens to have
+            # (which may or may not already include these two specific
+            # names -- never assumed either way). KERNEL32.dll itself is
+            # never embeddable/excludable by this project's own design, so
+            # a plain, ordinary (eager) import of it is always safe --
+            # nothing optional or API-set-shaped about it, unlike the
+            # delay-import targets this whole fix is about.
+            #
+            # A second, independent `IMAGE_IMPORT_DESCRIPTOR` for a DLL
+            # name the image already imports elsewhere (if it does) is
+            # unremarkable and standard -- the PE format allows any number
+            # of descriptors per DLL, each resolved independently by the
+            # real loader -- so this never needs to look for or reuse an
+            # existing KERNEL32 entry.
+            if pending_dep_delay_lazy_thunks:
+                _k32_name = b"KERNEL32.DLL\x00"
+                _ll_name = b"LoadLibraryA\x00"
+                _gpa_name = b"GetProcAddress\x00"
+                k32_blob = bytearray()
+                k32_blob += _k32_name
+                ll_ibn_off = len(k32_blob)
+                k32_blob += struct.pack("<H", 0) + _ll_name  # IMAGE_IMPORT_BY_NAME: Hint, Name
+                while len(k32_blob) % 2:
+                    k32_blob += b"\x00"
+                gpa_ibn_off = len(k32_blob)
+                k32_blob += struct.pack("<H", 0) + _gpa_name
+                while len(k32_blob) % ptr_size:
+                    k32_blob += b"\x00"
+                int_off = len(k32_blob)
+                k32_blob += b"\x00" * (ptr_size * 3)
+                iat_off = len(k32_blob)
+                k32_blob += b"\x00" * (ptr_size * 3)
+
+                k32_rva = next_rva
+                for base_off in (int_off, iat_off):
+                    k32_blob[base_off:base_off + ptr_size] = (k32_rva + ll_ibn_off).to_bytes(ptr_size, "little")
+                    k32_blob[base_off + ptr_size:base_off + 2 * ptr_size] = (
+                        (k32_rva + gpa_ibn_off).to_bytes(ptr_size, "little")
+                    )
+                    # third qword/dword of each array is already the null
+                    # terminator from the zero-fill above.
+
+                # `_SCN_CODE_RWX`, not `_SCN_DATA_R` -- this blob's IAT
+                # array (unlike `.sidata2`'s own descriptor-only bytes
+                # just below, never itself written to at runtime) is
+                # exactly what the real loader's own import-snapping
+                # overwrites in place with each resolved function's
+                # absolute address, same as it does for any ordinary
+                # import's `FirstThunk` array (which is why every other
+                # dependency's own such array -- living inside that
+                # dependency's `blob`, appended via `.sdepN` below -- is
+                # also placed RWX, not read-only). Confirmed the hard way:
+                # a read-only placement here reproduced a real
+                # `STATUS_ACCESS_VIOLATION` inside `ntdll!LdrpSnapModule`
+                # itself (a write fault on this exact IAT slot) against
+                # `tests/windows/test_pe_real_binaries.py::
+                # test_second_real_binary_curated_subset` (the only
+                # existing test whose embedded dependency, WS2_32.dll,
+                # happens to have delay imports of its own, so it's the
+                # only one that ever exercises this synthetic import at
+                # all).
+                new_sections.append((
+                    b".sdlzimp", bytes(k32_blob), k32_rva, _SCN_CODE_RWX, len(k32_blob),
+                ))
+                next_rva = _align_up(k32_rva + len(k32_blob), section_alignment)
+
+                merged_descriptors.append({
+                    "name_rva": k32_rva,
+                    "orig_first_thunk_rva": k32_rva + int_off,
+                    "first_thunk_rva": k32_rva + iat_off,
+                })
+                loadlibrarya_iat_slot_va = image_base + k32_rva + iat_off
+                getprocaddress_iat_slot_va = image_base + k32_rva + iat_off + ptr_size
+            else:
+                loadlibrarya_iat_slot_va = None
+                getprocaddress_iat_slot_va = None
+
             # -- merged/combined import directory -------------------------
             if removed_dll_names_lower or merged_descriptors:
                 combined: List[Dict[str, int]] = []
@@ -2427,6 +2677,57 @@ class PortableExecutableEmbedder:
             else:
                 import_rva = None
                 import_bytes = b""
+
+            # -- finalize deferred delay-import lazy-resolution thunks -----
+            # `loadlibrarya_iat_slot_va`/`getprocaddress_iat_slot_va` are
+            # only known now that the synthetic KERNEL32 import above has
+            # been placed, so this necessarily runs after it (and after
+            # the merged import directory, though it doesn't itself need
+            # anything from there). Build every pending thunk's own code
+            # first (into one growing buffer, each noting its own offset
+            # within it), *then* place that buffer as a single new
+            # section and only then patch every calling IAT slot -- a
+            # thunk's own code never needs to know its own eventual
+            # address (nothing in it is self-referential), only each
+            # *calling* IAT slot does, so there's no ordering hazard in
+            # splitting it this way, and it avoids a second full pass
+            # purely to compute placement.
+            if pending_dep_delay_lazy_thunks:
+                thunks_blob = bytearray()
+                thunk_patches: List[Tuple[str, int, int, List[int]]] = []
+                for (dep_name_lower, slot_offset_in_blob, dll_name_va,
+                     func_key_va_or_ordinal, func_key_is_ordinal) in pending_dep_delay_lazy_thunks:
+                    dep_X = dep_X_by_name_lower[dep_name_lower]
+                    self_iat_slot_va = image_base + dep_X + slot_offset_in_blob
+                    code, reloc_offsets = build_windows_delay_import_lazy_thunk(
+                        dll_name_va=dll_name_va,
+                        func_key_va_or_ordinal=func_key_va_or_ordinal,
+                        func_key_is_ordinal=func_key_is_ordinal,
+                        loadlibrarya_iat_slot_va=loadlibrarya_iat_slot_va,
+                        getprocaddress_iat_slot_va=getprocaddress_iat_slot_va,
+                        self_iat_slot_va=self_iat_slot_va,
+                    )
+                    thunk_off = len(thunks_blob)
+                    thunks_blob += code
+                    thunk_patches.append((dep_name_lower, slot_offset_in_blob, thunk_off, reloc_offsets))
+
+                thunks_rva = next_rva
+                new_sections.append((
+                    b".sdlzthk", bytes(thunks_blob), thunks_rva, _SCN_CODE_RWX, len(thunks_blob),
+                ))
+                next_rva = _align_up(thunks_rva + len(thunks_blob), section_alignment)
+
+                reloc_type = IMAGE_REL_BASED_DIR64 if is64 else IMAGE_REL_BASED_HIGHLOW
+                for dep_name_lower, slot_offset_in_blob, thunk_off, reloc_offsets in thunk_patches:
+                    thunk_va = image_base + thunks_rva + thunk_off
+                    dep_blob = dep_blobs_by_name_lower[dep_name_lower]
+                    dep_blob[slot_offset_in_blob:slot_offset_in_blob + ptr_size] = thunk_va.to_bytes(
+                        ptr_size, "little"
+                    )
+                    dep_X = dep_X_by_name_lower[dep_name_lower]
+                    new_reloc_entries.append((dep_X + slot_offset_in_blob, reloc_type))
+                    for off in reloc_offsets:
+                        new_reloc_entries.append((thunks_rva + thunk_off + off, reloc_type))
 
             # -- generated init-call stub (build_windows_stub, Task 7) -----
             if dep_entry_calls:

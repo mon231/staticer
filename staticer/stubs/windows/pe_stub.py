@@ -100,6 +100,7 @@ from staticer.stubs._keystone_utils import (
     patch_immediate as _patch_immediate,
     patch_two_va_sentinels as _patch_two_va_sentinels,
     patch_va_sentinel as _patch_va_sentinel,
+    patch_va_sentinels as _patch_va_sentinels,
 )
 
 # Each helper below returns (bytes, [byte offsets of embedded absolute-VA
@@ -307,6 +308,171 @@ def build_windows_tls_index_fixup(*, host_tlsindex_va: int, dep_tlsindex_va: int
         data, _X64_SENTINEL_A, host_tlsindex_va, _X64_SENTINEL_B, dep_tlsindex_va, 8
     )
     return data, [host_off, dep_off]
+
+
+# Distinct from `_X64_SENTINEL_A`/`_B` above purely for readability (each
+# function's own sentinels only ever appear in buffers *that function*
+# assembles, so there's no actual collision risk in sharing them --
+# `patch_va_sentinels`, like `patch_two_va_sentinels`, locates every
+# sentinel against the original, unmodified buffer before splicing any of
+# them in).
+_X64_DELAY_SENTINEL_DLLNAME = 0x1111111111111111
+_X64_DELAY_SENTINEL_FUNCKEY = 0x2222222222222222
+_X64_DELAY_SENTINEL_LOADLIBRARYA_SLOT = 0x3333333333333333
+_X64_DELAY_SENTINEL_GETPROCADDRESS_SLOT = 0x4444444444444444
+_X64_DELAY_SENTINEL_SELF_IAT_SLOT = 0x5555555555555555
+
+
+def build_windows_delay_import_lazy_thunk(
+    *,
+    dll_name_va: int,
+    func_key_va_or_ordinal: int,
+    func_key_is_ordinal: bool,
+    loadlibrarya_iat_slot_va: int,
+    getprocaddress_iat_slot_va: int,
+    self_iat_slot_va: int,
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code for a single delay-imported function whose real
+    target DLL is *not* itself embedded this run (see pe_embedder.py's
+    long comment on the two-case split for why only this case -- "target
+    not embedded" -- needs a generated stub at all, and why the stub
+    exists in the first place rather than leaving the compiler's own
+    delay-load descriptor untouched).
+
+    Confirmed via a real crash, reproduced against a real 010 Editor
+    embed and root-caused with `cdb`: once this dependency's own code is
+    physically embedded inside the host's single image (rather than
+    separately `LoadLibrary`'d as its own OS-registered module), the
+    *compiler's own* generated delay-load thunk's call into
+    `ntdll!LdrResolveDelayLoadedAPI` -- passing `&__ImageBase` as
+    `ParentModuleBase`, which after embedding correctly computes (via
+    ordinary RIP-relative addressing) to this dependency's own placement
+    *within* the host image, not a real, separately loaded module's base
+    -- fails with `LdrResolveDelayLoadedAPI:Unable to locate DLL based at
+    <address>. Status = 0xc0000135`, and the thunk's own handling of that
+    failure dereferences a null/garbage result, crashing with RIP
+    becoming exactly 0 (`First chance exceptions`... `Access violation -
+    code c0000005`, confirmed live under `cdb`). This happens regardless
+    of whether the delay-import's *target* DLL is itself embedded or a
+    real, always-loadable external one -- the broken half is
+    `ParentModuleBase`, which is wrong either way once the *descriptor's
+    own module* has been embedded, not anything about the target.
+
+    So the real compiler-generated thunk for this function must never
+    run at all, for any embedded dependency with delay imports --
+    regardless of target. This builds a drop-in replacement: a tiny,
+    self-contained thunk that performs the *exact same* work a real
+    `__delayLoadHelper2` would (resolve, once, via plain `LoadLibraryA`
+    + `GetProcAddress` -- real Win32 APIs that handle API-set redirection
+    correctly on their own, unlike this project's own static,
+    build-time-only resolution -- then self-patch the IAT slot with the
+    resolved address so every later call skips straight to it, exactly
+    matching a real delay-load's own steady-state-bound behavior), using
+    only ordinary Win32 calls through two freshly-added KERNEL32.dll IAT
+    slots (`loadlibrarya_iat_slot_va`/`getprocaddress_iat_slot_va` --
+    KERNEL32.dll is never embeddable/excludable by this project's own
+    design, so these always resolve at real process load, same as any
+    other ordinary import) -- never touching `LdrResolveDelayLoadedAPI`
+    or anything else loader-internal.
+
+    `self_iat_slot_va`'s caller installs *this stub's own address* into
+    that same IAT slot beforehand (mirroring B1/B1-delay's direct-address
+    patch elsewhere in `pe_embedder.py`) -- nothing here runs until the
+    host's own compiled code actually calls through that slot for the
+    first time, preserving genuine delay-load laziness; this only
+    replaces *what* runs on that first call, not *when*.
+
+    `func_key_va_or_ordinal` is either the absolute VA of the function
+    name's existing ASCII string (already present, unmodified, in the
+    owning dependency's own embedded blob -- the compiler's own
+    `IMAGE_IMPORT_BY_NAME.Name`) for a by-name import, or the raw ordinal
+    integer value itself (not a pointer -- `GetProcAddress`'s own
+    `MAKEINTRESOURCE`-style convention for an ordinal-style
+    `lpProcName`) for a by-ordinal one; either way it's loaded into
+    `rdx` as an opaque 8-byte value, but `func_key_is_ordinal` tells the
+    caller (via this function's returned offset list) whether that
+    particular immediate is a real address needing its own base-
+    relocation entry (by-name) or a small integer that must never be
+    treated as one (by-ordinal -- adding an ASLR delta to an ordinal
+    number would silently corrupt it into a bogus one).
+
+    Register save/restore: unlike `_x64_call_dllmain` above (whose own
+    callee, `DllMain`, has a fixed, integer-only signature), a delay-
+    imported function's real signature is unknown here, so this must
+    preserve every x64 argument-passing register it might disturb --
+    `rcx`/`rdx`/`r8`/`r9` *and* `xmm0`-`xmm3` (the first four integer and
+    floating-point argument slots respectively; MSVC's own real
+    `__tailMerge*` thunks preserve exactly this same set, for the same
+    reason) -- around its own two calls, then restores all eight before
+    tail-jumping to the resolved address with the original incoming
+    register state otherwise completely undisturbed and the stack
+    exactly as the caller left it (no new frame left behind), so the
+    resolved function's own eventual `ret` lands directly back at the
+    real caller.
+
+    Failure path (either Win32 call returns NULL): `ud2` -- a real delay
+    import's *default* (unhooked) failure behavior is itself fatal (MSVC
+    raises a structured exception), and this case should be exceedingly
+    rare in practice (it only means a real system DLL this project never
+    touched at all somehow isn't loadable on this machine, a condition
+    the original, unmodified binary would be equally unable to recover
+    from) -- `ud2` is a clean, deterministic, immediately-debuggable
+    trap, deliberately safer than letting execution continue into
+    whatever garbage a silent NULL `jmp` would land on.
+    """
+    asm = (
+        "push rcx\n"
+        "push rdx\n"
+        "push r8\n"
+        "push r9\n"
+        "sub rsp, 0x78\n"
+        "movups [rsp+0x20], xmm0\n"
+        "movups [rsp+0x30], xmm1\n"
+        "movups [rsp+0x40], xmm2\n"
+        "movups [rsp+0x50], xmm3\n"
+        f"mov rcx, {_X64_DELAY_SENTINEL_DLLNAME}\n"
+        f"mov rax, {_X64_DELAY_SENTINEL_LOADLIBRARYA_SLOT}\n"
+        "call qword ptr [rax]\n"
+        "test rax, rax\n"
+        "jz fail\n"
+        "mov rcx, rax\n"
+        f"mov rdx, {_X64_DELAY_SENTINEL_FUNCKEY}\n"
+        f"mov rax, {_X64_DELAY_SENTINEL_GETPROCADDRESS_SLOT}\n"
+        "call qword ptr [rax]\n"
+        "test rax, rax\n"
+        "jz fail\n"
+        f"mov rcx, {_X64_DELAY_SENTINEL_SELF_IAT_SLOT}\n"
+        "mov [rcx], rax\n"
+        "movups xmm0, [rsp+0x20]\n"
+        "movups xmm1, [rsp+0x30]\n"
+        "movups xmm2, [rsp+0x40]\n"
+        "movups xmm3, [rsp+0x50]\n"
+        "add rsp, 0x78\n"
+        "pop r9\n"
+        "pop r8\n"
+        "pop rdx\n"
+        "pop rcx\n"
+        "jmp rax\n"
+        "fail:\n"
+        "ud2"
+    )
+    data = _assemble(True, asm)
+    data, offsets = _patch_va_sentinels(
+        data,
+        [
+            (_X64_DELAY_SENTINEL_DLLNAME, dll_name_va),
+            (_X64_DELAY_SENTINEL_FUNCKEY, func_key_va_or_ordinal),
+            (_X64_DELAY_SENTINEL_LOADLIBRARYA_SLOT, loadlibrarya_iat_slot_va),
+            (_X64_DELAY_SENTINEL_GETPROCADDRESS_SLOT, getprocaddress_iat_slot_va),
+            (_X64_DELAY_SENTINEL_SELF_IAT_SLOT, self_iat_slot_va),
+        ],
+        8,
+    )
+    dllname_off, funckey_off, loadlib_off, getproc_off, self_off = offsets
+    reloc_offsets = [dllname_off, loadlib_off, getproc_off, self_off]
+    if not func_key_is_ordinal:
+        reloc_offsets.append(funckey_off)
+    return data, reloc_offsets
 
 
 def build_windows_stub(

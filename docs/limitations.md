@@ -333,75 +333,170 @@
   accepted correctness gap, not a new crash risk, and exactly the kind
   of gap the "second, independent verification pass" note above already
   anticipated.
-- **Fixed, found via the same 010 Editor testing**: the PE embedder had
-  no handling at all for `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT` (the
-  linker's `/DELAYLOAD` feature) -- a second, independent real crash
-  source, unrelated to the TLS scanner bugs above. Left alone, a
-  delay-imported function's compiled thunk, on its first actual use,
-  calls `ntdll!LdrResolveDelayLoadedAPI` passing the embedded
-  dependency's own placement as if it were a real, separately
-  `LoadLibrary`'d module's `HMODULE` -- which it isn't (it's just
-  appended code/data inside the host's own single image, with no
-  corresponding entry in the process's real loaded-module list).
-  Confirmed via live single-stepping under a debugger (embedding a real
-  `OLEAUT32.dll`, which delay-loads several API-set DLLs for COM
-  interop, as part of a real 010 Editor build) that this leads to an
-  indirect call through a null pointer a few frames further in, with
-  the host crashing with RIP becoming exactly `0`. Checked against every
-  dependency a real 010 Editor embed pulls in: 38 of 57 have a
+- **Fixed, found via the same 010 Editor testing (history below --
+  CORRECTED twice; the first "fix" here had a real, confirmed
+  regression of its own)**: the PE embedder had no handling at all for
+  `IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT` (the linker's `/DELAYLOAD`
+  feature) -- a second, independent real crash source, unrelated to the
+  TLS scanner bugs above. Left alone, a delay-imported function's
+  compiled thunk, on its first actual use, calls
+  `ntdll!LdrResolveDelayLoadedAPI` passing the embedded dependency's own
+  placement as if it were a real, separately `LoadLibrary`'d module's
+  `HMODULE` -- which it isn't. Confirmed via live single-stepping under
+  a debugger (embedding a real `OLEAUT32.dll`) that this leads to an
+  indirect call through a null pointer, crashing with RIP becoming
+  exactly `0`. 38 of 57 of a real 010 Editor embed's dependencies have a
   non-empty delay-import directory, so refusing to embed any dependency
-  that has one isn't viable -- nearly every real Windows system DLL uses
-  `/DELAYLOAD` for at least a handful of imports. An intermediate fix
-  attempt (overwriting every delay-import IAT slot with a tiny stub that
-  unconditionally "fails") did stop the crash but broke 010 Editor's own
-  startup, which treats one specific forced-failed COM call as fatal and
-  exits on its own -- confirmed by comparing against the unmodified
-  original `010Editor.exe` (even just renamed/run from a different
-  location), which starts normally. Properly fixed instead by folding
-  each delay-import module into the very same merged/combined
-  ordinary-import mechanism already used for a dependency's own
-  *remaining* (non-embedded) ordinary imports: the modern (VS2005+)
-  delay-import descriptor format already mirrors an ordinary
-  `IMAGE_IMPORT_DESCRIPTOR` almost exactly (`pINT` is the same shape as
-  `OriginalFirstThunk`, `pIAT` the same shape as `FirstThunk`), so its
-  name-table thunk entries get the same `+X` rebase as an ordinary
-  import's and it becomes one more merged descriptor entry. The real
-  Windows loader then resolves it like any ordinary import, at process
-  load, before any application code runs -- so by the time the
-  delay-load thunk's own compiled "already resolved?" fast-path check
-  runs, the slot already holds the real function's address, and the
-  thunk never calls into the delay-load helper (hence never touches the
-  dangerous fake-HMODULE path) at all. No dependency-graph change was
-  needed: delay-import targets are never themselves one of this run's
-  embedded dependencies (nothing currently walks delay imports when
-  discovering the graph), so there's no "target is itself embedded" case
-  to handle here, unlike the ordinary-import merge.
-- **Found, not yet fixed**: with both TLS-scanner false-positives and
-  the delay-import gap above fixed, the full real 010 Editor embed (all
-  8 originally-requested dependencies, 57 once transitive imports are
-  included, excluding only
-  `kernel32.dll,msvcrt.dll,ntdll.dll,USER32.dll,ole32.dll`) no longer
-  crashes with an access violation, but still doesn't run cleanly: it
-  now terminates a few seconds into startup with exit code `0xC0000417`
-  (`STATUS_INVALID_CRUNTIME_PARAMETER`) -- the UCRT's own fatal
-  invalid-parameter fast-fail path, not an unhandled SEH exception (it
-  generates no Windows Error Reporting / Application-Error event log
-  entry at all, consistent with a deliberate `__fastfail`-style
-  termination rather than a wild crash). Not yet root-caused: it doesn't
-  reproduce reliably while single-stepping under a live debugger (cdb
-  sessions covering the relevant ~4-10 second real-time window
-  consistently failed to hit it at all, even with breakpoints on
-  `ntdll!RtlFailFast`/`RtlFailFast2`/`KERNELBASE!RaiseFailFastException`),
-  suggesting it's sensitive to real wall-clock timing (e.g. an
-  async/worker-thread race) in a way that a debugger's own overhead
-  disturbs. Confirmed real progress nonetheless: an earlier, intermediate
-  fix attempt (stubbing out delay imports instead of properly resolving
-  them, see above) got only as far as a clean, immediate `exit(-1)`
-  before even this point was reached, so properly resolving delay
-  imports did fix a real, further startup step (likely COM
-  initialization) before this next, distinct issue surfaces. Future work:
-  reproduce under a lower-overhead instrumentation approach (e.g. a
-  logging `DllMain`/CRT-init shim rather than live single-stepping, per
-  this project's own established debug-instrumentation precedent) to
-  identify which specific CRT call and parameter trips the fast-fail
-  check.
+  with one isn't viable.
+
+  **First fix attempt (shipped, then reverted)**: folded every delay-
+  import module into the same merged/combined *ordinary*-import
+  mechanism already used for a dependency's own remaining external
+  imports, reasoning that the modern delay-import descriptor shape
+  (`pINT`/`pIAT`) mirrors an ordinary one closely enough to reuse that
+  machinery. This stopped the null-pointer crash, but introduced a
+  **real, confirmed regression**: it turns every genuinely *lazy*
+  delay-load into an *eager*, process-init-time one, resolved by
+  `LdrpInitializeProcess` before any application code -- even the
+  host's own entry point -- ever runs. Confirmed via a real full 010
+  Editor embed (`staticer 010Editor.exe -o onefile_010editor.exe
+  --exclude kernel32.dll,msvcrt.dll,ntdll.dll,USER32.dll,ole32.dll`,
+  all 57 transitive dependencies once ADVAPI32/SHELL32/COMDLG32 are
+  added) plus `gflags /i <exe> +sls` (Show Loader Snaps): the build no
+  longer crashed, but *hung forever* behind a `STATUS_DLL_INIT_FAILED`
+  ("this application was unable to start correctly") hard-error dialog
+  that generates no WER entry at all (a loader-level hard error, not an
+  unhandled exception), with the loader snap log pinpointing the exact
+  cause --
+  ```
+  LdrpPreprocessDllName - ERROR: ... for DLL
+  ext-ms-win-security-chambers-l1-1-0.dll failed with status
+  0xc0000481 (STATUS_API_SET_NOT_PRESENT)
+  LdrpInitializeProcess - ERROR: Walking the import tables of the
+  executable and its static imports failed with status 0xc0000481
+  ```
+  -- i.e. `SECHOST.dll` (itself one of the 57 embedded dependencies
+  here, pulled in purely as an export-forward target of ADVAPI32.dll,
+  nothing to do with delay imports at all) has its own perfectly
+  ordinary, genuine `/DELAYLOAD` import of that API set, which
+  independently confirmed has no real host at all on this machine
+  (`LoadLibraryW` on it fails with `ERROR_MODULE_NOT_FOUND`/126,
+  outside this project entirely). That's fine -- *expected*, even --
+  for a real delay import: it's resolved only on an actual first call,
+  which evidently never happens during 010 Editor's own normal startup.
+  Forced into the *ordinary* import table instead, its mere absence
+  became a mandatory, unrecoverable process-startup failure. (This
+  wasn't an isolated fluke either: a scan of this same real 010 Editor
+  closure found over 100 delay-import entries whose target happens to
+  also be one of this run's own embedded dependencies once ADVAPI32/
+  SHELL32/COMDLG32/SHLWAPI/SHCORE/NETAPI32/etc. are all embedded --
+  contradicting that first fix's own "a delay-import's target is never
+  itself one of this run's embedded dependencies" assumption.)
+
+  **Second attempt tried, also empirically falsified**: simply
+  reverting to "leave every delay-import descriptor completely
+  untouched" (its pre-fix behavior) was tried next and *also* crashes --
+  this turns out to be the *same original* null-pointer-at-RIP-0 bug,
+  reproduced again and root-caused live under `cdb`:
+  ```
+  LdrResolveDelayLoadedAPI - ERROR: LdrResolveDelayLoadedAPI:Unable to
+  locate DLL based at 0x00000001425B0000. Status = 0xc0000135
+  Access violation - code c0000005 (first chance)
+  00000000`00000000 ??              ???
+  ```
+  This is unavoidable for *any* embedded dependency with its own delay
+  imports, regardless of the delay-import's target: the compiler's own
+  thunk computes `ParentModuleBase` as `&__ImageBase` (correctly
+  resolving, via ordinary RIP-relative addressing, to this dependency's
+  own placement *within* the host image -- the same property that
+  already lets its entry point/export table/TLS directory work
+  untouched), but `LdrResolveDelayLoadedAPI` needs that to be a *real,
+  separately loaded module's* registered base, which it no longer is
+  once embedded -- so the lookup fails and the thunk's own failure
+  handling dereferences a null/garbage result.
+
+  **Properly fixed**: the compiler's own delay-load thunk must never
+  run at all for *any* delay import belonging to an embedded
+  dependency, regardless of its target, while the target DLL's real
+  name/optionality must never be forced into eager resolution either.
+  Two cases:
+  1. Target is itself embedded this run: no live DLL by that name is
+     left to delay-load, so each function is resolved directly to the
+     target's own final address (mirroring the ordinary-import "B1"
+     merge's dependency-to-dependency IAT patch) -- bypassing the
+     delay-load thunk entirely, since the IAT slot already holds the
+     real address before anything could call through it. A resolution
+     failure here (e.g. SHLWAPI.dll's real delay import of SHELL32.dll's
+     ordinal 102, `SHCoCreateInstance`, which SHELL32 itself can only
+     re-export as a forward to the same unembeddable
+     `api-ms-win-shell-shellcom-l1-1-0.dll` virtual API set as the
+     next bullet below) falls back to leaving that one IAT slot's
+     original compiled bytes untouched rather than failing the whole
+     embed -- safe because the target DLL is still a real, loadable
+     file on disk even once also embedded.
+  2. Target is a real external DLL, not embedded this run (the
+     overwhelming majority of cases): a small generated per-function
+     "lazy thunk" is installed in its IAT slot instead of the
+     compiler's own thunk. On the host's own code's first actual call
+     through that slot (never before), it does its own real
+     `LoadLibraryA`+`GetProcAddress` (through two freshly added
+     KERNEL32.dll IAT slots -- KERNEL32.dll is never embeddable/
+     excludable, so this is always safe/eager with no optionality
+     concern), self-patches the slot with the resolved address so
+     every later call skips straight to it (matching a real delay-
+     load's own steady-state-bound behavior), and only then tail-jumps
+     -- preserving every x64 argument register (`rcx`/`rdx`/`r8`/`r9`
+     and `xmm0`-`xmm3`, matching what MSVC's own real thunks preserve)
+     so the resolved function's own `ret` lands directly back at the
+     real caller. Nothing runs until that first real call; what runs
+     then never touches `LdrResolveDelayLoadedAPI` or any other loader-
+     internal mechanism at all.
+
+  Verified against the real, full 010 Editor embed: the build no
+  longer hangs behind a hard-error dialog and no longer null-pointer-
+  crashes -- it now actually starts, shows a real window, and stays
+  alive and responsive. See the next bullet for what it shows once it
+  does.
+- **Found, confirmed unrelated to the delay-import fix above**: with
+  the loader-level hang/crash fixed, the real full 010 Editor embed
+  now actually starts and shows a real window for the first time in
+  this whole investigation -- but that window is Qt's own
+  "This application failed to start because no Qt platform plugin
+  could be initialized" error dialog, not 010 Editor's real UI.
+  Root-caused, not just observed: `Get-Process -Module` on the running
+  process shows `Qt6Core.dll` and `Qt6Gui.dll` both loaded as real,
+  separate, disk-resident modules (`C:\Program Files\010
+  Editor\Qt6Core.dll`/`Qt6Gui.dll`) *alongside* this run's own embedded
+  copies of the exact same two DLLs. Cause: 010 Editor's Qt platform
+  plugin (`Plugins\platforms\qwindows.dll`, loaded at runtime via
+  `QPluginLoader`/`LoadLibrary`, entirely outside this project's own
+  static import-table analysis) has its own ordinary, compile-time
+  import of `Qt6Core.dll`/`Qt6Gui.dll` by name; since no module by
+  that exact name is registered in the process once they're embedded,
+  the real Windows loader dutifully finds and loads a second, fresh,
+  genuinely separate copy straight off disk (both files are still
+  there -- embedding copies a dependency's code into the host, it
+  doesn't remove the original file). The result is two independent
+  QtCore/QtGui runtime instances in one process with no shared global
+  state (separate `QCoreApplication::instance()`, among everything
+  else), which is exactly the shape Qt's own plugin-compatibility
+  check is designed to reject.
+
+  This is **not a new gap introduced by this task's fix** -- it's the
+  first entry in this very file ("Explicit dynamic-loading from the
+  executed code itself ... is not hooked yet") and the
+  deliberately-deferred "runtime dynamic-loading interception" hook
+  `pe_stub.py`'s own module docstring already describes in detail
+  (locate KERNEL32's LoadLibraryW/GetProcAddress IAT slots, redirect a
+  request for an embedded module's own name back to its embedded
+  address instead of letting a fresh copy load) -- it simply had never
+  been *reached* before: every earlier attempt at this real 010 Editor
+  embed crashed or hung during process bootstrap, long before Qt ever
+  got a chance to load a plugin at all. Fixing the delay-import
+  regression was a precondition for discovering this, not its cause.
+  Implementing that hook is a substantial, separate undertaking (real,
+  non-trivial generated machine code touching every embedded
+  dependency's own name resolution, with -- per that same docstring --
+  "an outsized blast radius if it's subtly wrong") and is left as
+  follow-up work, consistent with this project's existing precedent of
+  shipping the tested mechanism now and deferring that specific hook.

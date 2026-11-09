@@ -55,7 +55,7 @@ sequence containing *two* independent VA sentinels together, then patch
 both -- that's what `patch_two_va_sentinels` is for.
 """
 
-from typing import Dict, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from keystone import Ks, KS_ARCH_X86, KS_MODE_32, KS_MODE_64
 
@@ -186,3 +186,29 @@ def patch_two_va_sentinels(
     data = splice_at(data, offset_a, real_va_a.to_bytes(width, "little"))
     data = splice_at(data, offset_b, real_va_b.to_bytes(width, "little"))
     return data, offset_a, offset_b
+
+
+def patch_va_sentinels(
+    data: bytes, pairs: Sequence[Tuple[int, int]], width: int
+) -> Tuple[bytes, List[int]]:
+    """Generalizes `patch_two_va_sentinels` above to any number of
+    independent absolute-VA sentinels in one assembled sequence (`pairs`
+    is a sequence of `(sentinel, real_va)`), rather than duplicating its
+    exactly-two-sentinel shape a third or fourth time. Needed by the PE
+    delay-import lazy-resolution thunk (`pe_stub.py`'s
+    `build_windows_delay_import_lazy_thunk`), which embeds five
+    independent absolute VAs in one short sequence (the DLL-name string,
+    the LoadLibraryA/GetProcAddress IAT slots to call through, the
+    function name-or-ordinal value, and the stub's own target IAT slot
+    to self-patch on success).
+
+    Same cross-sentinel-collision avoidance as `patch_two_va_sentinels`:
+    every sentinel's offset is located against the original, unmodified
+    buffer before any splice happens, so a real value that happens to
+    equal some *other*, not-yet-spliced sentinel's byte pattern can never
+    cause a later lookup to find a spurious extra match.
+    """
+    offsets = [locate_sentinel(data, sentinel.to_bytes(width, "little")) for sentinel, _ in pairs]
+    for offset, (_, real_va) in zip(offsets, pairs):
+        data = splice_at(data, offset, real_va.to_bytes(width, "little"))
+    return data, offsets

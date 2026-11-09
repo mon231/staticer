@@ -28,18 +28,25 @@ pin down two things the embed-level tests can't easily isolate:
 
 import pytest
 
+from staticer.stubs._keystone_utils import patch_va_sentinels
 from staticer.stubs.windows.pe_stub import (
     _patch_immediate,
     _X64_SENTINEL_A,
     _X64_SENTINEL_B,
     _X86_SENTINEL_A,
     _X86_SENTINEL_B,
+    _X64_DELAY_SENTINEL_DLLNAME,
+    _X64_DELAY_SENTINEL_FUNCKEY,
+    _X64_DELAY_SENTINEL_LOADLIBRARYA_SLOT,
+    _X64_DELAY_SENTINEL_GETPROCADDRESS_SLOT,
+    _X64_DELAY_SENTINEL_SELF_IAT_SLOT,
     _x64_call_dllmain,
     _x64_process_attach_guard,
     _x64_tail_jmp,
     _x86_call_dllmain,
     _x86_process_attach_guard,
     _x86_tail_jmp,
+    build_windows_delay_import_lazy_thunk,
     build_windows_tls_index_fixup,
 )
 
@@ -231,3 +238,164 @@ def test_tls_index_fixup_cross_sentinel_collision_slot_b():
     assert build_windows_tls_index_fixup(
         host_tlsindex_va=host_va, dep_tlsindex_va=dep_va
     ) == _old_tls_index_fixup(host_va, dep_va)
+
+
+# -- patch_va_sentinels (the N-way generalization of patch_two_va_sentinels, --
+# -- needed by build_windows_delay_import_lazy_thunk's five independent VAs) --
+
+def test_patch_va_sentinels_rejects_missing_sentinel():
+    data = b"\x90" * 4
+    with pytest.raises(ValueError):
+        patch_va_sentinels(data, [(0x1111111111111111, 0x2000)], 8)
+
+
+def test_patch_va_sentinels_rejects_duplicated_sentinel():
+    pat = (0x1111111111111111).to_bytes(8, "little")
+    data = b"\x90" + pat + b"\x90" + pat
+    with pytest.raises(ValueError):
+        patch_va_sentinels(data, [(0x1111111111111111, 0x2000)], 8)
+
+
+def test_patch_va_sentinels_splices_all_in_order():
+    s_a, s_b, s_c = 0x1111, 0x2222, 0x3333
+    data = s_a.to_bytes(8, "little") + s_b.to_bytes(8, "little") + s_c.to_bytes(8, "little")
+    patched, offsets = patch_va_sentinels(
+        data, [(s_a, 0xAAAA), (s_b, 0xBBBB), (s_c, 0xCCCC)], 8
+    )
+    assert offsets == [0, 8, 16]
+    assert patched == (
+        (0xAAAA).to_bytes(8, "little") + (0xBBBB).to_bytes(8, "little") + (0xCCCC).to_bytes(8, "little")
+    )
+
+
+def test_patch_va_sentinels_tolerates_cross_sentinel_collision():
+    # The real value supplied for slot A equals slot B's own (not yet
+    # spliced) sentinel constant -- must not cause B's later lookup to
+    # find two matches (see patch_two_va_sentinels's own module-docstring
+    # section on this, generalized here to N slots).
+    s_a, s_b = 0x1111, 0x2222
+    data = s_a.to_bytes(8, "little") + s_b.to_bytes(8, "little")
+    patched, offsets = patch_va_sentinels(data, [(s_a, s_b), (s_b, 0xCCCC)], 8)
+    assert offsets == [0, 8]
+    assert patched == s_b.to_bytes(8, "little") + (0xCCCC).to_bytes(8, "little")
+
+
+# -- build_windows_delay_import_lazy_thunk ------------------------------
+#
+# No pre-existing "legacy" hand-encoded implementation to byte-compare
+# against (unlike every builder above) -- this is brand new machine code,
+# built to fix a real, confirmed regression (see docs/limitations.md's
+# delay-import entries and pe_embedder.py's own long comment on the
+# two-case delay-import split for the full story). What's tested here
+# instead: every real VA this builder embeds resolves to exactly one
+# occurrence (so a future change to the assembly source text that
+# introduces an accidental sentinel collision is caught immediately,
+# rather than surfacing three layers up as a mis-resolved address in a
+# real embedded binary -- real-binary verification for the mechanism
+# itself is covered by `tests/windows/test_pe_real_binaries.py::
+# test_second_real_binary_curated_subset`, WS2_32.dll's own genuine
+# delay imports, and a real full 010 Editor embed, both documented in
+# docs/limitations.md -- a real, compiler-generated `/DELAYLOAD` fixture
+# wasn't practical to add here: this project's own `c_compiler` fixture
+# only resolves a GNU/mingw toolchain in this environment, and `/DELAYLOAD`
+# is an MSVC-specific linker feature with no mingw equivalent this
+# project could reliably generate the same "modern", RVA-based descriptor
+# format from), and that `func_key_is_ordinal` correctly selects whether
+# the function-key immediate is treated as a real address needing its own
+# relocation entry or an opaque small integer that must never get one.
+
+#: Each tuple's five values are deliberately mutually distinct (unlike
+#: most real VAs in practice, two of these *could* coincidentally match,
+#: but every test below asserts each one's own byte pattern occurs
+#: exactly once, which would be a false failure if two slots legitimately
+#: shared a value -- the dedicated cross-sentinel-collision tests further
+#: below cover the "two slots end up holding the same bytes" case on
+#: purpose, against the sentinel constants specifically).
+_DELAY_THUNK_VA_CASES = [
+    (0x1400A0000, 0x1400A0020, 0x1400B0000, 0x1400B0008, 0x1400C0000),
+    (0x7FFABCDE1000, 0x7FFABCDE2000, 0x7FFABCDE3000, 0x7FFABCDE4000, 0x7FFABCDE5000),
+    (0, 1, 2, 3, 4),
+    (0xFFFFFFFFFFFFFFFF, 0x1, 0x2, 0x3, 0x4),
+]
+
+
+@pytest.mark.parametrize(
+    "dll_name_va,func_key_va,loadlib_va,getproc_va,self_va", _DELAY_THUNK_VA_CASES
+)
+def test_delay_import_lazy_thunk_by_name_resolves_all_five_sentinels(
+    dll_name_va, func_key_va, loadlib_va, getproc_va, self_va
+):
+    code, reloc_offsets = build_windows_delay_import_lazy_thunk(
+        dll_name_va=dll_name_va,
+        func_key_va_or_ordinal=func_key_va,
+        func_key_is_ordinal=False,
+        loadlibrarya_iat_slot_va=loadlib_va,
+        getprocaddress_iat_slot_va=getproc_va,
+        self_iat_slot_va=self_va,
+    )
+    # By-name: every one of the five embedded VAs is a real address, so
+    # all five get their own relocation entry.
+    assert len(reloc_offsets) == 5
+    for va in (dll_name_va, func_key_va, loadlib_va, getproc_va, self_va):
+        assert code.count(va.to_bytes(8, "little")) == 1
+
+
+@pytest.mark.parametrize(
+    "dll_name_va,ordinal,loadlib_va,getproc_va,self_va",
+    [
+        (0x1400A0000, 102, 0x1400B0000, 0x1400B0008, 0x1400C0000),
+        (0x1400A0000, 0, 0x1400B0000, 0x1400B0008, 0x1400C0000),
+        (0x1400A0000, 0xFFFF, 0x1400B0000, 0x1400B0008, 0x1400C0000),
+    ],
+)
+def test_delay_import_lazy_thunk_by_ordinal_excludes_funckey_from_relocs(
+    dll_name_va, ordinal, loadlib_va, getproc_va, self_va
+):
+    code, reloc_offsets = build_windows_delay_import_lazy_thunk(
+        dll_name_va=dll_name_va,
+        func_key_va_or_ordinal=ordinal,
+        func_key_is_ordinal=True,
+        loadlibrarya_iat_slot_va=loadlib_va,
+        getprocaddress_iat_slot_va=getproc_va,
+        self_iat_slot_va=self_va,
+    )
+    # By-ordinal: the ordinal is a small integer, not an address -- it
+    # must NOT get a relocation entry (adding an ASLR delta to it would
+    # silently corrupt it into a bogus ordinal), so only the other four
+    # genuine VAs do.
+    assert len(reloc_offsets) == 4
+    for va in (dll_name_va, loadlib_va, getproc_va, self_va):
+        assert code.count(va.to_bytes(8, "little")) == 1
+
+
+@pytest.mark.parametrize(
+    "sentinel_name,sentinel_value",
+    [
+        ("dll_name_va", _X64_DELAY_SENTINEL_DLLNAME),
+        ("func_key_va_or_ordinal", _X64_DELAY_SENTINEL_FUNCKEY),
+        ("loadlibrarya_iat_slot_va", _X64_DELAY_SENTINEL_LOADLIBRARYA_SLOT),
+        ("getprocaddress_iat_slot_va", _X64_DELAY_SENTINEL_GETPROCADDRESS_SLOT),
+        ("self_iat_slot_va", _X64_DELAY_SENTINEL_SELF_IAT_SLOT),
+    ],
+)
+def test_delay_import_lazy_thunk_cross_sentinel_collision(sentinel_name, sentinel_value):
+    # One real VA happens to equal *another* slot's own sentinel constant
+    # (the same class of collision `patch_two_va_sentinels`/
+    # `patch_va_sentinels` are specifically designed to tolerate) --
+    # must still produce exactly one occurrence of every real value.
+    kwargs = dict(
+        dll_name_va=0x1400A0000,
+        func_key_va_or_ordinal=0x1400A0020,
+        func_key_is_ordinal=False,
+        loadlibrarya_iat_slot_va=0x1400B0000,
+        getprocaddress_iat_slot_va=0x1400B0008,
+        self_iat_slot_va=0x1400C0000,
+    )
+    kwargs[sentinel_name] = sentinel_value
+    code, reloc_offsets = build_windows_delay_import_lazy_thunk(**kwargs)
+    assert len(reloc_offsets) == 5
+    for key in (
+        "dll_name_va", "func_key_va_or_ordinal", "loadlibrarya_iat_slot_va",
+        "getprocaddress_iat_slot_va", "self_iat_slot_va",
+    ):
+        assert code.count(kwargs[key].to_bytes(8, "little")) == 1
