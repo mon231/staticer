@@ -69,6 +69,29 @@ _SCN_UNINIT_RW = 0xC0000080  # CNT_UNINITIALIZED_DATA|MEM_READ|MEM_WRITE (".bss"
 _TLS64_FIELD_OFFSET = {"start": 0, "end": 8, "callbacks": 24, "zero_fill": 32}
 
 
+# pefile's own `max_symbol_exports` default (8192) silently truncates a
+# dependency's own export-table PARSE once past that many distinct
+# symbols -- NOT a corruption guard tripping on a malicious file (that's
+# `max_repeated_symbol`'s/the separate (name, address)-repeat check's job,
+# both unaffected by this), just an overly conservative default for a
+# real, large, legitimate module: confirmed via a genuine commercial Qt6
+# application's own Qt6Gui.dll (9255 real exports) -- `embed()` reported
+# a specific exported symbol the host's own import table needed as
+# "does not export" it, even though the real Windows loader resolves it
+# fine (the DLL unmodified by this project runs correctly) -- because
+# pefile's parse silently stopped at the 8192nd symbol and the needed
+# one happened to sit past that cut-off. Same bug *class* as the already-
+# fixed import-table re-parse truncation documented in `list_pe_imports`
+# below (a pefile internal safety limit, not file corruption, silently
+# dropping real data for a sufficiently large real-world binary) -- just
+# a different cap on a different directory. Comfortably above any real
+# module's export count (even large system DLLs like combase.dll/
+# shell32.dll stay well under this); raising it costs nothing but a
+# larger loop bound, since genuine corruption is still caught by the
+# unrelated repeated-(name, address) check regardless of this value.
+_MAX_SYMBOL_EXPORTS = 65536
+
+
 def list_pe_imports(path: Path) -> List[str]:
     """Names of the DLLs a PE file imports, read from its IMPORT_DESCRIPTOR
     directory (empty list if it has none)."""
@@ -83,7 +106,7 @@ def list_pe_imports(path: Path) -> List[str]:
     # truncation cascaded into `build_dependency_graph` only ever seeing
     # the input's first 3 imports, and a corrupted/crashing final binary.
     # Never re-parse an already-constructed PE object.
-    pe = pefile.PE(str(path))
+    pe = pefile.PE(str(path), max_symbol_exports=_MAX_SYMBOL_EXPORTS)
     try:
         if not hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
             return []
@@ -118,7 +141,7 @@ def _list_pe_import_graph_edges(path: Path) -> List[str]:
     parse of the same already-parsed object is unsafe; two independent
     `pefile.PE()` constructions from the same path are fine, just wasteful
     I/O-wise for every node in a large graph, avoided here instead."""
-    pe = pefile.PE(str(path))
+    pe = pefile.PE(str(path), max_symbol_exports=_MAX_SYMBOL_EXPORTS)
     try:
         names: List[str] = []
         if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
@@ -1247,7 +1270,7 @@ class PortableExecutableEmbedder:
             self.output_path.write_bytes(self.input_path.read_bytes())
             return
 
-        pe = pefile.PE(str(self.input_path))
+        pe = pefile.PE(str(self.input_path), max_symbol_exports=_MAX_SYMBOL_EXPORTS)
         try:
             # See `list_pe_imports`'s comment: `pefile.PE(...)` already fully
             # parses every data directory at construction -- re-parsing
@@ -1414,7 +1437,7 @@ class PortableExecutableEmbedder:
             tls_zero_fill_total = 0
 
             for node in order:
-                dep = pefile.PE(str(node.path))
+                dep = pefile.PE(str(node.path), max_symbol_exports=_MAX_SYMBOL_EXPORTS)
                 try:
                     if dep.FILE_HEADER.Machine != host_machine:
                         raise ValueError(
@@ -1964,6 +1987,22 @@ class PortableExecutableEmbedder:
                                 fwd_dll_lower = fwd_dll.lower()
                                 if not fwd_dll_lower.endswith(".dll"):
                                     fwd_dll_lower += ".dll"
+                                # A forward target can name the target's
+                                # export either by name (the common case,
+                                # already handled correctly below) or by
+                                # ORDINAL, per the PE/COFF spec's own
+                                # "#N" notation (a real, observed shape --
+                                # e.g. SHLWAPI.dll forwards export #619 to
+                                # "SHCORE.#192"). `raw_exports` below is
+                                # keyed by the target's real `sym.ordinal`
+                                # (an int) or `sym.name` (a str with no
+                                # '#') -- the raw string "#192" would never
+                                # match either, silently failing to
+                                # resolve a forward that's otherwise
+                                # perfectly resolvable. Convert it to the
+                                # real int key here instead.
+                                if fwd_func.startswith("#"):
+                                    fwd_func = int(fwd_func[1:])
                                 entry = ("fwd", fwd_dll_lower, fwd_func, forwarder)
                             else:
                                 entry = image_base + X + sym.address
