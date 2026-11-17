@@ -31,40 +31,123 @@ relocated DT_INIT_ARRAY entries, flattened in dependencies-first order;
 ``.init_array`` specifically, not the legacy single DT_INIT entry -- see
 ``embed()``'s own docstring for why).
 
-Deliberately unimplemented: the dlopen/dlsym PLT hook ``hooked_names``
-implies (intercepting a dlopen/dlsym call for a name that used to be a
-real DT_NEEDED entry -- now embedded, so a real dlopen of it would
-otherwise fail with "no such file"). A *correct* version of this hook
-turns out to need more than a simple GOT-slot patch: overwriting the
-host's own dlopen/dlsym GOT slot with a trampoline, while leaving its
-JMPREL entry (and the lazy-PLT-stub machinery it feeds) untouched so a
-*fallthrough* call still resolves normally, means the *first* fallthrough
-call permanently self-clobbers the hook (ld.so's lazy binding overwrites
-that same GOT slot with the real resolved address once lazy resolution
-actually fires, uninstalling the trampoline for every call after that).
-Avoiding that cleanly needs either a self-reinstalling trampoline (saves
-the resolved target, calls through it, then rewrites its own hook back
-into the GOT slot every time) or an upfront harmless bootstrap call to
-force resolution to happen once, immediately, before the hook is ever
-installed -- either way, a second, independent layer of machine code and
-runtime bookkeeping on top of everything else this stub already does.
-Given the task brief's own explicit latitude for "a minimal/documented-
-partial implementation if a full general-purpose hook would balloon
-scope disproportionately -- same latitude Task 3/4 used for their own
-stubs" (echoed for this exact hook, on both the PE and ELF sides), and
-that *neither* of this task's two required tests
-(test_exception_crosses_embedded_boundary,
-test_dependency_initializer_runs_before_dependent) exercises dlopen/dlsym
-at all, this function simply raises ``NotImplementedError`` for a
-non-empty ``hooked_names`` rather than installing a hook with a silent,
-untested correctness gap. ``ElfEmbedder.embed()`` currently never passes
-a non-empty set.
+Hook mechanism (implemented, x64 only): mirrors ``pe_stub.py``'s own
+LoadLibraryW/LoadLibraryA/GetProcAddress hook in *shape* -- a generated
+trampoline intercepts an explicit, application-level call asking for one
+of this run's embedded dependencies by name and redirects it to the
+already-embedded copy -- but ``dlopen``/``dlsym`` differ from Win32's
+LoadLibrary/GetProcAddress in ways that rule out a direct transliteration:
+
+* **Lazy PLT binding self-clobbers a naive GOT-slot patch.** A plain
+  "read the GOT slot, save it, overwrite it with the trampoline" step
+  (exactly what the PE hook does -- correct there because the PE loader
+  always eagerly resolves every IAT slot before any code runs) is *wrong*
+  here: under the ABI-default lazy-binding scheme, an unresolved
+  ``dlopen``/``dlsym`` GOT slot initially holds the address of its own
+  PLT entry's lazy-resolution trailer, not a real function pointer. The
+  first *fallthrough* call after the hook is installed still works (the
+  trailer's own resolution logic runs, and execution reaches the real
+  function correctly), but as a side effect ``ld.so``'s resolver
+  (``_dl_fixup``) permanently overwrites that same GOT slot with the real
+  resolved address -- silently uninstalling the trampoline for every call
+  after that first one. ``build_linux_hook_install`` avoids this with an
+  upfront, harmless bootstrap call through *every* discovered slot before
+  ever reading/overwriting any of them (``dlopen(NULL, RTLD_LAZY)`` --
+  well-defined, returns a handle to the main program, no real loading;
+  ``dlsym(RTLD_DEFAULT, <bogus probe name>)`` -- well-defined, returns
+  ``NULL``): this forces real, final resolution to happen once, by us,
+  before the hook is ever installed, so the GOT slot it then reads and
+  overwrites is guaranteed to already hold the real address, and nothing
+  ever triggers ``_dl_fixup`` again afterward. Done per-slot (not just
+  once per API, unlike the PE hook's "read the first slot" shortcut),
+  because -- unlike Windows's uniformly eagerly-resolved IAT -- each
+  independent GOT slot importing the same symbol (the host's own, and/or
+  any embedded dependency's own remaining import of it) has its *own*
+  independent lazy-resolution state.
+* **A pre-existing GOT slot can be RELRO-protected (read-only).** Modern
+  toolchains (confirmed against this project's own: a plain ``gcc -fpie
+  -pie`` build already defaults to full RELRO + ``BIND_NOW``) place
+  ``.got.plt`` inside the ``PT_GNU_RELRO`` segment, which the loader
+  ``mprotect``s to read-only as its very last startup step, before any
+  ``.init_array`` entry (including this hook's own install code) ever
+  runs. Writing to such a slot without first restoring write access
+  faults with ``SIGSEGV`` -- the direct ELF analogue of the PE hook's own
+  ``VirtualProtect`` dance around a read-only IAT slot, for the same
+  underlying reason. ``build_linux_hook_install`` checks each discovered
+  slot against the host's own ``PT_GNU_RELRO`` range (known statically at
+  embed time, computed by the caller) and only wraps the ones that fall
+  inside it in a real ``mprotect(PROT_READ|PROT_WRITE)`` / write /
+  ``mprotect(PROT_READ)`` sequence -- through a synthetic external
+  ``mprotect`` import the caller adds the same way it already forwards any
+  other unresolved external reference (see ``ElfEmbedder.embed()``'s
+  ``external_symbol_index`` mechanism). A slot outside that range (e.g.
+  one newly created inside an embedded dependency's own appended data,
+  which the host's pre-existing ``PT_GNU_RELRO`` segment was never
+  extended to cover) is written directly, with no protection dance at
+  all -- restoring an already-writable page to merely ``PROT_READ`` would
+  wrongly downgrade every *other*, unrelated GOT slot sharing that same
+  4 KiB page.
+* **Symbol versioning**: real glibc exports ``dlopen``/``dlsym`` as
+  versioned symbols (confirmed via ``readelf -s``/``nm -D`` against a real
+  glibc 2.43 ``libc.so.6``: ``dlopen@GLIBC_2.2.5``/``dlopen@@GLIBC_2.34``,
+  and the pre-2.34 name was in ``libdl.so.2`` instead -- glibc >= 2.34
+  merged ``libdl`` into ``libc``). This needs no special handling at all:
+  confirmed via ``pyelftools`` against a real compiled fixture that a
+  ``.dynsym`` entry's own ``name`` field is always the bare, unversioned
+  string (``"dlopen"``) -- the ``@``/``@@`` version suffix ``readelf``
+  prints is synthesized for display by cross-referencing ``.gnu.version``/
+  ``.gnu.version_r`` separately, never stored in the name string itself --
+  so an ordinary by-name relocation walk (exactly what this project's
+  other GOT/PLT handling already does) matches correctly regardless of
+  which glibc version/library actually provides either symbol.
+* **A recognized handle with no matching export returns NULL, not a real
+  ``dlsym`` fallback** -- deliberately narrower than ``GetProcAddress``'s
+  own documented "fall through to the real API" latitude might suggest,
+  and for the same reason ``pe_stub.py``'s own GetProcAddress trampoline
+  already stops short of that for its exact same case: a fake, non-
+  loader-tracked handle is never safe to hand to the *real* API. For ELF
+  specifically this is *worse* than merely calling the wrong function --
+  real ``dlsym`` (glibc's ``_dl_sym``) does ``l = (struct link_map *)
+  handle`` and dereferences fields on it with **no validation at all**
+  when ``handle`` isn't ``RTLD_DEFAULT``/``RTLD_NEXT``; our fake handle
+  (an embedded dependency's own base VA) *is* a validly mapped address,
+  so this wouldn't even reliably crash -- it would read whatever
+  unrelated bytes happen to sit at a fixed offset from that base (this
+  dependency's own ELF header/code, not a ``link_map``) and chase them as
+  pointers, risking a wild write or a silently wrong resolved address
+  rather than a clean failure. Returning ``NULL`` is the same, deliberate
+  trade their own docstring makes, for the same reason.
+* ``RTLD_DEFAULT``/``RTLD_NEXT`` (dlsym's two pseudo-handles) need no
+  special-casing at all: both are small, fixed non-address values (0 and
+  ``(void*)-1``) that can never coincidentally equal one of this run's
+  embedded dependencies' own real base VAs, so the ordinary table-miss
+  path already falls them through to the real ``dlsym`` unconditionally.
+
+The three builders below mirror ``pe_stub.py``'s own trio in role
+(``build_linux_dlopen_trampoline`` ~ LoadLibrary, ``build_linux_dlsym_
+trampoline`` ~ GetProcAddress, ``build_linux_hook_install`` ~ the IAT-slot
+installer), using the SysV x86-64 calling convention throughout (``rdi``/
+``rsi`` for the first two integer/pointer arguments, never Windows's
+``rcx``/``rdx`` fastcall registers, and no shadow-space requirement around
+a call -- SysV only needs 16-byte stack alignment immediately before
+one). ``ElfEmbedder.embed()`` builds the match/module tables (from the
+same per-dependency export data it already computes for its own GOT/PLT
+patching) and splices the install code in as one more, synthetic,
+zero-argument entry prepended to ``init_array_calls`` -- exactly the same
+"runs before any embedded dependency's own real initializer" trick
+``pe_embedder.py`` uses for its ``__hook_install__`` entry.
+
+x64 only, matching every other machine-code-generating stub in this
+module; a 32-bit (x86) host gets no hook at all.
 """
 
-from typing import List, Set, Tuple
+import itertools
+from typing import List, Optional, Sequence, Set, Tuple
 
 from staticer.stubs._keystone_utils import assemble as _assemble
 from staticer.stubs._keystone_utils import assemble_with_immediate as _assemble_with_immediate
+from staticer.stubs._keystone_utils import patch_va_sentinels as _patch_va_sentinels
+from staticer.stubs._keystone_utils import patch_two_va_sentinels as _patch_two_va_sentinels
 
 # -- assembling via Keystone instead of hand-encoded opcode bytes --
 #
@@ -305,13 +388,11 @@ def build_linux_stub(
     constructors, a plain C++ throw/catch) happen to touch alignment-
     sensitive instructions at all, so they could not have caught it.
     """
-    if hooked_names:
-        raise NotImplementedError(
-            "the dlopen/dlsym PLT hook isn't implemented yet -- see this module's "
-            "own docstring for why it's deliberately deferred; pass an empty "
-            "hooked_names set"
-        )
     del init_order  # see docstring: informational only, carries no addresses
+    del hooked_names  # unused here by design -- see module docstring's "Hook mechanism"
+    # section: the real dlopen/dlsym interception machinery is built by the caller
+    # and spliced into `init_calls` as one more entry, same as pe_stub.py's
+    # build_windows_stub never reading its own same-named parameter either.
 
     reloc_offsets: List[int] = []
     out = bytearray()
@@ -441,3 +522,283 @@ def build_linux_stub(
 
     assert all(off + ptr_size <= len(out) for off in reloc_offsets)  # sanity: every immediate fits
     return bytes(out), reloc_offsets
+
+
+# -- dlopen/dlsym runtime hook (x64 only) -----------------------------------
+# See this module's own docstring's "Hook mechanism" section for the full
+# design derivation and the caller-side (ElfEmbedder.embed()) integration
+# this assumes.
+
+_HOOK_SENTINEL_TABLE = 0x1122334455667788
+_HOOK_SENTINEL_SAVED = 0x8877665544332211
+
+# Base for the install builder's own, a-priori-unknown number of
+# independent absolute-VA sentinels (one per discovered GOT slot, per
+# bootstrap-force/read/overwrite step -- see build_linux_hook_install) --
+# same "generate as many as needed" approach as pe_stub.py's own
+# `_make_hook_install_sentinels`, just using an unbounded counter instead
+# of a precomputed budget, since nothing here needs to preallocate an
+# array of them up front. Chosen in a distinct, easily recognizable range
+# from this module's other sentinels purely for readability when
+# debugging a failed splice, not a correctness requirement.
+_HOOK_INSTALL_SENTINEL_BASE = 0x9999000000000000
+
+_MPROTECT_PAGE = 0x1000
+
+
+def build_linux_dlopen_trampoline(*, match_table_va: int, saved_original_va: int) -> Tuple[bytes, List[int]]:
+    """x64 machine code for a drop-in ``dlopen`` replacement, installed over
+    every discovered real GOT slot for it by ``build_linux_hook_install``.
+
+    ``match_table_va`` points at a caller-built array of 16-byte entries --
+    ``(name_string_va: u64, fake_handle_va: u64)``, ASCII, NUL-terminated by
+    one all-zero sentinel entry (``name_string_va == 0``) -- one per
+    embedded dependency, keyed by the exact name the host's own dynamic
+    section originally knew it by (the same string a real ``dlopen`` call
+    for it would have to use). The match is byte-for-byte, case-
+    *sensitive* (unlike the PE hook's case-insensitive DLL-name fold --
+    Linux filenames are case-sensitive); on a match, the table entry's own
+    ``fake_handle_va`` (that dependency's own base VA within the merged
+    image -- mirroring the PE hook's own "HMODULE is the module's base
+    address" convention) is returned directly in ``rax``, without ever
+    calling the real ``dlopen``.
+
+    ``rdi`` (the incoming ``filename``) is explicitly NULL-checked before
+    any table lookup -- unlike Win32's ``lpLibFileName``, a real ``dlopen``
+    call legitimately passes ``NULL`` (meaning "the main program itself"),
+    and dereferencing it unconditionally the way the PE hook's own
+    ``lpLibFileName`` handling does would crash on that case.
+
+    No match at all (including every ordinary ``dlopen`` call, by far the
+    common case, and every ``NULL`` one) tail-jumps to the real, saved
+    original at ``saved_original_va`` with ``rdi``/``esi`` (the incoming
+    ``filename``/``flags``) completely undisturbed.
+    """
+    asm = (
+        f"mov r11, {_HOOK_SENTINEL_TABLE}\n"
+        "test rdi, rdi\n"
+        "jz no_match\n"
+        "try_entry:\n"
+        "mov rax, [r11]\n"
+        "test rax, rax\n"
+        "jz no_match\n"
+        "mov r10, rdi\n"
+        "char_loop:\n"
+        "movzx r8d, byte ptr [r10]\n"
+        "movzx r9d, byte ptr [rax]\n"
+        "cmp r8d, r9d\n"
+        "jne next_entry\n"
+        "test r8d, r8d\n"
+        "jz matched\n"
+        "inc r10\n"
+        "inc rax\n"
+        "jmp char_loop\n"
+        "next_entry:\n"
+        "add r11, 16\n"
+        "jmp try_entry\n"
+        "matched:\n"
+        "mov rax, [r11+8]\n"
+        "ret\n"
+        "no_match:\n"
+        f"mov rax, {_HOOK_SENTINEL_SAVED}\n"
+        "mov rax, [rax]\n"
+        "jmp rax"
+    )
+    data = _assemble(True, asm)
+    data, table_off, saved_off = _patch_two_va_sentinels(
+        data, _HOOK_SENTINEL_TABLE, match_table_va, _HOOK_SENTINEL_SAVED, saved_original_va, 8
+    )
+    return data, [table_off, saved_off]
+
+
+def build_linux_dlsym_trampoline(*, module_table_va: int, saved_original_va: int) -> Tuple[bytes, List[int]]:
+    """x64 machine code for a drop-in ``dlsym`` replacement, installed over
+    every discovered real GOT slot for it by ``build_linux_hook_install``.
+
+    ``module_table_va`` points at a caller-built array of 16-byte entries --
+    ``(fake_handle_va: u64, by_name_table_va: u64)``, sentinel-terminated
+    on ``fake_handle_va == 0`` -- one per embedded dependency. ``rdi`` (the
+    incoming ``handle``) is matched against each entry's own
+    ``fake_handle_va``; ``RTLD_DEFAULT``/``RTLD_NEXT`` (0 and all-ones) and
+    any genuine real handle can never coincidentally match one of these
+    (real base VAs), so they fall through to the real, saved original at
+    ``saved_original_va`` exactly like every other miss, with ``rdi``/
+    ``rsi`` (``handle``/``symbol``) undisturbed.
+
+    A match commits to resolving against that module's own by-name table
+    (``by_name_table_va``, 16-byte ``(name_string_va: u64, resolved_va:
+    u64)`` pairs, sentinel-terminated on ``name_string_va == 0``) -- an
+    exact, case-sensitive byte-for-byte compare against ``rsi`` (real ELF
+    symbol lookup is case-sensitive), same walk shape as the PE hook's own
+    export-name scan. If found, the resolved VA is returned directly in
+    ``rax``. If the module matched but the symbol doesn't appear in its
+    own table, this returns ``NULL`` (``rax = 0``) rather than falling
+    through to the real ``dlsym`` -- see this module's own docstring for
+    exactly why a fake handle is never safe to hand to the real API here.
+    """
+    asm = (
+        f"mov r11, {_HOOK_SENTINEL_TABLE}\n"
+        "find_module:\n"
+        "mov rax, [r11]\n"
+        "test rax, rax\n"
+        "jz no_match\n"
+        "cmp rax, rdi\n"
+        "je module_found\n"
+        "add r11, 16\n"
+        "jmp find_module\n"
+        "module_found:\n"
+        "mov r9, [r11+8]\n"
+        "name_scan:\n"
+        "mov rax, [r9]\n"
+        "test rax, rax\n"
+        "jz ret_null\n"
+        "mov r8, rax\n"
+        "mov rcx, rsi\n"
+        "name_cmp_loop:\n"
+        "movzx eax, byte ptr [r8]\n"
+        "movzx r10d, byte ptr [rcx]\n"
+        "cmp eax, r10d\n"
+        "jne name_next\n"
+        "test eax, eax\n"
+        "jz name_matched\n"
+        "inc r8\n"
+        "inc rcx\n"
+        "jmp name_cmp_loop\n"
+        "name_next:\n"
+        "add r9, 16\n"
+        "jmp name_scan\n"
+        "name_matched:\n"
+        "mov rax, [r9+8]\n"
+        "ret\n"
+        "ret_null:\n"
+        "xor eax, eax\n"
+        "ret\n"
+        "no_match:\n"
+        f"mov rax, {_HOOK_SENTINEL_SAVED}\n"
+        "mov rax, [rax]\n"
+        "jmp rax"
+    )
+    data = _assemble(True, asm)
+    data, table_off, saved_off = _patch_two_va_sentinels(
+        data, _HOOK_SENTINEL_TABLE, module_table_va, _HOOK_SENTINEL_SAVED, saved_original_va, 8
+    )
+    return data, [table_off, saved_off]
+
+
+def build_linux_hook_install(
+    entries: Sequence[Tuple[str, int, Sequence[int], int]],
+    *,
+    dlsym_probe_va: int,
+    mprotect_slot_va: Optional[int] = None,
+    relro_range: Optional[Tuple[int, int]] = None,
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code that installs the dlopen/dlsym hook: for each
+    ``(api_kind, saved_cell_va, slot_vas, trampoline_va)`` in ``entries``
+    (``api_kind`` is ``"dlopen"`` or ``"dlsym"``; an entry with an empty
+    ``slot_vas`` -- nothing to hook for that API in this image -- is
+    skipped entirely), per discovered real GOT slot:
+
+    1. An upfront, harmless bootstrap call through the slot's *current*
+       value, forcing real resolution to happen now, by us, before this
+       slot is ever read or overwritten -- see this module's own
+       docstring's "Hook mechanism" section for exactly why this step
+       exists (it's the ELF-specific fix for a problem Windows's IAT-based
+       hook never has). Done for every slot independently, not just the
+       first.
+    2. Only then: the first slot's now-guaranteed-resolved value is read
+       and stored into ``saved_cell_va`` (one per API, read once -- every
+       slot for the same symbol holds the identical real address once
+       actually resolved, same simplification ``pe_stub.py``'s own
+       install builder uses).
+    3. Every slot is overwritten with ``trampoline_va``. A slot falling
+       inside ``relro_range`` (the host's own ``PT_GNU_RELRO`` segment
+       bounds, ``(lo, hi)``, computed by the caller -- ``None`` if the
+       host has none) is wrapped in a real
+       ``mprotect(page, 0x1000, PROT_READ|PROT_WRITE)`` / write /
+       ``mprotect(page, 0x1000, PROT_READ)`` sequence through
+       ``mprotect_slot_va`` (a GOT slot for ``mprotect`` itself, added by
+       the caller the same way any other unresolved external reference
+       already gets forwarded -- required whenever any slot falls inside
+       ``relro_range``, otherwise unused). A slot outside that range is
+       written directly.
+
+    ``dlsym_probe_va`` is the absolute VA of a short, NUL-terminated ASCII
+    string naming a symbol that doesn't exist -- used as every dlsym
+    bootstrap call's harmless probe (``dlsym(RTLD_DEFAULT, <probe>)``,
+    well-defined, returns ``NULL``).
+
+    Runs with no live incoming arguments to preserve (spliced into the
+    generated init-array call sequence as one more, synthetic, zero-
+    argument entry -- see this module's own docstring), but still needs
+    its own SysV-ABI-correct call-site realignment for its *own* nested
+    calls (unlike a normal callee, nothing guarantees this function's own
+    incoming ``rsp`` leaves room for that) -- the same ``push r12``/
+    ``and rsp, -16``/...-/``mov rsp, r12``/``pop r12`` bracket
+    ``build_linux_init_array_stub`` already uses for the identical reason
+    (running as an ordinarily-``call``ed function, not a process entry
+    point), reused here rather than invented a second time.
+    """
+    if not any(slot_vas for _, _, slot_vas, _ in entries):
+        return b"", []
+
+    relro_lo, relro_hi = relro_range if relro_range is not None else (None, None)
+
+    pairs: List[Tuple[int, int]] = []
+    sentinels = (_HOOK_INSTALL_SENTINEL_BASE + i for i in itertools.count())
+
+    def sentinel_for(real_va: int) -> int:
+        s = next(sentinels)
+        pairs.append((s, real_va))
+        return s
+
+    lines: List[str] = ["push r12", "mov r12, rsp", "and rsp, -16"]
+
+    for api_kind, saved_cell_va, slot_vas, trampoline_va in entries:
+        if not slot_vas:
+            continue
+
+        # Step 1: bootstrap-force every slot, independently.
+        for slot_va in slot_vas:
+            lines.append(f"mov r11, {sentinel_for(slot_va)}")
+            lines.append("mov rax, [r11]")
+            if api_kind == "dlopen":
+                lines.append("xor edi, edi")  # filename = NULL
+                lines.append("mov esi, 1")  # flags = RTLD_LAZY
+            else:
+                lines.append("xor edi, edi")  # handle = RTLD_DEFAULT
+                lines.append(f"mov rsi, {sentinel_for(dlsym_probe_va)}")  # symbol = bogus probe name
+            lines.append("call rax")
+
+        # Step 2: read the first slot's now-resolved value into saved_cell_va.
+        lines.append(f"mov r11, {sentinel_for(slot_vas[0])}")
+        lines.append("mov rax, [r11]")
+        lines.append(f"mov r10, {sentinel_for(saved_cell_va)}")
+        lines.append("mov [r10], rax")
+
+        # Step 3: overwrite every slot with the trampoline's address.
+        for slot_va in slot_vas:
+            needs_relro = relro_lo is not None and relro_lo <= slot_va < relro_hi
+            if needs_relro:
+                page_va = slot_va & ~(_MPROTECT_PAGE - 1)
+                lines.append(f"mov rdi, {sentinel_for(page_va)}")
+                lines.append(f"mov esi, {_MPROTECT_PAGE}")
+                lines.append("mov edx, 3")  # PROT_READ | PROT_WRITE
+                lines.append(f"mov rax, {sentinel_for(mprotect_slot_va)}")
+                lines.append("call qword ptr [rax]")
+
+            lines.append(f"mov r11, {sentinel_for(slot_va)}")
+            lines.append(f"mov rax, {sentinel_for(trampoline_va)}")
+            lines.append("mov [r11], rax")
+
+            if needs_relro:
+                lines.append(f"mov rdi, {sentinel_for(page_va)}")
+                lines.append(f"mov esi, {_MPROTECT_PAGE}")
+                lines.append("mov edx, 1")  # PROT_READ (restore -- matches PT_GNU_RELRO's own p_flags)
+                lines.append(f"mov rax, {sentinel_for(mprotect_slot_va)}")
+                lines.append("call qword ptr [rax]")
+
+    lines += ["mov rsp, r12", "pop r12", "ret"]
+
+    data = _assemble(True, "\n".join(lines))
+    data, offsets = _patch_va_sentinels(data, pairs, 8)
+    return data, offsets

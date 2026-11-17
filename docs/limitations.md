@@ -1,8 +1,60 @@
 # Limitations
 
 - ELF: explicit dynamic-loading from the executed code itself
-  (`dlopen`+`dlsym`) is not hooked; only dependencies resolved through the
-  input's own dynamic-section table are embedded.
+  (`dlopen`+`dlsym`) against an *embedded* dependency's own name **is**
+  now hooked, x64 hosts only (see `elf_stub.py`'s module docstring's "Hook
+  mechanism" section for the full design) -- `ElfEmbedder.embed()` finds
+  every real GOT slot importing `dlopen`/`dlsym` (the host's own, and/or
+  any embedded dependency's own remaining import of either) and, from a
+  synthetic, zero-argument entry prepended to the generated init-array
+  call sequence (runs before any embedded dependency's own real
+  initializer, same ordering guarantee as the PE hook's own install
+  step), forces real resolution via a harmless bootstrap call (fixing a
+  real ELF-specific hazard the PE hook never has -- a naive "read the GOT
+  slot, overwrite it" patch self-clobbers under lazy PLT binding, since
+  the first real fallthrough call's own lazy resolution permanently
+  overwrites the trampoline right back out), then overwrites every
+  discovered slot with a generated trampoline (through a real
+  `mprotect`-wrapped read/write when a slot falls inside the host's own
+  RELRO-protected range, the ELF analogue of the PE hook's `VirtualProtect`
+  dance). A `dlopen` call for one of this run's embedded dependencies'
+  own names returns that dependency's own base VA as a fake handle
+  (mirroring the PE hook's "HMODULE is the base address" convention); a
+  `dlsym` call against that handle resolves against that dependency's own
+  already-known export table. Confirmed via a real end-to-end fixture
+  (`tests/linux/test_elf_dlopen_hook.py`): after a real `embed()`+run, the
+  host's own runtime `dlopen`+`dlsym` call against an embedded
+  dependency's name resolves and calls through to the embedded copy
+  correctly, including when the real on-disk `.so` is removed first
+  (proving no real `dlopen` happened), and an ordinary `dlopen`/`dlsym`
+  call against a real, unrelated, still-on-disk system library
+  (`libm.so.6`) is completely unaffected by the hook being installed.
+  Known, deliberate scope limits:
+  - x86-64 only (32-bit hosts get no hook at all), matching the PE hook's
+    own x64-only scope.
+  - Only `dlopen`/`dlsym` themselves are hooked, not `dlvsym` (the
+    explicitly-versioned variant) -- not needed for anything this
+    project's own fixtures or the motivating gap actually require.
+  - `RTLD_DEFAULT`/`RTLD_NEXT` (dlsym's pseudo-handles) and any genuine
+    real handle fall through to the real `dlsym` unconditionally, same as
+    every other non-match.
+  - A recognized handle whose requested symbol isn't in that
+    dependency's own export table returns `NULL` rather than falling
+    through to a *real* `dlsym` call with that handle -- deliberately
+    narrower than it might seem necessary to be, and for the same reason
+    `pe_stub.py`'s own `GetProcAddress` trampoline already makes the
+    identical choice for its exact equivalent case: a fake,
+    non-loader-tracked handle is never safe to hand to the real API.
+    Confirmed concretely *why* for ELF specifically (not just mirrored
+    from the PE side without checking): real glibc `dlsym` casts its
+    `handle` argument directly to `struct link_map *` and dereferences
+    fields on it with no validation at all once it isn't
+    `RTLD_DEFAULT`/`RTLD_NEXT` -- since our fake handle (an embedded
+    dependency's own base VA) is itself a validly-mapped address, this
+    wouldn't even reliably crash; it would chase whatever unrelated bytes
+    (that dependency's own ELF header/code, not a real `link_map`) happen
+    to sit there as pointers, risking a wild write or a silently wrong
+    resolved address rather than a clean, debuggable failure.
 - PE (Windows): explicit dynamic-loading (`LoadLibraryW`/`LoadLibraryA`/
   `GetProcAddress`) against an *embedded* dependency's own name **is**
   now hooked, x64 hosts only (see `pe_stub.py`'s module docstring's "Hook

@@ -15,6 +15,17 @@ for the full mechanism and its one real limitation). Unwind-metadata
 preservation and the real generated entrypoint stub are later tasks; see
 ``ElfEmbedder.embed()``'s docstring for exactly what's simplified here.
 
+On an x64 host with at least one embedded dependency, the generated
+init-array call sequence also installs a runtime ``dlopen``/``dlsym`` hook
+(see ``staticer/stubs/linux/elf_stub.py``'s own module docstring's "Hook
+mechanism" section, and this module's own long comment near where it's
+built, just before the external-symbol-forwarding block), the ELF
+counterpart of the PE embedder's own LoadLibraryW/LoadLibraryA/
+GetProcAddress hook -- so an explicit, application-level ``dlopen``/
+``dlsym`` call for one of this run's embedded dependencies by name gets
+redirected to the already-embedded copy instead of a real, separate,
+duplicate (and, post-embedding, likely-failing) load.
+
 ``pyelftools`` is read-only, so every byte this module *writes* is built
 by hand from the fixed, standardized ELF32/ELF64 struct layouts (ELF
 headers, program headers, dynamic-tag entries, and REL/RELA relocation
@@ -28,12 +39,26 @@ import io
 import shutil
 import struct
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from elftools.elf.elffile import ELFFile
 
 from .common.depgraph import build_dependency_graph, embed_order
-from .stubs.linux.elf_stub import build_linux_init_array_stub, build_linux_stub
+from .stubs.linux.elf_stub import (
+    build_linux_dlopen_trampoline,
+    build_linux_dlsym_trampoline,
+    build_linux_hook_install,
+    build_linux_init_array_stub,
+    build_linux_stub,
+)
+
+# Real libc/libdl functions a dlopen/dlsym runtime hook (see embed()'s own
+# "runtime dlopen/dlsym hook" section) looks for existing GOT slots for --
+# matched purely by name (pyelftools' own Symbol.name is always the bare,
+# unversioned string, confirmed against a real glibc 2.43 libc.so.6 via
+# both readelf/nm and pyelftools directly -- see elf_stub.py's module
+# docstring's "Hook mechanism" section for the full verification).
+_HOOKABLE_API_NAMES = ("dlopen", "dlsym")
 
 # -- ELF constants pyelftools doesn't expose as plain ints for our needs --
 # (it hands back Enum-mapped strings for e.g. p_type/d_tag, which is fine
@@ -794,6 +819,40 @@ class ElfEmbedder:
             tag = next(host_dyn.iter_tags(tag_name), None)
             return tag.entry.d_val if tag is not None else None
 
+        # -- runtime dlopen/dlsym hook (x64 only): discover the host's own
+        #    real GOT slot(s) for dlopen/dlsym, if it calls either one
+        #    directly -- see elf_stub.py's module docstring's "Hook
+        #    mechanism" section for the full design. Any relocation type
+        #    that resolves a GOT slot to an external symbol's address
+        #    qualifies (R_*_JUMP_SLOT -- the ordinary lazy-PLT case -- or
+        #    R_*_GLOB_DAT/R_*_ABS_PLUS_ADDEND, e.g. a `-fno-plt` build);
+        #    matched purely by name, which pyelftools always gives bare and
+        #    unversioned (see this module's own `_HOOKABLE_API_NAMES`
+        #    comment). A dependency's *own* remaining real reference to
+        #    either (if any) is discovered separately, after the per-
+        #    dependency loop below -- see `_resolve_dep_reference`'s own
+        #    handling of a truly-external symbol, which already applies
+        #    here with no changes needed.
+        host_api_slot_vas: Dict[str, List[int]] = {name: [] for name in _HOOKABLE_API_NAMES}
+        if is64:
+            for _reloc_table in host_reloc_tables.values():
+                for reloc in _reloc_table.iter_relocations():
+                    if reloc["r_info_type"] not in (R_JUMP_SLOT, R_GLOB_DAT, R_ABS_PLUS_ADDEND):
+                        continue
+                    sym = host_dyn.get_symbol(reloc["r_info_sym"])
+                    if sym.name in host_api_slot_vas:
+                        host_api_slot_vas[sym.name].append(reloc["r_offset"])
+
+        # The host's own PT_GNU_RELRO segment bounds (None if it has none)
+        # -- a GOT slot falling inside this range is read-only by the time
+        # any .init_array entry (including the hook-install code below)
+        # runs; see elf_stub.py's own docstring for exactly why and how
+        # `build_linux_hook_install` uses this.
+        _relro_seg = next(elf.iter_segments(type="PT_GNU_RELRO"), None)
+        host_relro_range: Optional[Tuple[int, int]] = (
+            (_relro_seg["p_vaddr"], _relro_seg["p_vaddr"] + _relro_seg["p_memsz"]) if _relro_seg is not None else None
+        )
+
         # Needed only if some embedded dependency turns out to have a
         # remaining external symbol reference to forward (see
         # `external_symbol_index`, below) -- read unconditionally here
@@ -825,6 +884,15 @@ class ElfEmbedder:
         # well after this), so a COPY relocation's source bytes have to
         # come from here instead.
         dep_blob_by_base: Dict[int, bytes] = {}
+        # Each embedded dependency's own name (the exact string the host's
+        # dynamic section originally knew it by, and the same string a
+        # real `dlopen()` call for it would have to use) -> its own base
+        # vaddr `X` -- the runtime dlopen/dlsym hook's "fake handle" value
+        # for that dependency (mirrors pe_stub.py's own "HMODULE is the
+        # module's base address" convention). Populated alongside
+        # `dep_blob_by_base` below; consumed after the per-dependency loop
+        # by the hook-data-table builder, further down.
+        dep_base_by_name: Dict[str, int] = {}
         # (host vaddr, bytes-to-write) pairs for R_*_COPY relocations (see
         # the R_COPY handling in the patch_specs loop) -- writing has to
         # be deferred until after the "lay everything out" block, further
@@ -1590,6 +1658,7 @@ class ElfEmbedder:
                     _remove_verneed_entry(host_dyn, raw, ptr_size, vaddr_to_offset, node.name)
 
                 dep_blob_by_base[X] = bytes(blob)
+                dep_base_by_name[node.name] = X
                 if is_fixed_base:
                     fixed_base_segments.append((X, bytes(blob)))
                 else:
@@ -1631,6 +1700,169 @@ class ElfEmbedder:
                     continue
                 _seen_extra_needed.add(needed)
                 extra_needed_names.append(needed)
+
+        # -- runtime dlopen/dlsym hook, continued: data tables + trampolines
+        #    + install code (x64 only) -- host-side slots were discovered
+        #    above, before the per-dependency loop; a dependency's own
+        #    remaining real reference to dlopen/dlsym (if any) was already
+        #    converted by `_resolve_dep_reference`, in that loop, into an
+        #    ordinary forwarded external symbol -- recovered here via
+        #    `external_symbol_index`/`new_glob_dat_entries`, the exact same
+        #    data that mechanism already produces for any other truly-
+        #    external reference (`malloc`, `__cxa_throw`, ...). See
+        #    elf_stub.py's own module docstring for the full design this
+        #    implements. Must run *before* the external-symbol-forwarding
+        #    block just below (which serializes `external_symbol_index`
+        #    into a brand new .dynsym), since this may still add one more
+        #    name to it (`mprotect`) -- and before the combined relocation
+        #    table, further down, since this writes into `new_reloc_entries`/
+        #    `new_glob_dat_entries` too.
+        dep_api_slot_vas: Dict[str, List[int]] = {name: [] for name in _HOOKABLE_API_NAMES}
+        for _api_name in _HOOKABLE_API_NAMES:
+            _idx = external_symbol_index.get(_api_name)
+            if _idx is not None:
+                dep_api_slot_vas[_api_name] = [va for va, sidx in new_glob_dat_entries if sidx == _idx]
+
+        all_api_slot_vas: Dict[str, List[int]] = {
+            name: host_api_slot_vas[name] + dep_api_slot_vas[name] for name in _HOOKABLE_API_NAMES
+        }
+
+        if is64 and order and any(all_api_slot_vas.values()):
+            exports_by_base: Dict[int, List[Tuple[str, int]]] = {}
+            for _name, (_X, _off, _size) in combined_exports.items():
+                exports_by_base.setdefault(_X, []).append((_name, _X + _off))
+
+            hook_blob_base = next_vaddr
+            hook_blob = bytearray()
+            hook_reloc_offsets: List[int] = []
+
+            def _hook_va(offset: int) -> int:
+                return hook_blob_base + offset
+
+            def _put_va(value: int) -> None:
+                hook_reloc_offsets.append(len(hook_blob))
+                hook_blob.extend(value.to_bytes(8, "little"))
+
+            def _put_raw64(value: int) -> None:
+                hook_blob.extend((value & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little"))
+
+            def _pad8() -> None:
+                while len(hook_blob) % 8:
+                    hook_blob.append(0)
+
+            dlopen_match_entries: List[Tuple[int, int]] = []  # (name_off, X)
+            dlsym_module_entries: List[Tuple[int, int]] = []  # (X, by_name_table_off)
+            for node in order:
+                X = dep_base_by_name[node.name]
+                name_off = len(hook_blob)
+                hook_blob.extend(node.name.encode("ascii") + b"\x00")
+                dlopen_match_entries.append((name_off, X))
+
+                _pad8()
+                by_name_offsets: List[Tuple[int, int]] = []
+                for sym_name, resolved_va in exports_by_base.get(X, []):
+                    sym_name_off = len(hook_blob)
+                    hook_blob.extend(sym_name.encode("ascii") + b"\x00")
+                    by_name_offsets.append((sym_name_off, resolved_va))
+                _pad8()
+                by_name_table_off = len(hook_blob)
+                for sym_name_off, resolved_va in by_name_offsets:
+                    _put_va(_hook_va(sym_name_off))
+                    _put_va(resolved_va)
+                _put_raw64(0)
+                _put_raw64(0)
+                dlsym_module_entries.append((X, by_name_table_off))
+
+            _pad8()
+            match_table_off = len(hook_blob)
+            for name_off, X in dlopen_match_entries:
+                _put_va(_hook_va(name_off))
+                _put_va(X)
+            _put_raw64(0)
+            _put_raw64(0)
+
+            module_table_off = len(hook_blob)
+            for X, by_name_off in dlsym_module_entries:
+                _put_va(X)
+                _put_va(_hook_va(by_name_off))
+            _put_raw64(0)
+            _put_raw64(0)
+
+            saved_dlopen_off = len(hook_blob)
+            _put_raw64(0)
+            saved_dlsym_off = len(hook_blob)
+            _put_raw64(0)
+
+            probe_off = len(hook_blob)
+            hook_blob.extend(b"staticer_dlsym_bootstrap_probe\x00")
+            _pad8()
+
+            # mprotect is only needed -- and only added as a new external
+            # symbol reference -- if at least one discovered slot actually
+            # falls inside the host's own PT_GNU_RELRO range (see
+            # elf_stub.py's docstring for why a slot outside it is written
+            # directly, with no protect/restore dance at all).
+            any_needs_relro = host_relro_range is not None and any(
+                host_relro_range[0] <= va < host_relro_range[1]
+                for _slots in all_api_slot_vas.values() for va in _slots
+            )
+            mprotect_slot_va: Optional[int] = None
+            if any_needs_relro:
+                if "mprotect" not in external_symbol_index:
+                    external_symbol_index["mprotect"] = host_symtab_count + len(external_symbol_index)
+                external_symbol_is_weak["mprotect"] = False
+                mprotect_slot_off = len(hook_blob)
+                _put_raw64(0)
+                new_glob_dat_entries.append((_hook_va(mprotect_slot_off), external_symbol_index["mprotect"]))
+                mprotect_slot_va = _hook_va(mprotect_slot_off)
+
+            dlopen_code, dlopen_relocs = build_linux_dlopen_trampoline(
+                match_table_va=_hook_va(match_table_off), saved_original_va=_hook_va(saved_dlopen_off),
+            )
+            dlopen_tramp_off = len(hook_blob)
+            hook_blob.extend(dlopen_code)
+            hook_reloc_offsets.extend(dlopen_tramp_off + off for off in dlopen_relocs)
+
+            dlsym_code, dlsym_relocs = build_linux_dlsym_trampoline(
+                module_table_va=_hook_va(module_table_off), saved_original_va=_hook_va(saved_dlsym_off),
+            )
+            dlsym_tramp_off = len(hook_blob)
+            hook_blob.extend(dlsym_code)
+            hook_reloc_offsets.extend(dlsym_tramp_off + off for off in dlsym_relocs)
+
+            install_entries: List[Tuple[str, int, Sequence[int], int]] = []
+            if all_api_slot_vas["dlopen"]:
+                install_entries.append(
+                    ("dlopen", _hook_va(saved_dlopen_off), all_api_slot_vas["dlopen"], _hook_va(dlopen_tramp_off))
+                )
+            if all_api_slot_vas["dlsym"]:
+                install_entries.append(
+                    ("dlsym", _hook_va(saved_dlsym_off), all_api_slot_vas["dlsym"], _hook_va(dlsym_tramp_off))
+                )
+
+            install_code, install_relocs = build_linux_hook_install(
+                install_entries,
+                dlsym_probe_va=_hook_va(probe_off),
+                mprotect_slot_va=mprotect_slot_va,
+                relro_range=host_relro_range,
+            )
+            install_off = len(hook_blob)
+            hook_blob.extend(install_code)
+            hook_reloc_offsets.extend(install_off + off for off in install_relocs)
+
+            new_sections.append((hook_blob_base, bytes(hook_blob)))
+            next_vaddr = _align_up(hook_blob_base + len(hook_blob), _PAGE)
+            for off in hook_reloc_offsets:
+                new_reloc_entries.append((hook_blob_base + off, _read_int(hook_blob, off, 8)))
+
+            # Prepended (not appended), same as every other "must run
+            # before any embedded dependency's own real initializer" entry
+            # this method builds -- runs as the *very first* init-array
+            # call, so the hook is installed before anything else (any
+            # embedded dependency's own constructor, or the host's own
+            # original startup code once this stub tail-jumps/falls
+            # through to it) gets a chance to call dlopen/dlsym for real.
+            init_array_calls.insert(0, _hook_va(install_off))
 
         # -- forward embedded dependencies' remaining external symbol
         #    references into the host's own dynamic section (see

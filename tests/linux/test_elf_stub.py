@@ -138,13 +138,24 @@ def test_main_stub_32_bytes_and_relocs():
         assert code[off : off + 4] == addr.to_bytes(4, "little")
 
 
-def test_main_stub_hooked_names_not_implemented():
-    import pytest
-
-    with pytest.raises(NotImplementedError):
-        build_linux_stub(
-            [], {"dlopen"}, is64=True, init_calls=[0x1000], original_entry=0x2000
-        )
+def test_main_stub_hooked_names_accepted_but_unused():
+    # The dlopen/dlsym hook is now implemented (see elf_stub.py's own
+    # "Hook mechanism" docstring section) -- but, exactly like
+    # pe_stub.py's build_windows_stub never reading its own same-named
+    # parameter, build_linux_stub itself never builds that hook; the
+    # caller (ElfEmbedder.embed()) builds it separately and splices the
+    # install code into `init_calls` as one more entry. `hooked_names` is
+    # accepted (for interface-compatibility with the original design
+    # brief) and simply ignored -- no exception, and the generated code
+    # is identical to passing an empty set.
+    with_hooked, relocs_a = build_linux_stub(
+        [], {"dlopen"}, is64=True, init_calls=[0x1000], original_entry=0x2000
+    )
+    without_hooked, relocs_b = build_linux_stub(
+        [], set(), is64=True, init_calls=[0x1000], original_entry=0x2000
+    )
+    assert with_hooked == without_hooked
+    assert relocs_a == relocs_b
 
 
 def test_main_stub_sanity_assert_holds_for_large_call_count():
