@@ -1,9 +1,31 @@
 # Limitations
 
-- Explicit dynamic-loading from the executed code itself (`dlopen`+`dlsym`
-  / `LoadLibraryW`+`GetProcAddress`) is not hooked yet; only dependencies
-  resolved through the input's own import/dynamic-section table are
-  embedded.
+- ELF: explicit dynamic-loading from the executed code itself
+  (`dlopen`+`dlsym`) is not hooked; only dependencies resolved through the
+  input's own dynamic-section table are embedded.
+- PE (Windows): explicit dynamic-loading (`LoadLibraryW`/`LoadLibraryA`/
+  `GetProcAddress`) against an *embedded* dependency's own name **is**
+  now hooked, x64 hosts only (see `pe_stub.py`'s module docstring's "Hook
+  mechanism" section for the full design) -- this project's own
+  generated entrypoint stub installs trampolines over every discovered
+  real IAT slot for the three, before any embedded dependency's own
+  initializer runs, so anything that later asks to load one of this
+  run's embedded dependencies by name gets back its already-initialized
+  embedded address instead of triggering a real, separate, duplicate
+  load. Two scope limits remain, both deliberate:
+  - 32-bit (x86) hosts get no hook at all (the trampolines/install code
+    are x64 machine code only, matching every other recently-added stub
+    in that module).
+  - This intercepts *explicit, application-level* LoadLibrary*/
+    GetProcAddress calls, not the OS loader's own *internal* resolution
+    of a module's statically-compiled import table while mapping that
+    module. A module loaded dynamically by name (which this hook does
+    see) that itself statically imports one of this run's embedded
+    dependencies by name is NOT thereby redirected to the embedded copy
+    -- the loader's own internal import-table walk for that module never
+    calls through any IAT slot this hook can see or overwrite. See the
+    010 Editor Qt-platform-plugin entry below for the real-world case
+    this was confirmed against, and exactly what it does and doesn't fix.
 - A "full closure" embed on ELF still bottoms out at glibc's own dynamic
   linker/loader internals, which stay dynamically linked rather than
   embedded. Root cause confirmed concrete, not a vague "loader internals"

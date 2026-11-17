@@ -24,33 +24,112 @@ other hardcoded absolute address this project already emits -- see
 ``pe_embedder.py``'s own module docstring on why) if the final image
 might ever load somewhere other than its preferred base.
 
-Hook mechanism (deliberately deferred): ``hooked_names`` is accepted and
-threaded through for interface compatibility with the design doc's
-"runtime dynamic-loading interception" goal, but this implementation does
-not yet emit the LoadLibraryW/GetProcAddress IAT-interception
-trampolines it describes. Installing that correctly means generating code
-that runs *before* any embedded module's own initializer and:
-  1. locates KERNEL32.dll's LoadLibraryW/GetProcAddress IAT slots in the
-     host's own (already-merged) import directory,
-  2. saves each slot's real (loader-resolved) value somewhere our own
-     trampolines can read it back from,
-  3. overwrites each slot with a trampoline's own address, and
-  4. in each trampoline, compares the *name* being requested at runtime
-     against a table of ``hooked_names`` (a wide-string compare loop
-     against each entry) to decide whether to resolve against an
-     embedded module's address instead of falling through to the saved
-     original.
-Steps 1-3 are straightforward; step 4 is real, non-trivial machine code
-(safe register preservation across stdcall/x64-fastcall boundaries for
-two different APIs, a string-comparison loop, an embedded wide-string
-table) with an outsized blast radius if it's subtly wrong -- *every*
-embed() run that calls at least one dependency's entry point through this
-same stub would run it, not just hook-specific tests. Per this task's own
-scoping note (mirroring Task 3's precedent of shipping a flat,
-unconditional stub and explicitly deferring full hooking), and since no
-test in this task's own suite exercises runtime LoadLibraryW/
-GetProcAddress interception, this ships the real, tested DllMain-ordering
-mechanism now and leaves steps 1-4 as documented follow-up work.
+Hook mechanism (implemented, x64 only): ``hooked_names`` is accepted for
+interface compatibility with the design brief's exact signature, but the
+actual LoadLibraryW/LoadLibraryA/GetProcAddress interception machinery it
+describes is *not* built from that parameter directly inside
+``build_windows_stub`` -- it's built by the caller (``pe_embedder.py``,
+which already has every address this needs: each hooked dependency's own
+``hinst_va`` from ``dep_entry_vas``, and its own raw export table from
+``global_raw_exports_by_dll``) and spliced in as one more synthetic,
+no-op-DllMain-signature entry prepended to ``init_order`` -- exactly the
+same trick already used for the per-dependency TLS-index fixup
+(``__tls_fixup_<name>__``, built by ``build_windows_tls_index_fixup`` and
+appended to the caller's own ``dep_entry_calls`` list). Prepending it
+(rather than appending) is what satisfies the design's "runs *before* any
+embedded module's own initializer" requirement: every call in
+``init_order`` after it, including every real dependency's own entry
+point, only runs once hook installation has already completed.
+
+The three builders below this module exports for that mechanism:
+
+* ``build_windows_loadlibrary_trampoline`` -- one instance built per
+  (is_wide) combination, i.e. once for LoadLibraryW and once for
+  LoadLibraryA. Walks a caller-supplied, NUL-sentinel-terminated match
+  table of (name-string VA, base VA) pairs, case-folding both the
+  requested name and each table entry one code unit (wchar_t or char) at
+  a time -- DLL names are ASCII-only in practice, so a simple
+  ``'A'-'Z'`` fold suffices and needs no locale/Unicode-casing machinery
+  -- and returns the matching base VA directly (what a real LoadLibrary
+  would have returned as the module's ``HINSTANCE``) without ever calling
+  the real API. No match -- including the common case, every name this
+  process ever asks for that *isn't* one of this run's embedded
+  dependencies -- falls through to the real, saved original via an
+  unconditional tail-jump, so ordinary LoadLibrary calls are completely
+  unaffected.
+* ``build_windows_getprocaddress_trampoline`` -- walks a module table of
+  (base VA, by-name sub-table VA, by-ordinal sub-table VA) triples to
+  find the one matching the incoming ``HMODULE``; GetProcAddress's own
+  by-name/by-ordinal convention (`lpProcName`'s high 48 bits all zero
+  means it's really a 16-bit ordinal via `MAKEINTRESOURCE`, not a string
+  pointer) picks the by-name sub-table (an exact, case-*sensitive*
+  byte-for-byte string match -- real export-name lookup is
+  case-sensitive, unlike a DLL filename) or the by-ordinal one (a plain
+  integer compare) accordingly. If the `HMODULE` doesn't match any
+  hooked dependency's own base VA at all, falls through to the real,
+  saved original, same as the LoadLibrary trampolines; if it *does*
+  match a hooked module but the requested name/ordinal isn't present in
+  that module's own table, returns ``NULL`` directly (matching a real
+  GetProcAddress's own "not found" behavior for a real module) rather
+  than calling through to the real API with a fake, non-loader-tracked
+  `HMODULE` it would never recognize.
+* ``build_windows_hook_install`` -- straight-line code (no branches) that,
+  for each hooked API, reads the *first* of its caller-supplied IAT slot
+  VAs (every slot for the same real API ends up holding the identical
+  loader-resolved address once the real loader has snapped it, regardless
+  of which importer's own IAT array that particular slot physically lives
+  in, so one read suffices), stores it into a small saved-original data
+  cell the matching trampoline reads back from, then overwrites *every*
+  supplied slot (there can be more than one -- the host's own IAT, and/or
+  any number of already-merged dependencies' own remaining IAT arrays,
+  since each embedded dependency keeps its own distinct FirstThunk array
+  physically inside its own relocated blob rather than sharing one) with
+  that API's trampoline address. Each individual slot write is wrapped in
+  a real `VirtualProtect`/write/`VirtualProtect`-restore pair -- confirmed
+  via a real, reproduced crash that a pre-existing IAT slot can live in a
+  read-only page (a common, legitimate compiler layout; only the loader's
+  own privileged one-time import-snapping can write there otherwise) --
+  so this does make real calls (needing the standard `sub rsp,
+  0x28`/`add rsp, 0x28` shadow-space prologue/epilogue around them) and
+  treats every argument-passing register as clobbered across each one,
+  reloading every value fresh from its own sentinel immediately after.
+  Still never leaves `rcx`/`rdx`/`r8`/`r9` holding anything this function
+  *itself* needs to persist across its own `ret` -- the per-dependency
+  init-call sequences immediately following it (and, for a DLL host, the
+  real `DllMain` it eventually tail-jumps to) rely on those holding the
+  stub's own original incoming arguments untouched, which this never
+  touches in the first place (its own "no live incoming arguments"
+  calling convention -- see its own docstring).
+
+Known, deliberate scope limits (see ``docs/limitations.md`` for the fuller
+write-up):
+
+* x64 only, matching every other recently-added stub in this module (the
+  TLS-index fixup, the delay-import lazy thunk). 32-bit PE support has its
+  own, separately documented, pre-existing gaps.
+* Only `LoadLibraryW`/`LoadLibraryA`/`GetProcAddress` themselves are
+  hooked -- not `LoadLibraryExW` or any loader-internal resolution path
+  (e.g. `ntdll!LdrLoadDll`) a module's own *statically compiled* import
+  table goes through when the OS loader itself resolves it while mapping
+  that module (as opposed to an explicit, application-level
+  LoadLibrary/GetProcAddress call, which this hook does intercept). A
+  module that is itself loaded dynamically by name (e.g. a plugin loaded
+  via an explicit `LoadLibraryW` call this hook *does* see) but which in
+  turn statically imports one of this run's embedded dependencies by
+  name is NOT redirected to the embedded copy by this mechanism alone --
+  the OS loader's own internal import-table walk for that plugin never
+  calls through any IAT slot this hook can see or overwrite. Confirmed
+  against a real-world repro (010 Editor's Qt platform plugin,
+  `qwindows.dll`, itself loaded dynamically via `QPluginLoader`-
+  >`LoadLibraryW`, statically importing `Qt6Core.dll`/`Qt6Gui.dll`) --
+  see ``docs/limitations.md`` for the full account of what this hook does
+  and doesn't fix for that case.
+* A hooked GetProcAddress's by-name/by-ordinal lookup against a matched
+  module only covers exports this project could resolve at embed time --
+  a forwarded export whose target DLL isn't itself embedded this run is
+  silently left out of that module's own runtime table (returning
+  ``NULL``, the same as a real "not found"), exactly mirroring this
+  project's existing delay-import forward-resolution fallback elsewhere.
 
 Assembly mechanism: every byte sequence below is assembled from real
 x86/x64 assembly *source text* by the Keystone assembler engine
@@ -93,7 +172,8 @@ needs, and which sentinel constants this module happens to use -- stay
 here.
 """
 
-from typing import Dict, List, Set, Tuple
+import itertools
+from typing import Dict, List, Sequence, Set, Tuple
 
 from staticer.stubs._keystone_utils import (
     assemble as _assemble,
@@ -475,6 +555,377 @@ def build_windows_delay_import_lazy_thunk(
     return data, reloc_offsets
 
 
+# -- LoadLibraryW/LoadLibraryA/GetProcAddress runtime hook ------------------
+# See this module's own docstring's "Hook mechanism" section for the full
+# design derivation and the caller-side (`pe_embedder.py`) integration this
+# assumes. Everything below is x64 only.
+
+# Reused (like `_X64_SENTINEL_A`/`_B` above) across every builder in this
+# section -- each is only ever located against a buffer *that builder*
+# itself assembled, so there's no real collision risk in sharing them.
+_X64_HOOK_SENTINEL_TABLE = _X64_SENTINEL_A
+_X64_HOOK_SENTINEL_SAVED = _X64_SENTINEL_B
+
+# `build_windows_hook_install` below can embed an a-priori unknown number
+# of independent absolute-VA sentinels in one buffer (one IAT slot address
+# per *importer* of a hooked API, which varies run to run), so it can't
+# reuse a small fixed set of named constants the way every other builder
+# in this module does -- it generates as many as it needs from this base,
+# via `_make_hook_install_sentinels` below. Chosen in a distinct, easily
+# recognizable range (`0x9999...`) from every other sentinel in this
+# module purely for readability when debugging a failed splice -- not a
+# correctness requirement (`patch_va_sentinels` would just as happily
+# reuse any other unused range).
+_X64_HOOK_INSTALL_SENTINEL_BASE = 0x9999000000000000
+
+
+def _make_hook_install_sentinels(n: int) -> List[int]:
+    return [_X64_HOOK_INSTALL_SENTINEL_BASE + i for i in range(n)]
+
+
+def build_windows_loadlibrary_trampoline(
+    *, is_wide: bool, match_table_va: int, saved_original_va: int
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code for a drop-in LoadLibraryW (`is_wide=True`) or
+    LoadLibraryA (`is_wide=False`) replacement, installed over every
+    discovered real IAT slot for that API by `build_windows_hook_install`.
+
+    `match_table_va` points at a caller-built array of 16-byte entries --
+    `(name_string_va: u64, base_va: u64)`, wide (UTF-16LE) or ANSI to
+    match `is_wide` -- terminated by one all-zero sentinel entry
+    (`name_string_va == 0`). On a match, returns that entry's own
+    `base_va` directly (the embedded dependency's own `hinst_va`) without
+    ever calling the real API; the match is case-*insensitive* (Windows
+    DLL names are) via a one-code-unit-at-a-time `'A'-'Z'` fold applied to
+    *both* the incoming name and the table entry as they're compared --
+    deliberately not pre-folded into the table at build time, since that
+    would just move the same fold logic from "every comparison" to "every
+    table entry, once" without saving anything (the incoming name still
+    needs folding either way, and still has to be compared one code unit
+    at a time regardless of whether the other operand was pre-folded).
+
+    On no match (including every ordinary, non-hooked LoadLibrary call --
+    the overwhelmingly common case in practice), tail-jumps to the real,
+    saved original at `saved_original_va` with the incoming argument
+    register (`rcx` -- x64's one-pointer-argument fastcall convention for
+    both LoadLibraryW/A) completely undisturbed, so the real call behaves
+    exactly as if this trampoline were never installed.
+
+    Register usage: `rcx` (the incoming name pointer) is read but never
+    written, so it's valid for the real API's own use the entire time
+    this runs, including the final tail-jump. `rax`, `r8`, `r9`, `r10`,
+    `r11` are scratch -- all volatile under x64 fastcall, so none needs
+    saving. No stack frame is used at all.
+    """
+    load_insn = "word ptr" if is_wide else "byte ptr"
+    step = 2 if is_wide else 1
+    asm = (
+        f"mov r11, {_X64_HOOK_SENTINEL_TABLE}\n"
+        "try_entry:\n"
+        "mov rax, [r11]\n"
+        "test rax, rax\n"
+        "jz no_match\n"
+        "mov r10, rcx\n"
+        "char_loop:\n"
+        f"movzx r8d, {load_insn} [r10]\n"
+        f"movzx r9d, {load_insn} [rax]\n"
+        "cmp r8d, 0x41\n"
+        "jl fold1_done\n"
+        "cmp r8d, 0x5A\n"
+        "jg fold1_done\n"
+        "add r8d, 0x20\n"
+        "fold1_done:\n"
+        "cmp r9d, 0x41\n"
+        "jl fold2_done\n"
+        "cmp r9d, 0x5A\n"
+        "jg fold2_done\n"
+        "add r9d, 0x20\n"
+        "fold2_done:\n"
+        "cmp r8d, r9d\n"
+        "jne next_entry\n"
+        "test r8d, r8d\n"
+        "jz matched\n"
+        f"add r10, {step}\n"
+        f"add rax, {step}\n"
+        "jmp char_loop\n"
+        "next_entry:\n"
+        "add r11, 16\n"
+        "jmp try_entry\n"
+        "matched:\n"
+        "mov rax, [r11+8]\n"
+        "ret\n"
+        "no_match:\n"
+        f"mov rax, {_X64_HOOK_SENTINEL_SAVED}\n"
+        "mov rax, [rax]\n"
+        "jmp rax"
+    )
+    data = _assemble(True, asm)
+    data, table_off, saved_off = _patch_two_va_sentinels(
+        data, _X64_HOOK_SENTINEL_TABLE, match_table_va, _X64_HOOK_SENTINEL_SAVED, saved_original_va, 8
+    )
+    return data, [table_off, saved_off]
+
+
+def build_windows_getprocaddress_trampoline(
+    *, module_table_va: int, saved_original_va: int
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code for a drop-in GetProcAddress replacement, installed
+    over every discovered real IAT slot for it by `build_windows_hook_
+    install`.
+
+    `module_table_va` points at a caller-built array of 24-byte entries --
+    `(base_va: u64, by_name_table_va: u64, by_ordinal_table_va: u64)` --
+    terminated by one all-zero sentinel entry (`base_va == 0`), one per
+    hooked dependency. `rcx` (the incoming `HMODULE`) is matched against
+    each entry's own `base_va`; no match at all falls through to the
+    real, saved original exactly like the LoadLibrary trampolines above
+    (`rcx`/`rdx` both left completely undisturbed for the real call).
+
+    A match commits to resolving against *that* module's own tables --
+    GetProcAddress's own by-name/by-ordinal convention for `rdx`
+    (`lpProcName`) is used to pick which: if `rdx`'s high 48 bits are all
+    zero, the whole value is really a 16-bit ordinal via
+    `MAKEINTRESOURCE`, not a string pointer (this is GetProcAddress's own
+    real, documented convention, not something invented here); otherwise
+    it's a real ASCII C-string pointer, compared byte-for-byte,
+    case-*sensitively* (export-name lookup is case-sensitive, unlike a
+    DLL filename) against each `by_name_table_va` entry (16-byte
+    `(name_string_va: u64, resolved_va: u64)` pairs, sentinel-terminated
+    on `name_string_va == 0`) until a match or the sentinel. The ordinal
+    path walks `by_ordinal_table_va` (16-byte `(ordinal: u64, resolved_
+    va: u64)` pairs, sentinel-terminated on `ordinal == 0xFFFF...FFFF` --
+    0 is deliberately not used as that sentinel, since real export
+    ordinals are 16-bit and a real `0` is never actually reachable as a
+    *value* here anyway, but `-1` is unambiguous either way and matches
+    `cmp reg64, -1`'s natural sign-extended-immediate encoding) the same
+    way.
+
+    If the module matches but the specific name/ordinal doesn't appear in
+    its own table (including a forwarded export this project couldn't
+    resolve at embed time -- see this module's own docstring's scope-
+    limits section), this returns `NULL` directly rather than falling
+    through -- the real GetProcAddress has no way to recognize our fake,
+    non-loader-tracked `HMODULE` value at all, so calling through to it
+    at this point would be calling the real API with a bogus handle, not
+    a safe fallback.
+
+    Register usage: `rcx`/`rdx` (the incoming arguments) are read but
+    never written *before* a module match is found, so the no-match
+    tail-jump sees them completely undisturbed; once a module is
+    matched, both are free to reuse as scratch (together with `rax`,
+    `r8`, `r9`, `r10`, `r11`, all volatile) since every path from that
+    point on is this function's own `ret`, not a tail-jump relying on
+    the caller's original argument values. No stack frame is used.
+    """
+    asm = (
+        f"mov r11, {_X64_HOOK_SENTINEL_TABLE}\n"
+        "find_module:\n"
+        "mov rax, [r11]\n"
+        "test rax, rax\n"
+        "jz no_match\n"
+        "cmp rax, rcx\n"
+        "je module_found\n"
+        "add r11, 24\n"
+        "jmp find_module\n"
+        "module_found:\n"
+        "mov rax, rdx\n"
+        "shr rax, 16\n"
+        "test rax, rax\n"
+        "jnz by_name\n"
+        "movzx r10d, dx\n"
+        "mov r9, [r11+16]\n"
+        "ord_scan:\n"
+        "mov rax, [r9]\n"
+        "cmp rax, -1\n"
+        "je ret_null\n"
+        "cmp rax, r10\n"
+        "je ord_matched\n"
+        "add r9, 16\n"
+        "jmp ord_scan\n"
+        "ord_matched:\n"
+        "mov rax, [r9+8]\n"
+        "ret\n"
+        "by_name:\n"
+        "mov r9, [r11+8]\n"
+        "name_scan:\n"
+        "mov rax, [r9]\n"
+        "test rax, rax\n"
+        "jz ret_null\n"
+        "mov r8, rax\n"
+        "mov rcx, rdx\n"
+        "name_cmp_loop:\n"
+        "movzx eax, byte ptr [r8]\n"
+        "movzx r10d, byte ptr [rcx]\n"
+        "cmp eax, r10d\n"
+        "jne name_next\n"
+        "test eax, eax\n"
+        "jz name_matched\n"
+        "inc r8\n"
+        "inc rcx\n"
+        "jmp name_cmp_loop\n"
+        "name_next:\n"
+        "add r9, 16\n"
+        "jmp name_scan\n"
+        "name_matched:\n"
+        "mov rax, [r9+8]\n"
+        "ret\n"
+        "ret_null:\n"
+        "xor eax, eax\n"
+        "ret\n"
+        "no_match:\n"
+        f"mov rax, {_X64_HOOK_SENTINEL_SAVED}\n"
+        "mov rax, [rax]\n"
+        "jmp rax"
+    )
+    data = _assemble(True, asm)
+    data, table_off, saved_off = _patch_two_va_sentinels(
+        data, _X64_HOOK_SENTINEL_TABLE, module_table_va, _X64_HOOK_SENTINEL_SAVED, saved_original_va, 8
+    )
+    return data, [table_off, saved_off]
+
+
+def build_windows_hook_install(
+    entries: Sequence[Tuple[int, Sequence[int], int]],
+    *,
+    virtualprotect_iat_slot_va: int,
+    scratch_dword_va: int,
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code that performs steps 1-3 of this module's own
+    docstring's "Hook mechanism" section for every hooked API at once:
+    save each one's real, loader-resolved value, then overwrite every one
+    of its discovered IAT slots with its own trampoline's address.
+
+    `entries` is one `(saved_cell_va, slot_vas, trampoline_va)` tuple per
+    hooked API (LoadLibraryW, LoadLibraryA, GetProcAddress): `slot_vas`
+    is every IAT slot this run found for that API (could be more than
+    one -- the host's own, and/or any number of already-merged
+    dependencies' own remaining KERNEL32 imports of it, since each keeps
+    its own distinct FirstThunk array rather than sharing one); an entry
+    with an empty `slot_vas` is skipped entirely (nothing to hook for
+    that API in this image). Every slot for the *same* API holds the
+    identical real address once the real loader has resolved it
+    (there's only one real KERNEL32 export by that name in the whole
+    process), so only the first slot is ever actually read from.
+
+    `VirtualProtect` around every slot write: confirmed via a real crash
+    (reproduced against the simplest possible fixture, root-caused with
+    `cdb`) that a plain, unprotected write into a *discovered* IAT slot
+    can fault with `STATUS_ACCESS_VIOLATION` -- unlike every *newly
+    created* data/code blob this project emits elsewhere (always placed
+    RWX precisely to avoid this -- see e.g. the delay-import lazy
+    thunk's own synthetic KERNEL32 import), a pre-existing IAT slot
+    inside the host's or a dependency's own original, compiler-produced
+    section is placed wherever that original toolchain happened to put
+    it, commonly a read-only section (`.rdata` or merged-into-`.rdata`
+    IAT, a common and legitimate layout -- the loader itself can still
+    write there once, during its own one-time import-snapping, via
+    privileged internal calls this project's own generated code has no
+    equivalent of). So every slot write here is wrapped in a real
+    `VirtualProtect(page_aligned(slot), 0x1000, PAGE_READWRITE,
+    &scratch_dword) ... write ... VirtualProtect(page_aligned(slot),
+    0x1000, scratch_dword, &scratch_dword)` pair (`scratch_dword_va`, a
+    single caller-supplied writable qword reused -- and overwritten --
+    by every such pair in turn, never read back by the caller itself; no
+    reentrancy/aliasing concern since this all runs synchronously,
+    single-threaded, before any embedded module's own initializer).
+    `virtualprotect_iat_slot_va` -- like `loadlibrarya_iat_slot_va`/
+    `getprocaddress_iat_slot_va` elsewhere in this module -- is an IAT
+    slot address to call *through* (`call qword ptr [slot]`), not
+    `VirtualProtect`'s own address directly; the caller resolves this the
+    same way it resolves every other KERNEL32 API this mechanism needs
+    (see `pe_embedder.py`'s own synthetic-KERNEL32-import handling).
+    Reads (the "capture the real original value" step below) never need
+    this -- only a *write* to a possibly-read-only page can fault.
+
+    This runs with no live incoming arguments to preserve (it's spliced
+    into the generated init-call stub as a synthetic, no-op-DllMain-
+    signature entry -- see this module's own docstring), but deliberately
+    still avoids `rcx`/`rdx`/`r8`/`r9` as anything *persistent* across a
+    `VirtualProtect` call regardless (every real argument-passing
+    register is treated as fully clobbered by `call qword ptr [...]`,
+    exactly as x64 calling convention allows any callee to do, and
+    reloaded fresh from its own sentinel immediately after every such
+    call rather than ever relied on to survive one). A `sub rsp,
+    0x28`/`add rsp, 0x28` prologue/epilogue reserves the 32-byte shadow
+    space x64 `VirtualProtect`'s own call sites need (and restores 16-
+    byte stack alignment after the `call` instruction's own implicit
+    8-byte push -- the exact same idiom already used for every other
+    real-API call this module makes, e.g. `_x64_call_dllmain`'s `sub
+    rsp, 0x28`), omitted entirely when there is nothing at all to hook
+    (every `slot_vas` empty) since no `call` is ever emitted in that
+    case.
+    """
+    pairs: List[Tuple[int, int]] = []
+    lines: List[str] = []
+    # Upper bound: 2 fixed (capture + save) per API entry, plus 9 per
+    # discovered slot (the protect/write/restore sequence below) -- a few
+    # more than strictly necessary when some `slot_vas` are empty costs
+    # nothing, since unused sentinels are simply never referenced in
+    # `lines`/`pairs`.
+    sentinel_budget = sum(2 + 9 * len(slot_vas) for _, slot_vas, _ in entries)
+    sentinels = iter(_make_hook_install_sentinels(sentinel_budget))
+
+    for saved_cell_va, slot_vas, trampoline_va in entries:
+        if not slot_vas:
+            continue
+        first_slot_sentinel = next(sentinels)
+        pairs.append((first_slot_sentinel, slot_vas[0]))
+        lines.append(f"mov r11, {first_slot_sentinel}")
+        lines.append("mov rax, [r11]")  # read-only -- never faults, no protect needed
+        saved_sentinel = next(sentinels)
+        pairs.append((saved_sentinel, saved_cell_va))
+        lines.append(f"mov r10, {saved_sentinel}")
+        lines.append("mov [r10], rax")  # our own RWX data -- never faults either
+
+        for slot_va in slot_vas:
+            page_va = slot_va & ~0xFFF
+
+            protect_page = next(sentinels)
+            pairs.append((protect_page, page_va))
+            lines.append(f"mov rcx, {protect_page}")
+            lines.append("mov edx, 0x1000")
+            lines.append("mov r8d, 0x4")  # PAGE_READWRITE
+            scratch_out = next(sentinels)
+            pairs.append((scratch_out, scratch_dword_va))
+            lines.append(f"mov r9, {scratch_out}")
+            vp_slot_1 = next(sentinels)
+            pairs.append((vp_slot_1, virtualprotect_iat_slot_va))
+            lines.append(f"mov rax, {vp_slot_1}")
+            lines.append("call qword ptr [rax]")
+
+            slot_sentinel = next(sentinels)
+            pairs.append((slot_sentinel, slot_va))
+            lines.append(f"mov r11, {slot_sentinel}")
+            trampoline_sentinel = next(sentinels)
+            pairs.append((trampoline_sentinel, trampoline_va))
+            lines.append(f"mov rax, {trampoline_sentinel}")
+            lines.append("mov [r11], rax")  # the actual hook install, now safe to write
+
+            scratch_in = next(sentinels)
+            pairs.append((scratch_in, scratch_dword_va))
+            lines.append(f"mov rax, {scratch_in}")
+            lines.append("mov r8d, dword ptr [rax]")  # restore: flNewProtect = the real original value
+            restore_page = next(sentinels)
+            pairs.append((restore_page, page_va))
+            lines.append(f"mov rcx, {restore_page}")
+            lines.append("mov edx, 0x1000")
+            scratch_out2 = next(sentinels)
+            pairs.append((scratch_out2, scratch_dword_va))
+            lines.append(f"mov r9, {scratch_out2}")
+            vp_slot_2 = next(sentinels)
+            pairs.append((vp_slot_2, virtualprotect_iat_slot_va))
+            lines.append(f"mov rax, {vp_slot_2}")
+            lines.append("call qword ptr [rax]")
+
+    if not pairs:
+        return b"", []
+
+    lines = ["sub rsp, 0x28"] + lines + ["add rsp, 0x28", "ret"]
+    data = _assemble(True, "\n".join(lines))
+    data, offsets = _patch_va_sentinels(data, pairs, 8)
+    return data, offsets
+
+
 def build_windows_stub(
     init_order: List[str],
     hooked_names: Set[str],
@@ -494,8 +945,13 @@ def build_windows_stub(
     caller needs.
 
     `hooked_names` is accepted for interface compatibility with the
-    design's LoadLibraryW/GetProcAddress interception goal but is not yet
-    acted on -- see this module's docstring ("Hook mechanism").
+    design's exact `build_windows_stub(init_order, hooked_names)`
+    signature, but this function itself never reads it -- the actual
+    LoadLibraryW/LoadLibraryA/GetProcAddress interception machinery is
+    built by the caller and spliced into `init_order`/`dep_entry_vas` as
+    one more (synthetic, hinst=0) entry *before* this is called, same as
+    the per-dependency TLS-index fixup already is -- see this module's
+    own docstring's "Hook mechanism" section.
 
     `host_is_dll` (B6-PE): when the host being embedded into is itself a
     DLL (not an EXE), this stub becomes the module's real
@@ -510,7 +966,7 @@ def build_windows_stub(
     is emitted at all -- behavior is unchanged from before this parameter
     existed.
     """
-    del hooked_names  # deferred -- see module docstring
+    del hooked_names  # unused here by design -- see docstring above
 
     call_fn = _x64_call_dllmain if is64 else _x86_call_dllmain
     tail_jmp_fn = _x64_tail_jmp if is64 else _x86_tail_jmp

@@ -11,10 +11,16 @@ addresses and its import-table entry is removed. Each dependency's own
 ``.pdata``/``.xdata`` (x64 unwind metadata) is merged into the host's own
 exception directory, and the generated entrypoint stub (see
 ``staticer/stubs/windows/pe_stub.py``) runs each embedded dependency's own
-entry point before handing off to the host's original one; see
-``embed()``'s docstring for exactly what's simplified in the stub (it does
-not yet implement the design's LoadLibraryW/GetProcAddress-interception
-hook).
+entry point before handing off to the host's original one. On an x64
+host with at least one embedded dependency, that same stub also installs
+a runtime LoadLibraryW/LoadLibraryA/GetProcAddress hook (see
+``pe_stub.py``'s own module docstring's "Hook mechanism" section, and
+this module's own long comment near ``build_windows_stub``'s call site),
+so anything in the process that later asks to load one of this run's
+embedded dependencies *by name* at runtime gets back its already-
+initialized embedded address instead of triggering a real, separate,
+duplicate load -- see ``embed()``'s docstring for this mechanism's own
+documented scope limits.
 """
 
 import os
@@ -27,6 +33,9 @@ import pefile
 from .common.depgraph import build_dependency_graph, embed_order
 from .stubs.windows.pe_stub import (
     build_windows_delay_import_lazy_thunk,
+    build_windows_getprocaddress_trampoline,
+    build_windows_hook_install,
+    build_windows_loadlibrary_trampoline,
     build_windows_stub,
     build_windows_tls_index_fixup,
 )
@@ -1307,12 +1316,36 @@ class PortableExecutableEmbedder:
         dependency's *other* references needed delta-relocation at all --
         see ``_adjust_unwind_info``'s docstring).
 
-        Simplification for this task (explicitly deferred, see
-        ``staticer/stubs/windows/pe_stub.py``'s module docstring): step 7's
-        stub does not implement the design doc's LoadLibraryW/
-        GetProcAddress interception goal -- ``hooked_names`` is threaded
-        through as an empty mechanism for interface compatibility, not
-        acted on.
+        Step 7's stub also installs the design doc's LoadLibraryW/
+        LoadLibraryA/GetProcAddress interception mechanism, on an x64 host
+        with at least one embedded dependency that has its own entry
+        point (see ``staticer/stubs/windows/pe_stub.py``'s module
+        docstring's "Hook mechanism" section for the full design, and this
+        method's own long comment just above its ``build_windows_stub``
+        call site for exactly how the data/trampolines/install code are
+        built here). Known, deliberate scope limits -- not yet fixed,
+        tracked in ``docs/limitations.md``:
+
+        * 32-bit (x86) hosts get no hook at all -- this mechanism's
+          trampolines and install code are x64 machine code only, matching
+          every other recently-added stub in ``pe_stub.py``.
+        * This intercepts explicit, application-level LoadLibrary*/
+          GetProcAddress calls, not the OS loader's own *internal*
+          resolution of a module's statically-compiled import table while
+          mapping that module -- a module loaded dynamically by name
+          (which this hook does see) that itself statically imports one of
+          this run's embedded dependencies by name is NOT thereby
+          redirected to the embedded copy; the loader's own internal
+          import-table walk never calls through any IAT slot this hook can
+          see or overwrite. See ``docs/limitations.md`` for the real-world
+          case (010 Editor's Qt platform plugin) this was confirmed
+          against.
+        * A hooked GetProcAddress only resolves exports this project could
+          already resolve at embed time -- a forwarded export whose target
+          DLL isn't itself embedded this run is left out of that module's
+          own runtime table (returning ``NULL``, matching a real "not
+          found"), mirroring this project's existing delay-import forward-
+          resolution fallback elsewhere.
         """
         search_dirs = self._search_dirs()
         graph = build_dependency_graph(
@@ -1417,6 +1450,50 @@ class PortableExecutableEmbedder:
             # be embedded at the point the forward itself is processed --
             # see that pass for why that matters).
             global_raw_exports_by_dll: Dict[str, Dict[object, object]] = {}
+            # (ordinal, name_va_or_None, raw_entry) per exported symbol of
+            # every embedded dependency, keyed by lowercased DLL name --
+            # collected in the very same per-symbol loop that populates
+            # `global_raw_exports_by_dll` above (so there's no duplicate
+            # work or double-counting from that dict's own by-name *and*
+            # by-ordinal keys both pointing at one real symbol), consumed
+            # only by the runtime GetProcAddress-hook table builder below
+            # (near `build_windows_stub`), which needs one row per actual
+            # symbol rather than per dict key. `raw_entry` is exactly
+            # `global_raw_exports_by_dll[dll][ordinal]` -- an absolute VA,
+            # or an unresolved ("fwd", ...) marker resolved the same way
+            # (`_resolve_raw_export`, defined below) when this is consumed.
+            pending_hook_export_syms: Dict[str, List[Tuple[int, Optional[int], object]]] = {}
+            # Absolute VAs of every discovered KERNEL32.dll LoadLibraryA/
+            # LoadLibraryW/GetProcAddress IAT slot this run finds -- the
+            # host's own (collected after the main loop below, directly
+            # from `pe.DIRECTORY_ENTRY_IMPORT`) and each embedded
+            # dependency's own *remaining* (non-embedded-target) KERNEL32
+            # import of one of these three (collected inline in the main
+            # loop below, in the same place `entry_dll_lower == "kernel32.
+            # dll"` is already special-cased for the merged-descriptor
+            # path). Consulted by the runtime LoadLibraryW/LoadLibraryA/
+            # GetProcAddress hook-install step below (near
+            # `build_windows_stub`) -- see that section for why *every*
+            # discovered slot (there can be more than one per API, since
+            # each embedded dependency keeps its own distinct FirstThunk
+            # array rather than sharing the host's) must be overwritten,
+            # and for what happens if a given API has none at all (a
+            # fresh, synthetic KERNEL32 import is added for it, mirroring
+            # the existing delay-import lazy-thunk's own synthetic
+            # KERNEL32 import just below).
+            # "virtualprotect" is discovered/synthesized via the exact
+            # same mechanism as the other three (below), but is never
+            # itself a hook *target* -- it's purely internal plumbing
+            # `build_windows_hook_install` needs to temporarily make a
+            # possibly-read-only discovered IAT slot writable before
+            # patching it (see that function's own docstring); only
+            # `kernel32_hook_slot_vas["virtualprotect"][0]` is ever read
+            # (as a call-through address), never the whole list, and it's
+            # never passed to `build_windows_hook_install` as something
+            # to overwrite.
+            kernel32_hook_slot_vas: Dict[str, List[int]] = {
+                "loadlibrarya": [], "loadlibraryw": [], "getprocaddress": [], "virtualprotect": [],
+            }
             # (iat_slot_rva, dll_name_lower, name_or_ordinal) for every host
             # import of an embedded dependency, deferred until every
             # dependency's raw export table (and X placement) is known --
@@ -2132,6 +2209,27 @@ class PortableExecutableEmbedder:
                             raw_exports[sym.ordinal] = entry
                             if name:
                                 raw_exports[name] = entry
+                            # `sym.name_offset` (unlike `sym.address`) is a
+                            # *file* offset, not an RVA -- pefile's own
+                            # "_offset"-suffixed ExportData fields
+                            # (`name_offset`/`address_offset`/`ordinal_
+                            # offset`) are all file offsets, set via
+                            # `get_offset_from_rva(...)` internally; only
+                            # the plain, unsuffixed `.address` is an RVA.
+                            # Confirmed the hard way: using it directly as
+                            # an RVA here pointed into inter-section
+                            # padding (zero bytes) rather than the real
+                            # name string, which a real GetProcAddress
+                            # hook call then silently (no crash, just a
+                            # byte-for-byte string-compare that can never
+                            # match anything) failed to resolve.
+                            name_va = (
+                                image_base + X + dep.get_rva_from_offset(sym.name_offset)
+                                if sym.name else None
+                            )
+                            pending_hook_export_syms.setdefault(node.name.lower(), []).append(
+                                (sym.ordinal, name_va, entry)
+                            )
                     global_raw_exports_by_dll[node.name.lower()] = raw_exports
 
                     if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
@@ -2248,6 +2346,28 @@ class PortableExecutableEmbedder:
                                     ),
                                     "first_thunk_rva": X + entry.struct.FirstThunk,
                                 })
+                                # Runtime hook support (see
+                                # `kernel32_hook_slot_vas` above): this
+                                # dependency's own remaining KERNEL32
+                                # import survives as a live descriptor
+                                # (the branch just above), so its own IAT
+                                # slot for LoadLibraryA/LoadLibraryW/
+                                # GetProcAddress -- if it imports any of
+                                # them -- is a real call site the hook-
+                                # install step below must also overwrite,
+                                # not just the host's own. `imp.address`
+                                # is this slot's VA using dep's own
+                                # (unrelocated) ImageBase, same as
+                                # `slot_offset_in_blob` above.
+                                if entry_dll_lower == "kernel32.dll":
+                                    for imp in entry.imports:
+                                        if imp.import_by_ordinal or imp.name is None:
+                                            continue
+                                        api_name = imp.name.decode("ascii").lower()
+                                        if api_name in kernel32_hook_slot_vas:
+                                            kernel32_hook_slot_vas[api_name].append(
+                                                image_base + X + (imp.address - dep_image_base)
+                                            )
 
                     # Delay-loaded imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
                     # the linker's `/DELAYLOAD` feature).
@@ -2648,6 +2768,90 @@ class PortableExecutableEmbedder:
                 loadlibrarya_iat_slot_va = None
                 getprocaddress_iat_slot_va = None
 
+            # -- runtime LoadLibraryW/LoadLibraryA/GetProcAddress hook: ----
+            # -- locate every real KERNEL32 IAT slot for the three, and ---
+            # -- add a synthetic import for whichever has none at all -----
+            # (step 1 of this module's own top-of-file docstring's "Hook
+            # mechanism" section). `kernel32_hook_slot_vas` already holds
+            # every slot the main per-dependency loop above found among
+            # each dependency's own *remaining* (non-embedded-target)
+            # KERNEL32 imports; this adds the host's own (read directly
+            # from `pe.DIRECTORY_ENTRY_IMPORT` -- KERNEL32.dll is never
+            # one of the embedded/removed dependencies, so this still
+            # accurately reflects the host's real, surviving import table
+            # even this late). x64 only (matches this whole hook
+            # mechanism's own scope), and only attempted at all when at
+            # least one *real* (non-synthetic, `hinst != 0` -- excludes
+            # the `__tls_fixup_*__` entries, which share this same
+            # `dep_entry_calls` list but aren't real embedded modules)
+            # dependency exists to ever hook a name against.
+            hookable_deps_exist = is64 and any(hinst for _, hinst, _ in dep_entry_calls)
+            if hookable_deps_exist and hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+                for host_entry in pe.DIRECTORY_ENTRY_IMPORT:
+                    if host_entry.dll.decode("ascii").lower() != "kernel32.dll":
+                        continue
+                    for imp in host_entry.imports:
+                        if imp.import_by_ordinal or imp.name is None:
+                            continue
+                        api_name = imp.name.decode("ascii").lower()
+                        if api_name in kernel32_hook_slot_vas:
+                            kernel32_hook_slot_vas[api_name].append(imp.address)
+
+            if hookable_deps_exist:
+                missing_apis = [api for api, slots in kernel32_hook_slot_vas.items() if not slots]
+                if missing_apis:
+                    # Same synthetic-import mechanism as the delay-import
+                    # lazy thunk's own KERNEL32 import just above
+                    # (deliberately NOT reused/shared with it -- a second,
+                    # independent IMAGE_IMPORT_DESCRIPTOR for a DLL the
+                    # image already imports elsewhere, including via that
+                    # other synthetic entry, is unremarkable and standard;
+                    # see that section's own comment), generalized from
+                    # its fixed two names to however many of the three
+                    # hook APIs genuinely have zero real call sites
+                    # anywhere in the already-merged import graph.
+                    _hook_api_export_name = {
+                        "loadlibrarya": b"LoadLibraryA\x00",
+                        "loadlibraryw": b"LoadLibraryW\x00",
+                        "getprocaddress": b"GetProcAddress\x00",
+                        "virtualprotect": b"VirtualProtect\x00",
+                    }
+                    syn_blob = bytearray()
+                    syn_blob += b"KERNEL32.DLL\x00"
+                    ibn_offs = []
+                    for api in missing_apis:
+                        ibn_offs.append(len(syn_blob))
+                        syn_blob += struct.pack("<H", 0) + _hook_api_export_name[api]
+                        while len(syn_blob) % 2:
+                            syn_blob += b"\x00"
+                    while len(syn_blob) % ptr_size:
+                        syn_blob += b"\x00"
+                    n_missing = len(missing_apis)
+                    int_off = len(syn_blob)
+                    syn_blob += b"\x00" * (ptr_size * (n_missing + 1))
+                    iat_off = len(syn_blob)
+                    syn_blob += b"\x00" * (ptr_size * (n_missing + 1))
+
+                    syn_rva = next_rva
+                    for i in range(n_missing):
+                        name_rva = syn_rva + ibn_offs[i]
+                        for base_off in (int_off, iat_off):
+                            off = base_off + i * ptr_size
+                            syn_blob[off:off + ptr_size] = name_rva.to_bytes(ptr_size, "little")
+
+                    new_sections.append((
+                        b".shkimp", bytes(syn_blob), syn_rva, _SCN_CODE_RWX, len(syn_blob),
+                    ))
+                    next_rva = _align_up(syn_rva + len(syn_blob), section_alignment)
+
+                    merged_descriptors.append({
+                        "name_rva": syn_rva,
+                        "orig_first_thunk_rva": syn_rva + int_off,
+                        "first_thunk_rva": syn_rva + iat_off,
+                    })
+                    for i, api in enumerate(missing_apis):
+                        kernel32_hook_slot_vas[api].append(image_base + syn_rva + iat_off + i * ptr_size)
+
             # -- merged/combined import directory -------------------------
             if removed_dll_names_lower or merged_descriptors:
                 combined: List[Dict[str, int]] = []
@@ -2735,6 +2939,204 @@ class PortableExecutableEmbedder:
                 init_order_names = [name for name, _, _ in dep_entry_calls]
                 dep_entry_vas = {name: (hinst, entry) for name, hinst, entry in dep_entry_calls}
 
+                # -- runtime LoadLibraryW/LoadLibraryA/GetProcAddress -----
+                # -- hook: data tables + trampolines + install code -------
+                # (steps 2-4 of this module's own docstring's "Hook
+                # mechanism" section; step 1 -- `kernel32_hook_slot_vas` --
+                # was already handled above). `hooked_names` excludes the
+                # synthetic `__tls_fixup_*__` entries sharing this same
+                # `dep_entry_calls` list (`hinst == 0` for those; every
+                # real embedded dependency's own `hinst_va` is never 0).
+                hooked_names = {name for name in init_order_names if dep_entry_vas[name][0]}
+                if is64 and hooked_names:
+                    hookdata_rva = next_rva
+                    hook_blob = bytearray()
+                    # Offsets (within `hook_blob`) of every absolute-VA
+                    # 8-byte field written as *data* below -- each needs
+                    # its own base-relocation entry, same as every other
+                    # hardcoded absolute address this project emits (see
+                    # this module's own docstring). Code-immediate offsets
+                    # (the trampolines'/install code's own sentinel
+                    # splices) are collected separately, from each
+                    # builder's own returned offset list.
+                    hook_reloc_offsets: List[int] = []
+
+                    def _hook_va(offset: int) -> int:
+                        return image_base + hookdata_rva + offset
+
+                    def _put_va(value: int) -> None:
+                        hook_reloc_offsets.append(len(hook_blob))
+                        hook_blob.extend(value.to_bytes(8, "little"))
+
+                    def _put_plain_u64(value: int) -> None:
+                        hook_blob.extend((value & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little"))
+
+                    # Per hooked dependency: its own wide/ANSI name string
+                    # (for the LoadLibraryW/A match tables) and its own
+                    # GetProcAddress by-name/by-ordinal sub-tables, built
+                    # from `pending_hook_export_syms` -- resolving any
+                    # still-unresolved forward (`("fwd", ...)`) entry via
+                    # `_resolve_raw_export` (defined above, in the finalize
+                    # pass that already needs the exact same resolution),
+                    # and simply leaving an export out of this module's own
+                    # table if that fails (see pe_stub.py's own docstring's
+                    # scope-limits section on why that's a safe, honest
+                    # fallback here -- `NULL`, matching a real "not
+                    # found", rather than a hard embed() failure).
+                    loadlib_entries: List[Tuple[int, int, int]] = []  # (wide_off, ansi_off, hinst)
+                    module_table_entries: List[Tuple[int, int, int]] = []  # (hinst, name_tbl_off, ord_tbl_off)
+                    for name in init_order_names:
+                        hinst, _entry_va = dep_entry_vas[name]
+                        if not hinst:
+                            continue
+                        name_lower = name.lower()
+
+                        wide_off = len(hook_blob)
+                        hook_blob.extend(name.encode("utf-16-le") + b"\x00\x00")
+                        ansi_off = len(hook_blob)
+                        hook_blob.extend(name.encode("ascii") + b"\x00")
+                        loadlib_entries.append((wide_off, ansi_off, hinst))
+
+                        name_rows: List[Tuple[int, int]] = []
+                        ord_rows: List[Tuple[int, int]] = []
+                        for ordinal, name_va, raw_entry in pending_hook_export_syms.get(name_lower, []):
+                            if isinstance(raw_entry, tuple):
+                                try:
+                                    resolved_va = _resolve_raw_export(name_lower, ordinal)
+                                except ValueError:
+                                    continue
+                            else:
+                                resolved_va = raw_entry
+                            ord_rows.append((ordinal, resolved_va))
+                            if name_va is not None:
+                                name_rows.append((name_va, resolved_va))
+
+                        while len(hook_blob) % 8:
+                            hook_blob.append(0)
+                        name_table_off = len(hook_blob)
+                        for nva, rva_ in name_rows:
+                            _put_va(nva)
+                            _put_va(rva_)
+                        _put_plain_u64(0)
+                        _put_plain_u64(0)
+
+                        ord_table_off = len(hook_blob)
+                        for ordv, rva_ in ord_rows:
+                            _put_plain_u64(ordv)  # a small integer, not a VA -- never relocated
+                            _put_va(rva_)
+                        _put_plain_u64(0xFFFFFFFFFFFFFFFF)
+                        _put_plain_u64(0)
+
+                        module_table_entries.append((hinst, name_table_off, ord_table_off))
+
+                    while len(hook_blob) % 8:
+                        hook_blob.append(0)
+                    wide_table_off = len(hook_blob)
+                    for wide_off, _ansi_off, hinst in loadlib_entries:
+                        _put_va(_hook_va(wide_off))
+                        _put_va(hinst)
+                    _put_plain_u64(0)
+                    _put_plain_u64(0)
+
+                    ansi_table_off = len(hook_blob)
+                    for _wide_off, ansi_off, hinst in loadlib_entries:
+                        _put_va(_hook_va(ansi_off))
+                        _put_va(hinst)
+                    _put_plain_u64(0)
+                    _put_plain_u64(0)
+
+                    module_table_off = len(hook_blob)
+                    for hinst, name_off, ord_off in module_table_entries:
+                        _put_va(hinst)
+                        _put_va(_hook_va(name_off))
+                        _put_va(_hook_va(ord_off))
+                    _put_plain_u64(0)
+                    _put_plain_u64(0)
+                    _put_plain_u64(0)
+
+                    saved_loadlibw_off = len(hook_blob)
+                    _put_plain_u64(0)
+                    saved_loadliba_off = len(hook_blob)
+                    _put_plain_u64(0)
+                    saved_getproc_off = len(hook_blob)
+                    _put_plain_u64(0)
+                    # Transient scratch cell `build_windows_hook_install`
+                    # reuses across every one of its own VirtualProtect
+                    # calls (see that function's own docstring) -- never
+                    # read by anything else, so one shared cell suffices.
+                    scratch_dword_off = len(hook_blob)
+                    _put_plain_u64(0)
+
+                    loadlibw_code, loadlibw_relocs = build_windows_loadlibrary_trampoline(
+                        is_wide=True,
+                        match_table_va=_hook_va(wide_table_off),
+                        saved_original_va=_hook_va(saved_loadlibw_off),
+                    )
+                    loadlibw_off = len(hook_blob)
+                    hook_blob.extend(loadlibw_code)
+                    hook_reloc_offsets.extend(loadlibw_off + off for off in loadlibw_relocs)
+
+                    loadliba_code, loadliba_relocs = build_windows_loadlibrary_trampoline(
+                        is_wide=False,
+                        match_table_va=_hook_va(ansi_table_off),
+                        saved_original_va=_hook_va(saved_loadliba_off),
+                    )
+                    loadliba_off = len(hook_blob)
+                    hook_blob.extend(loadliba_code)
+                    hook_reloc_offsets.extend(loadliba_off + off for off in loadliba_relocs)
+
+                    getproc_code, getproc_relocs = build_windows_getprocaddress_trampoline(
+                        module_table_va=_hook_va(module_table_off),
+                        saved_original_va=_hook_va(saved_getproc_off),
+                    )
+                    getproc_off = len(hook_blob)
+                    hook_blob.extend(getproc_code)
+                    hook_reloc_offsets.extend(getproc_off + off for off in getproc_relocs)
+
+                    install_code, install_relocs = build_windows_hook_install(
+                        [
+                            (
+                                _hook_va(saved_loadlibw_off),
+                                kernel32_hook_slot_vas["loadlibraryw"],
+                                _hook_va(loadlibw_off),
+                            ),
+                            (
+                                _hook_va(saved_loadliba_off),
+                                kernel32_hook_slot_vas["loadlibrarya"],
+                                _hook_va(loadliba_off),
+                            ),
+                            (
+                                _hook_va(saved_getproc_off),
+                                kernel32_hook_slot_vas["getprocaddress"],
+                                _hook_va(getproc_off),
+                            ),
+                        ],
+                        virtualprotect_iat_slot_va=kernel32_hook_slot_vas["virtualprotect"][0],
+                        scratch_dword_va=_hook_va(scratch_dword_off),
+                    )
+                    install_off = len(hook_blob)
+                    hook_blob.extend(install_code)
+                    hook_reloc_offsets.extend(install_off + off for off in install_relocs)
+
+                    new_sections.append((
+                        b".shkdat", bytes(hook_blob), hookdata_rva, _SCN_CODE_RWX, len(hook_blob),
+                    ))
+                    next_rva = _align_up(hookdata_rva + len(hook_blob), section_alignment)
+                    for off in hook_reloc_offsets:
+                        new_reloc_entries.append((hookdata_rva + off, reloc_type))
+
+                    # Prepend (not append) -- the design's own requirement
+                    # that hook installation runs *before* any embedded
+                    # module's own initializer, exactly like
+                    # `build_windows_stub`'s docstring explains for this
+                    # same synthetic-entry trick (`__tls_fixup_*__` is the
+                    # pre-existing precedent; this is just the first entry
+                    # that specifically needs to run before *every other*
+                    # one, not merely alongside its own dependency).
+                    dep_entry_calls = [("__hook_install__", 0, _hook_va(install_off))] + dep_entry_calls
+                    init_order_names = [name for name, _, _ in dep_entry_calls]
+                    dep_entry_vas = {name: (hinst, entry) for name, hinst, entry in dep_entry_calls}
+
                 stub_rva = next_rva
                 # B6-PE: when the host (the file embed() is embedding
                 # *into*, not a dependency) is itself a DLL, this stub
@@ -2746,11 +3148,12 @@ class PortableExecutableEmbedder:
                 host_is_dll = bool(pe.FILE_HEADER.Characteristics & _IMAGE_FILE_DLL)
                 stub_bytes, abs_va_offsets = build_windows_stub(
                     init_order_names,
-                    # The design's LoadLibraryW/GetProcAddress-interception
-                    # goal is for every *embedded* dependency's own name to
-                    # resolve to its embedded address if something still
-                    # dynamically loads it by name at runtime -- not yet
-                    # acted on; see pe_stub.py's module docstring.
+                    # `build_windows_stub` itself never reads this (see
+                    # its own docstring) -- the real LoadLibraryW/
+                    # LoadLibraryA/GetProcAddress interception mechanism
+                    # was already built and spliced into `init_order_names`/
+                    # `dep_entry_vas` as the `__hook_install__` entry above,
+                    # when applicable (x64 host, at least one hooked name).
                     set(init_order_names),
                     is64=is64,
                     dep_entry_vas=dep_entry_vas,
