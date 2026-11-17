@@ -522,3 +522,90 @@
   "an outsized blast radius if it's subtly wrong") and is left as
   follow-up work, consistent with this project's existing precedent of
   shipping the tested mechanism now and deferring that specific hook.
+
+  **Update**: that hook is now implemented (the `LoadLibraryW`/
+  `LoadLibraryA`/`GetProcAddress` section above) -- it correctly
+  redirects any EXPLICIT, application-level LoadLibrary*/GetProcAddress
+  call against an embedded dependency's own name, confirmed via a real
+  end-to-end fixture. It does **not**, by itself, fix the Qt-plugin
+  case described here: `qwindows.dll` is itself loaded via an explicit
+  `LoadLibraryW` call (which the hook correctly lets through to a real
+  load, since `qwindows.dll` itself isn't embedded), but ITS OWN static
+  import table's resolution of `Qt6Core.dll`/`Qt6Gui.dll` happens
+  entirely inside `ntdll`'s own `LdrpLoadDll`/import-snap machinery --
+  never through any IAT slot the KERNEL32-level hook can see or
+  overwrite. Two independent investigations into the next-level fix
+  this needs, both real research, neither shipped:
+
+  1. *Is there a simpler fix?* No. A real Qt6 rebuild with static
+     plugins (`configure -static` + `Q_IMPORT_PLUGIN`) would eliminate
+     `qwindows.dll` as a separate module entirely, but that means
+     controlling 010 Editor's own Qt6 build, not something staticer can
+     do. An embed-time rewrite of `qwindows.dll`'s own on-disk IAT is
+     structurally impossible, not just complex: the embedded
+     `Qt6Core.dll`'s real runtime base is only known once the HOST
+     process actually loads (ASLR), which is long after `embed()` has
+     already finished writing files to disk. No Windows OS-level
+     facility (KnownDLLs, SxS/manifest redirection) generalizes to "redirect
+     an arbitrary third-party import, per-run, against an already-mapped
+     module." Prior art (PyInstaller's onefile mode, Enigma Virtual Box)
+     doesn't actually solve this same problem -- both extract every
+     embedded file to a real temp location (or virtualize the filesystem)
+     and let the ordinary Windows loader do all resolution itself,
+     naturally deduplicating by path; neither does true in-memory PE
+     embedding with manual import fixups the way staticer does, so
+     neither ever hits this failure mode in the first place. This is a
+     real structural cost of staticer's own in-memory-embed design,
+     not a gap in research.
+  2. *Is `LdrRegisterDllNotification` (the natural next mechanism: an
+     officially Microsoft-documented, if "may change without notice,"
+     ntdll export that fires when ANY module loads, before its own
+     dynamic linking runs, with that module's own base/size) the right
+     fix?* Investigated, NOT shipped -- two real, unresolved blockers,
+     not a complexity judgment call:
+     - Microsoft's own documentation states, verbatim, that it is
+       *"unsafe for the notification callback to call functions in ANY
+       other module other than itself."* The existing `VirtualProtect`
+       wrap this project's own hook-install code already needs (a real,
+       previously-reproduced crash proved a pre-existing IAT slot can
+       live in a read-only page) calls into KERNEL32 -- a different
+       module -- so the existing, already-proven-necessary pattern
+       can't be reused here without substituting a raw, undocumented
+       `ntdll`-internal syscall path instead, which carries its own,
+       separate version-fragility risk Microsoft's own text gives no
+       carve-out for either.
+     - Both "fires before dynamic linking takes place" is documented,
+       but whether an IAT write made *at that moment*, for the module
+       the notification is ABOUT, survives that same module's own
+       subsequent import-snap pass (which the loader still has to run
+       for it) is NOT confirmed by any authoritative source found --
+       only that import resolution overall happens "before DllMain," a
+       different claim. If the snap pass unconditionally overwrites
+       every slot regardless of what's already there (plausible, since
+       it walks the import-descriptor table by name with no reason to
+       skip an already-populated slot), a patch applied at this timing
+       would be silently undone moments later, and the real, duplicate
+       load would still happen -- meaning the whole mechanism might
+       accomplish nothing while still carrying the cross-module-call
+       risk above.
+
+     Settling the second point would need its own dedicated,
+     instrumented debugging investigation (a minimal notification-DLL
+     fixture, traced live under a debugger) before any production code
+     against this mechanism is safe to write -- a real sub-task of its
+     own, not attempted. A structurally different alternative (inserting
+     a synthetic `LDR_DATA_TABLE_ENTRY` for each embedded dependency so
+     the loader's OWN by-name resolution finds and reuses it naturally,
+     no per-import patching or notification callback needed at all) was
+     also considered and not attempted -- that struct's layout beyond a
+     small public partial definition is undocumented and has changed
+     across Windows versions, trading this problem for an equally real
+     version-compatibility one.
+
+     **Current state: genuinely unresolved, not merely unimplemented.**
+     Treat embedding a Qt6 (or any framework with the same "plugin
+     loaded by LoadLibrary, plugin statically imports an embedded
+     dependency by name" shape) GUI application as capped at "starts
+     without crashing/hanging, embeds everything except what a runtime-
+     loaded plugin's own import table needs" until one of the two
+     research threads above is actually completed, not just scoped.
