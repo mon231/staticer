@@ -17,9 +17,22 @@ propagates **transitively**: anything an excluded dependency itself imports
 is also left dynamic, so the same code never ends up both embedded and
 dynamically loaded as two independent copies in the same process.
 
-Cycles among embeddable dependencies are detected and rejected with a
-clear error naming the cycle, rather than looping forever or silently
-picking an order.
+On PE, a genuine import cycle among embeddable dependencies (confirmed
+real, not hypothetical: e.g. `WS2_32.dll`'s own import table imports
+`MSWSOCK.dll`, while `WS2_32.dll` also forwards some exports *to*
+`MSWSOCK.dll`) no longer aborts the embed — cross-dependency resolution
+is already fully deferred to a finalize pass run after every dependency
+is placed, so a strict total order was never a real technical
+requirement; cyclic nodes are grouped into strongly-connected components
+(Tarjan's algorithm) and embedded together, keeping every component
+dependencies-first relative to the rest of the graph. ELF keeps
+rejecting a cycle with a clear error naming it, unchanged.
+
+A dependency reachable *only* as another dependency's export-forward
+target (e.g. `SHLWAPI.dll` forwards some exports to `SHCORE.dll`, which
+its own import table never mentions at all) is also discovered and
+embedded like any ordinary one, on PE — not just ordinary import-table
+edges.
 
 ## PIC / relocation-bearing dependencies
 
@@ -110,6 +123,68 @@ match whichever module ended up holding the one real, loader-assigned slot.
     still supports only a single TLS-bearing dependency into a TLS-less
     host) — see [Limitations](limitations.md).
 
+ELF additionally supports the Initial-Exec TLS model
+(`R_X86_64_TPOFF64`): once a dependency's `PT_TLS` becomes the sole
+(module-1) TLS directory after merging into a TLS-less host, its
+%fs-relative static offset is a fixed, load-bias-independent constant
+per the ELF TLS ABI's variant II layout — confirmed empirically against
+a real process's actual %fs-relative address for a single-module
+Initial-Exec variable, not just derived from the ABI spec.
+
+## Runtime dynamic-loading interception
+
+A statically-resolved import isn't the only way code ends up needing a
+dependency: application code (or an embedded dependency's own later
+code) can also ask for one *by name* at runtime. Both platforms
+intercept this so a request for one of this run's own embedded
+dependencies resolves to the already-initialized embedded copy instead
+of triggering a real, separate, duplicate load (which would otherwise
+waste memory and, worse, duplicate the dependency's own global/static
+state between two independent instances in one process):
+
+- **PE**: `LoadLibraryW`/`LoadLibraryA`/`GetProcAddress` are hooked —
+  every discovered real IAT slot for the three is patched to a generated
+  trampoline before any embedded dependency's own initializer runs. A
+  name/handle that doesn't match one of this run's embedded dependencies
+  falls through to the real, saved API unconditionally, so ordinary
+  dynamic loading elsewhere is unaffected.
+- **PE, additionally**: `LdrRegisterDllNotification` is used to catch
+  the case the IAT hook alone can't see — a module *itself* loaded
+  dynamically by name (which the IAT hook does see and correctly lets
+  through, since that module isn't embedded) whose own,
+  compiler-generated static import table references an embedded
+  dependency by name. The OS loader resolves that internally while
+  mapping the module, never through any IAT slot the IAT hook can reach
+  — confirmed against the real-world case this was built for (a Qt
+  application's platform plugin, itself `LoadLibraryW`'d by Qt's own
+  plugin loader, statically importing the application's own Qt core
+  libraries). The registered callback patches the newly-loaded module's
+  own already-snapped IAT slots for any matching embedded dependency,
+  confirmed via a dedicated empirical investigation (not just read from
+  Microsoft's documentation) that this is safe: the loader's own import
+  snap for a module has already completed by the time the `LOADED`
+  notification fires for it, so there's no race to patch around, and a
+  real cross-module `VirtualProtect` call from inside the callback — of
+  the kind Microsoft's own docs call unsafe — works without deadlock or
+  crash on every Windows build tested so far. This is unsupported,
+  undocumented-by-Microsoft behavior, verified empirically rather than
+  architecturally guaranteed — see [Limitations](limitations.md).
+- **ELF**: `dlopen`/`dlsym` are hooked the same way, adapted for real
+  glibc mechanics rather than a blind port of the PE design — a
+  bootstrap call through every discovered GOT slot forces real
+  resolution to happen once, by `staticer`, before any slot is read or
+  overwritten (lazy PLT binding would otherwise let the first real call
+  silently uninstall the trampoline), and a slot inside a `PT_GNU_RELRO`
+  range gets a real `mprotect`-wrapped write. A `dlsym` against a
+  recognized (embedded-module) handle for a symbol that isn't in that
+  module's own known export table returns `NULL` (matching a real
+  "not found"), not a fallback to a real `dlsym` call — glibc's real
+  `dlsym` does no validation at all on its `handle` argument, so handing
+  it a fake one risks a wild pointer chase rather than a clean failure.
+
+Both platforms are x64/x86-64 only for this mechanism so far; see
+[Limitations](limitations.md) for the exact scope.
+
 ## Generated entrypoint stub
 
 The output's entrypoint is replaced with a small generated stub that
@@ -139,15 +214,39 @@ the intended search directory.
 ## Tested against real-world binaries
 
 Beyond synthetic test fixtures, `staticer` is tested against actual
-system binaries — `cmd.exe`/`hostname.exe` on Windows, `bash`/`grep` on
-Linux — both as a curated subset (via `--lib-dir`/`--exclude`) and as
-closer-to-full transitive closures. A handful of real-world-only bugs
-only ever surfaced against genuine system DLLs/`.so`s: forwarded
-exports, ordinal-only imports, forwarder import cycles, stale
-`DT_VERNEED` entries, `R_*_COPY` relocations for a dependency's own
-globals, and weak symbols from the C runtime's own startup boilerplate —
-all fixed, each covered by a regression test built from the binary that
-found it.
+system binaries — `cmd.exe`/`hostname.exe`/`python.exe`+`python313.dll`
+on Windows, `bash`/`grep` on Linux — both as a curated subset (via
+`--lib-dir`/`--exclude`) and as closer-to-full transitive closures. A
+real `python.exe`, embedded down to just `KERNEL32.dll` plus its own
+mandatory companions (`KERNELBASE.dll`/`ntdll.dll`/the virtual
+`api-ms-win-*` API sets, none of which are real files that could ever
+be embedded), runs a real interpreter session correctly after the
+embed. A handful of real-world-only bugs only ever surfaced against
+genuine system DLLs/`.so`s: forwarded exports, ordinal-only imports,
+forwarder import cycles, stale `DT_VERNEED` entries, `R_*_COPY`
+relocations for a dependency's own globals, weak symbols from the C
+runtime's own startup boilerplate, a `pefile` default export-table
+truncation cap silently dropping real exports from a sufficiently
+large real DLL, and ordinal-style (`"DLL.#N"`) export-forward targets
+never being converted from their literal string form to a real integer
+lookup key — all fixed, each covered by a regression test built from
+the binary that found it.
+
+Also tried, for real, against a genuine commercial Qt6 GUI application
+(010 Editor) — the single most demanding real-world closure attempted
+so far, pulling in dozens of real system DLLs and several genuinely
+TLS-bearing ones at once. This found real bugs no smaller closure ever
+reached: a `/DELAYLOAD` import crash (fixed by generating real lazy
+per-function thunks instead of either eagerly resolving or leaving the
+compiler's own thunk to run against a module that's no longer
+separately loaded), and false-positive matches in the TLS byte-pattern
+scanner against real MSVC-compiled system/Qt DLLs (`SHLWAPI.dll`,
+`SHELL32.dll`, and — as of this writing, still being worked —
+`Qt6Gui.dll`) that would have silently corrupted unrelated code — see
+[Limitations](limitations.md) for the current, exact state of this
+specific embed (the TLS-scanner and runtime-interception work above
+were both driven by it, and it's the most up-to-date record of exactly
+how far it currently gets).
 
 Also tried, for real, against a genuine third-party *instrumentation*
 library — Frida's own `frida-gadget`, downloaded directly from its GitHub
