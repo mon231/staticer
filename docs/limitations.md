@@ -867,3 +867,124 @@
      for the first time) but does not yet reach the real UI -- blocked
      by this separate, pre-existing, now precisely located TLS-scanner
      false-positive in `Qt6Gui.dll`, not by anything this task built.
+
+     **Update, fixed -- and the real mechanism is one function over from
+     where it first looked.** Directly re-invoking
+     `_patch_dep_tls_access_offsets` against the real, unmodified
+     `Qt6Gui.dll` bytes (same anchor, same `shift`) to build the actual
+     fix confirmed the crash-site math above byte-for-byte (the anchor at
+     blob offset `0x2393bf` is real; the corrupted disp32 really does
+     belong to the unrelated `cmp dword ptr [rip+disp32], eax` at
+     `0x2393d1`) -- but tracing *which* function in
+     `_KNOWN_DEP_TLS_ACCESS_PATTERNS` actually produces that corruption
+     shows it is **not** `_try_patch_msvc_style_tls_access` as the entry
+     above describes (that attribution was wrong): `_try_patch_mingw_
+     style_tls_access` is tried *first* for every anchor, and it is the
+     one that matches and corrupts this `cmp`'s disp32 -- confirmed by
+     isolating each pattern function and running it alone against the
+     real bytes: `_try_patch_mingw_style_tls_access` alone reproduces the
+     exact corruption; `_try_patch_msvc_style_tls_access` alone (never
+     actually reached in the real pipeline for this anchor, because the
+     mingw-style function already returns `True` first) correctly finds
+     and shifts the real `mov edx, 4` offset-load at `0x2393c5` instead.
+     Root cause: unlike `_try_patch_msvc_style_tls_access` (already
+     hardened twice, against SHLWAPI.dll/SHELL32.dll above), `_try_patch_
+     mingw_style_tls_access` had *no* corroboration at all beyond its own
+     bare two-byte opcode+ModRM shape (`8B`/`89`, mod=10, rm!=SIB) --
+     exactly the same class of under-corroborated byte-anywhere-in-a-
+     window scan already fixed twice in the other function, just never
+     ported over to this one. The `cmp`'s own disp32 bytes (`89 b6`)
+     happen to decode as that exact shape by pure coincidence. Since
+     `Qt6Gui.dll` is MSVC-compiled, `_try_patch_mingw_style_tls_access`
+     should never genuinely match *any* of its real TLS accesses at all
+     -- every one of the false matches this bug could cause in this file
+     is pure coincidence, not a real mingw-style access the scanner is
+     correctly recognizing.
+
+     Fixed with the same philosophy as the two MSVC-path fixes: a shared,
+     module-level `_is_scale8_sib_load` helper (hoisted out of
+     `_try_patch_msvc_style_tls_access`'s own local closure) now anchors
+     both compiler idioms' corroboration on opposite sides of the same
+     shape. Confirmed against four real, locally-compiled
+     `x86_64-w64-mingw32-gcc -O2` `__thread`-variable accesses (load,
+     store, a compound read, and an increment) that mingw-w64's real
+     final access instruction is *always* immediately (zero-gap)
+     preceded by that same scale-8 SIB-addressed load (e.g. `48 8b 04 c2`
+     directly followed by `8b 80 10 00 00 00`) -- so `_try_patch_mingw_
+     style_tls_access` now only accepts a candidate when
+     `_is_scale8_sib_load` matches the 4 bytes immediately before it,
+     exactly mirroring the already-proven MSVC-side tradeoff (precision
+     over recall) on the other side of the shared shape. Verified against
+     the real `Qt6Gui.dll` bytes: with the fix, this anchor's false match
+     is gone and the genuine `mov edx, 4` offset-load is the one shifted
+     instead (confirmed in-bounds: the corrupted value used to resolve to
+     ~2.2x `Qt6Gui.dll`'s own `SizeOfImage`; the fixed value is `4 +
+     shift`, pointing at the correct TLS-variable offset). Re-running the
+     full scanner against all of `Qt6Gui.dll`'s 184 real `_tls_index`
+     anchors with the fix in place produces the exact same `patched`
+     count (135) as before the fix, with only this one anchor's patched
+     byte position changed -- the fix is surgical, not a recall
+     regression across the rest of the file. Covered by a new, third
+     hand-crafted regression test,
+     `test_scanner_does_not_misparse_adjacent_cmp_disp32_as_mingw_access`
+     in `tests/test_pe_tls_scanner_unit.py`, built from the exact real
+     `Qt6Gui.dll` bytes around this anchor (confirmed red against the
+     pre-fix scanner, green after); the two existing mingw-style unit
+     tests (`test_scanner_shifts_mingw_style_access_with_ordinary_
+     register_load`, `..._with_extended_register_load`) needed their own
+     synthetic fixtures updated to include the same realistic preceding
+     scale-8 SIB load real mingw-w64 output always has (they previously
+     put the access instruction directly after the anchor with nothing
+     in between, which the new corroboration correctly rejects as
+     under-corroborated). Full `tests/windows` + `tests/test_pe_tls_
+     scanner_unit.py` suite stays green, zero regressions to either
+     SHLWAPI.dll/SHELL32.dll fix.
+
+     **The real payoff, and a new, genuinely separate blocker found while
+     chasing it (same shape as the pattern throughout this file: fixing
+     one confirmed real crash reveals the next one, further in).**
+     Rebuilding the real 010 Editor installation with this fix in place
+     and launching it moves the needle again, measurably: the process
+     now gets past the exact point the old `Qt6Gui.dll` false positive
+     used to kill it, loads `textinputframework.dll` and `Oleacc.dll`
+     (Windows' own text-input and accessibility support, never reached
+     in any earlier attempt recorded in this file), creates its real
+     window, and that window receives a real focus/accessibility event
+     from the OS -- but it crashes again a little further in, with a
+     real `STATUS_ACCESS_VIOLATION` (`c0000005`) at `010Editor+0x277453a`.
+
+     **Root-caused, and confirmed NOT another instance of the TLS-
+     scanner bug class.** The crash is inside the embedded copy of
+     `Qt6Core.dll` (`.sdep37` in the merged output, identified by its
+     size matching `Qt6Core.dll`'s own aligned `SizeOfImage` plus its own
+     appended TLS raw-data piece -- i.e. `Qt6Core.dll` is *also* a
+     TLS-bearing dependency that went through the exact same merge).
+     Confirmed genuinely different from every TLS-scanner false positive
+     above: the 5 bytes at the fault RVA (`f0 48 0f b1 11`, `lock cmpxchg
+     qword ptr [rcx], rdx`) are byte-for-byte identical to the real,
+     unmodified `Qt6Core.dll` on disk at the same RVA -- nothing in this
+     embed (the TLS scanner or anything else) touched this instruction
+     or any byte near it. The actual bug is a null object pointer, not a
+     corrupted immediate: the instruction immediately before it is `lea
+     rcx, [r13+0x90]`, and at the moment of the fault `r13 == 0`, so
+     `rcx == 0x90` and the atomic compare-exchange dereferences address
+     `0x90` directly. A full backtrace (`cdb`, `kb`) shows exactly how
+     execution gets here: Windows delivers a `WM_GETOBJECT`-driven
+     accessibility query to the real window (`MSCTF!CThreadInputMgr::
+     OnAccFocusEvent` -> `USER32!...WinEventProc` -> `Oleacc!
+     AccessibleObjectFromWindow` -> `SendMessageTimeoutW` -> the
+     `qwindows.dll` platform plugin's own window procedure -> two
+     `010Editor`-internal (Qt6Widgets-region) calls -> this `Qt6Core.dll`
+     instruction) -- i.e. a real OS accessibility subsystem (triggered by
+     this machine's own text-input/accessibility state, not by anything
+     this project's embed controls) reaches into Qt's accessibility code
+     for this window before whatever object it expects at `r13` has been
+     constructed. This is a new, separate, precisely located bug --
+     unrelated to TLS, to any byte-patching pass, and to the
+     `LdrRegisterDllNotification` hook -- out of scope for this task
+     (which fixed the specific, confirmed TLS-scanner false positive it
+     set out to fix, verified correct and non-regressing on its own
+     terms) and left as a concrete follow-up: real UI still doesn't
+     appear, but measurably closer, and the next blocker is now this one
+     specific null-object dereference in `Qt6Core.dll`'s accessibility
+     code path, not a TLS access anywhere.

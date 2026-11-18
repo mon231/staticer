@@ -990,34 +990,84 @@ def _collect_and_patch_dep_unwind(dep: "pefile.PE", blob: bytearray, shift: int)
     return entries
 
 
+def _is_scale8_sib_load(blob: bytearray, pos: int) -> bool:
+    """True if `blob[pos:pos+4]` is `REX.W 8B modrm sib` with the ModRM
+    selecting a SIB byte and no displacement (mod=00, rm=100) and that SIB
+    byte's own scale field selecting *8 (its top two bits, `0b11`) -- the
+    "index this module's own per-thread block by (register)*8" instruction
+    every real TLS access observed so far (both mingw-w64's and MSVC's own
+    idiom -- see each one's own docstring) sits immediately next to,
+    regardless of which registers it uses (R/X/B extension bits in the REX
+    byte, or the SIB's own index/base register fields, are deliberately
+    not checked here -- irrelevant to this specific shape). Shared,
+    module-level corroboration helper -- both compiler idioms below key
+    their own precision on this exact 4-byte shape, just on opposite sides
+    of it."""
+    if pos < 0 or pos + 4 > len(blob):
+        return False
+    return (
+        0x48 <= blob[pos] <= 0x4F  # REX.W set (bit 0x08), R/X/B don't matter
+        and blob[pos + 1] == 0x8B
+        and (blob[pos + 2] & 0xC7) == 0x04  # ModRM: mod=00, rm=100 (SIB follows)
+        and (blob[pos + 3] & 0xC0) == 0xC0  # SIB: scale=11 (*8)
+    )
+
+
 def _try_patch_mingw_style_tls_access(
     blob: bytearray, anchor_begin: int, tls_index_load_end: int, limit: int, shift: int
 ) -> bool:
     """mingw-w64's compiled idiom for the final, variable-specific part of
     a `__declspec(thread)`/`__thread` access: once `_tls_index`'s value
     has been loaded and combined with `TEB.ThreadLocalStoragePointer`
-    into this module's own per-thread block pointer, the link-time
+    into this module's own per-thread block pointer (via the same scale-8
+    SIB-addressed load `_try_patch_msvc_style_tls_access`'s own
+    corroboration keys on -- see `_is_scale8_sib_load`), the link-time
     constant offset to this one specific TLS variable is baked directly
     into *this* access instruction's own disp32 field:
 
         mov/  r32, [r64+disp32]      ; <- disp32 is the one to shift
          mov      [r64+disp32], r32
 
-    Scans forward from `tls_index_load_end` (where the `_tls_index` load
-    matched by the caller ends) through a short, bounded window for the
-    first instruction matching that exact shape (``8B``/``89`` opcode,
-    ModRM mod=10 i.e. disp32-sized displacement, rm!=100 i.e. a plain
-    base register with no SIB byte) and shifts its disp32 in place.
-    `anchor_begin` is unused here (mingw's idiom never needs to look
-    behind the `_tls_index` load) -- it's only part of this function's
-    signature so every entry in `_KNOWN_DEP_TLS_ACCESS_PATTERNS` shares
-    one call shape. Returns whether a match was found and patched.
+    Confirmed against real locally-compiled `x86_64-w64-mingw32-gcc -O2`
+    output (four distinct `__thread`-variable accesses, load/store/
+    compound/increment): the final access is *always* immediately
+    (zero-gap) preceded by that scale-8 SIB-addressed load -- e.g.
+    `48 8b 04 c2` (`mov rax, [rdx+rax*8]`) directly followed by
+    `8b 80 10 00 00 00` (`mov eax, [rax+0x10]`). Originally this scanned
+    forward from `tls_index_load_end` for the first byte shape alone
+    (``8B``/``89`` opcode, ModRM mod=10 i.e. disp32-sized displacement,
+    rm!=100 i.e. a plain base register with no SIB byte) with no other
+    corroboration at all -- too weak: real-world testing against the real
+    `Qt6Gui.dll` (MSVC-compiled, so this pattern should never genuinely
+    match it at all) found it matching a coincidental ``89``/modrm pair
+    sitting inside an unrelated `cmp dword ptr [rip+disp32], eax`
+    instruction's own disp32 bytes, well before `_try_patch_msvc_style_
+    tls_access` -- tried second, and the one that actually recognizes
+    MSVC's idiom -- ever got a chance to run on that anchor at all (see
+    `_patch_dep_tls_access_offsets`'s own per-anchor dispatch loop: the
+    first pattern in `_KNOWN_DEP_TLS_ACCESS_PATTERNS` to return `True`
+    wins). Shifting that disp32 corrupted both the `cmp`'s own instruction
+    and the start of the next one. Now a candidate is only accepted when
+    it's immediately (zero-gap) preceded by `_is_scale8_sib_load`, exactly
+    mirroring `_try_patch_msvc_style_tls_access`'s own (already twice-
+    hardened) precision tradeoff, just checked on the other side of the
+    shared shape. `anchor_begin` is unused here (mingw's idiom never needs
+    to look behind the `_tls_index` load for anything other than that
+    shared shape, which is itself found by scanning forward) -- it's only
+    part of this function's signature so every entry in
+    `_KNOWN_DEP_TLS_ACCESS_PATTERNS` shares one call shape. Returns
+    whether a match was found and patched.
     """
     j = tls_index_load_end
     window_end = min(j + 32, limit - 6, len(blob) - 6)
     while j <= window_end:
         op = blob[j]
-        if op in (0x8B, 0x89) and (blob[j + 1] & 0xC0) == 0x80 and (blob[j + 1] & 0x07) != 0x04:
+        if (
+            op in (0x8B, 0x89)
+            and (blob[j + 1] & 0xC0) == 0x80
+            and (blob[j + 1] & 0x07) != 0x04
+            and _is_scale8_sib_load(blob, j - 4)
+        ):
             disp_off = j + 2
             cur = int.from_bytes(blob[disp_off:disp_off + 4], "little", signed=True)
             blob[disp_off:disp_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
@@ -1111,25 +1161,6 @@ def _try_patch_msvc_style_tls_access(
     win_begin = max(0, anchor_begin - 32)
     win_end = min(limit, tls_index_load_end + 32, len(blob))
 
-    def _is_scale8_sib_load(pos: int) -> bool:
-        """True if `blob[pos:pos+4]` is `REX.W 8B modrm sib` with the
-        ModRM selecting a SIB byte and no displacement (mod=00, rm=100)
-        and that SIB byte's own scale field selecting *8 (its top two
-        bits, `0b11`) -- the "index this module's own per-thread block by
-        (register)*8" instruction every real offset-load observed so far
-        is immediately followed by, regardless of which registers it
-        uses (R/X/B extension bits in the REX byte, or the SIB's own
-        index/base register fields, are deliberately not checked here --
-        irrelevant to this specific shape)."""
-        if pos + 4 > len(blob):
-            return False
-        return (
-            0x48 <= blob[pos] <= 0x4F  # REX.W set (bit 0x08), R/X/B don't matter
-            and blob[pos + 1] == 0x8B
-            and (blob[pos + 2] & 0xC7) == 0x04  # ModRM: mod=00, rm=100 (SIB follows)
-            and (blob[pos + 3] & 0xC0) == 0xC0  # SIB: scale=11 (*8)
-        )
-
     j = win_begin
     while j <= win_end - 5:
         # Never start decoding inside the anchor's own 6 bytes (opcode +
@@ -1156,7 +1187,7 @@ def _try_patch_msvc_style_tls_access(
         if 0xB8 <= opcode <= 0xBF:
             imm_off = j + rex_len + 1
             imm_end = imm_off + 4
-            if imm_end <= len(blob) and _is_scale8_sib_load(imm_end):
+            if imm_end <= len(blob) and _is_scale8_sib_load(blob, imm_end):
                 cur = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
                 blob[imm_off:imm_off + 4] = (cur + shift).to_bytes(4, "little", signed=True)
                 return True

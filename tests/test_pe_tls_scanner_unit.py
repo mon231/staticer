@@ -10,15 +10,23 @@ from staticer.pe_embedder import _patch_dep_tls_access_offsets
 
 def _mingw_blob(load_reg_modrm: int, dep_index_rva: int, access_disp: int, shift: int):
     """Builds: `mov <reg>, [rip+disp32]` (the _tls_index load, at offset
-    `anchor`) immediately followed by `mov eax, [rcx+disp32]` (the
-    mingw-style variable-specific access `_try_patch_mingw_style_tls_access`
-    looks for). `load_reg_modrm` is the anchor's own ModRM byte (varies by
-    which register the load targets)."""
+    `anchor`), followed by the real mingw-w64-compiled shape confirmed
+    against actual `x86_64-w64-mingw32-gcc -O2` output -- a TEB load
+    (`mov rdx, gs:[0x58]`) then the scale-8 SIB-addressed load that
+    combines it with the just-loaded `_tls_index` value (`mov rax,
+    [rdx+rax*8]`) -- immediately (zero-gap) followed by `mov eax,
+    [rax+disp32]` (the mingw-style variable-specific access
+    `_try_patch_mingw_style_tls_access` looks for, now requiring that
+    zero-gap scale-8 SIB load right before it as real corroboration --
+    see its own docstring for why). `load_reg_modrm` is the anchor's own
+    ModRM byte (varies by which register the load targets)."""
     blob = bytearray(4)  # leading padding so the REX prefix (if any) isn't at index 0
     anchor = len(blob)
     blob += bytes([0x8B, load_reg_modrm])
     disp = dep_index_rva - (anchor + 6)
     blob += disp.to_bytes(4, "little", signed=True)
+    blob += bytes([0x65, 0x48, 0x8B, 0x14, 0x25, 0x58, 0x00, 0x00, 0x00])  # mov rdx, gs:[0x58]
+    blob += bytes([0x48, 0x8B, 0x04, 0xC2])  # mov rax, [rdx+rax*8] -- scale-8 SIB load
     access_start = len(blob)
     blob += bytes([0x8B, 0x80])  # mov eax, [rax+disp32] (mod=10, rm=000)
     blob += access_disp.to_bytes(4, "little", signed=True)
@@ -188,3 +196,71 @@ def test_scanner_does_not_misparse_intervening_instruction_as_msvc_immediate():
     # The real per-variable offset constant is the one that got shifted.
     result = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
     assert result == access_offset + shift
+
+
+def _mingw_blob_with_hazardous_trailing_cmp():
+    """Builds the exact real-world instruction bytes found at blob offset
+    `0x2393bf` in the real, MSVC-compiled `Qt6Gui.dll` (see
+    `_try_patch_mingw_style_tls_access`'s own docstring): the genuine
+    anchor (`mov ecx, [rip+disp32]`) is immediately followed by MSVC's own
+    real offset-load (`mov edx, 4`) and its real scale-8 SIB load (`mov
+    rcx, [rax+rcx*8]`), then the real final variable access (`mov eax,
+    [rdx+rcx*1]`) -- and a few bytes after *that*, an entirely unrelated
+    `cmp dword ptr [rip+disp32], eax` instruction whose own disp32 bytes
+    (`89 b6 45 00`) happen to decode as an `8B`/`89`-opcode, ModRM
+    mod=10/rm!=SIB pair -- the exact byte shape
+    `_try_patch_mingw_style_tls_access` looks for -- with nothing resembling
+    a real scale-8 SIB load actually sitting immediately before it (just
+    the tail of the real final access instruction). Before this function
+    required that zero-gap preceding scale-8 SIB load as corroboration, it
+    matched this `cmp`'s own disp32 and corrupted it (and the 2-byte `jg`
+    immediately after it, confirmed via the real 010 Editor crash this
+    regression test is for). Returns `(blob, dep_index_rva, anchor,
+    tls_index_load_end, imm_off, cmp_disp_off)`.
+    """
+    blob = bytearray(4)  # leading padding
+    blob += bytes([0x58, 0x00, 0x00, 0x00])  # tail of the real preceding `mov rax, gs:[0x58]`
+    anchor = len(blob)
+    hazardous_disp = 0x0045C123  # the real disp32 value, straight from Qt6Gui.dll
+    dep_index_rva = anchor + 6 + hazardous_disp
+    blob += bytes([0x8B, 0x0D])  # mov ecx, [rip+disp32] -- the real anchor
+    blob += hazardous_disp.to_bytes(4, "little", signed=True)
+    tls_index_load_end = len(blob)
+    imm_off = len(blob) + 1
+    blob += bytes([0xBA, 0x04, 0x00, 0x00, 0x00])  # mov edx, 4 -- the real genuine offset-load
+    blob += bytes([0x48, 0x8B, 0x0C, 0xC8])  # mov rcx, [rax+rcx*8] -- real scale-8 SIB load
+    blob += bytes([0x8B, 0x04, 0x0A])  # mov eax, [rdx+rcx*1] -- real final variable access
+    cmp_disp_off = len(blob) + 2
+    blob += bytes([0x39, 0x05, 0x89, 0xB6, 0x45, 0x00])  # cmp dword ptr [rip+disp32], eax -- unrelated
+    blob += bytes([0x7F, 0x0D])  # jg -- unrelated, corrupted alongside the cmp in the old bug
+    blob += bytes(8)  # trailing padding
+    return blob, dep_index_rva, anchor, tls_index_load_end, imm_off, cmp_disp_off
+
+
+def test_scanner_does_not_misparse_adjacent_cmp_disp32_as_mingw_access():
+    """Regression test for the real 010 Editor / Qt6Gui.dll crash (third
+    confirmed real-world false positive, after SHLWAPI.dll/SHELL32.dll):
+    `_try_patch_mingw_style_tls_access` must not accept the unrelated
+    `cmp`'s disp32 bytes merely because they happen to look like a `mov
+    r32, [r64+disp32]`-shaped access -- it must require the zero-gap
+    preceding scale-8 SIB load real mingw-w64 output always has, and defer
+    to `_try_patch_msvc_style_tls_access` (tried second), which correctly
+    finds and shifts the real `mov edx, 4` offset-load instead.
+    """
+    shift = 0x1000
+    blob, dep_index_rva, anchor, tls_index_load_end, imm_off, cmp_disp_off = (
+        _mingw_blob_with_hazardous_trailing_cmp()
+    )
+    cmp_disp_before = bytes(blob[cmp_disp_off:cmp_disp_off + 4])
+    anchor_bytes_before = bytes(blob[anchor:tls_index_load_end])
+
+    patched, anchors_found = _patch_dep_tls_access_offsets(blob, dep_index_rva, shift)
+
+    assert (patched, anchors_found) == (1, 1)
+    # The unrelated cmp's own disp32 (and the anchor itself) must be untouched.
+    assert bytes(blob[cmp_disp_off:cmp_disp_off + 4]) == cmp_disp_before
+    assert bytes(blob[anchor:tls_index_load_end]) == anchor_bytes_before
+    # The real per-variable offset constant (MSVC's `mov edx, 4`) is the
+    # one that got shifted, by `_try_patch_msvc_style_tls_access`.
+    result = int.from_bytes(blob[imm_off:imm_off + 4], "little", signed=True)
+    assert result == 4 + shift
