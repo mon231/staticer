@@ -412,6 +412,38 @@
   accepted correctness gap, not a new crash risk, and exactly the kind
   of gap the "second, independent verification pass" note above already
   anticipated.
+  **Update -- this "not a new crash risk" assumption needs correcting.**
+  Investigating the `Qt6Core.dll` `WM_GETOBJECT` crash below (see that
+  entry's own update) by re-running this exact scanner's matching logic
+  against the real, unmodified `Qt6Core.dll` found 167 real `_tls_index`
+  anchors, of which only 129 match either known pattern -- 38 (23%) go
+  unmatched, a much larger real-world gap than SHLWAPI.dll/SHELL32.dll's
+  (10/15, 25/26) ever showed, and a real, concrete case where an
+  unmatched access is plausibly the direct cause of a crash, not just a
+  stale-but-harmless read: a missed anchor's offset isn't patched, so it
+  still indexes into what *used* to be this dependency's own per-thread
+  block layout -- but after the merge that same byte range now belongs
+  to the *host's* own prepended TLS raw data (`shift` bytes, prepended
+  ahead of the dependency's own raw data in the combined block), not to
+  any of this dependency's own TLS variables at all. For an ordinary
+  data variable that's a wrong-value correctness bug; for one of
+  MSVC's own thread-safe-static-local-variable "magic statics" guards
+  (confirmed: most of these 38 anchors sit inside exactly that compiled
+  idiom -- `mov r32,[rip+disp]` anchor, zero-gap `mov r64,[gpr+gpr*8]`
+  scale-8 SIB load, a nearby `mov r32,imm32` offset, then a direct
+  register+register `[base+offset]` access with no further SIB-load
+  step at all -- a third compiled shape neither existing pattern
+  function recognizes, since both require the scale-8 SIB load to sit
+  on a specific *one* side of the offset-load, not reused directly by
+  the anchor itself) it means that guard now reads/writes the *host's*
+  own unrelated TLS byte instead of its own -- which can easily read
+  back as "already initialized" when it isn't, skipping the real
+  constructor and leaving the guarded object's members (a vtable
+  pointer, a cached pointer to some other object, etc.) zero-initialized
+  forever. That is a real, new crash risk this scanner's own docstring
+  and this bullet's original text did not anticipate, not merely a
+  "stale but in-bounds" one. See the `Qt6Core.dll` entry below for the
+  concrete case this was found investigating.
 - **Fixed, found via the same 010 Editor testing (history below --
   CORRECTED twice; the first "fix" here had a real, confirmed
   regression of its own)**: the PE embedder had no handling at all for
@@ -988,3 +1020,84 @@
      appear, but measurably closer, and the next blocker is now this one
      specific null-object dereference in `Qt6Core.dll`'s accessibility
      code path, not a TLS access anywhere.
+
+     **Update -- confirmed a real embedding bug, not this machine's own
+     accessibility state; root cause narrowed to a specific, known,
+     documented scanner gap (not yet fixed).** First checked the
+     environment hypothesis the entry above left open: no screen reader
+     or UI Automation client was running by default (checked for
+     Narrator/NVDA/JAWS/Magnifier-type processes and services -- none
+     found). Then tested the real, *unmodified* `010Editor.exe` (its own
+     separately-loaded, un-embedded `Qt6Core.dll`) directly against the
+     exact same accessibility entry points the crash's own backtrace
+     uses: called `Oleacc!AccessibleObjectFromWindow` on its real window
+     handle directly (succeeded, valid `IAccessible` returned); walked
+     its *entire* UI Automation tree (432 real descendant controls,
+     `AutomationElement.FindAll(TreeScope.Descendants, ...)`, which
+     forces Qt's accessibility bridge to construct an accessible object
+     for every single widget in the real, running app); started a real
+     `narrator.exe` and interacted with the window (`SetForegroundWindow`,
+     `Tab` through controls, opened the menu bar via `Alt`) while it was
+     running. None of this crashed the real, unmodified binary, over
+     several minutes of sustained exercise -- conclusively ruling out
+     "this machine's accessibility state alone triggers a genuine,
+     pre-existing Qt/010-Editor bug independent of embedding." This *is*
+     a real, staticer-caused embedding bug.
+
+     Root-caused the mechanism (not yet the single exact instruction)
+     via the same real-bytes technique used for every other fix this
+     session. Mapped the crash site precisely back to `Qt6Core.dll`'s
+     own RVA space: the merged image's `010Editor+0x277453a` fault
+     corresponds exactly (confirmed byte-for-byte, a 0x269F000 constant
+     shift between the two RVA spaces holds for a wide surrounding
+     window) to real `Qt6Core.dll`'s own RVA `0xd553a`, inside a
+     function starting at RVA `0xd54d0`: `r13 = qword ptr [rcx+8]` (RCX
+     being this function's own first incoming parameter -- some caller-
+     supplied object), then `lea rcx,[r13+0x90]` and the crashing
+     `lock cmpxchg qword ptr [rcx],rdx` once `r13` turns out to be `0`.
+     Re-running this project's own `_patch_dep_tls_access_offsets`
+     anchor-matching logic (unmodified, read-only, against the real
+     on-disk `Qt6Core.dll` bytes) found `167` real `_tls_index` load
+     sites in this one dependency, of which only `129` match either
+     known compiled pattern (`_try_patch_mingw_style_tls_access` /
+     `_try_patch_msvc_style_tls_access`) -- confirmed, for every one of
+     those 129, that the live merged binary's patched immediate is
+     *exactly* `(real value) + 0x4EC`, the same constant for all 129
+     with zero exceptions, i.e. the scanner's own patching is internally
+     self-consistent and correct wherever it fires at all. The other
+     `38` (23%) go completely unmatched and unpatched -- see the
+     "narrower than its own docstring implies" bullet's own update,
+     above, for the newly-identified third compiled shape most of them
+     share (an MSVC thread-safe-static "magic static" guard idiom with
+     the scale-8 SIB load sitting on the *opposite* side of the offset-
+     load from what either existing pattern function requires) and why
+     an unpatched one of these specifically risks a null/garbage-guard
+     read rather than just a harmless stale offset.
+
+     This is a strong, concrete, real-evidence-backed explanation for
+     the crash's own shape (an otherwise-valid object whose own member
+     is unexpectedly `0`, exactly what a magic-static guard reading the
+     *host's* unrelated TLS byte instead of its own -- wrongly concluding
+     "already constructed" -- would produce) but **not yet proven down
+     to the one single anchor that feeds this specific `r13`** -- that
+     would need tracing the caller chain further up through
+     `Qt6Widgets.dll`'s own accessibility factory code to identify
+     exactly which magic-static object is being read, which wasn't
+     completed. Deliberately **not** attempting a scanner fix for this
+     specific session's task: the 38 unmatched anchors are not even all
+     one shape (at least one, near RVA `0x1069`, folds the scale-8-SIB
+     load and the offset into a single `add r64,[gpr+gpr*8]` rather than
+     a separate `mov`+access, a fourth distinct idiom), and this
+     project's own history is that *exactly this kind of rushed, single-
+     sample heuristic pattern addition* is what produced each of the
+     three real TLS-scanner corruption bugs already found and fixed
+     this session -- writing a new pattern function with the same
+     confidence this codebase expects (verified against multiple
+     independently-compiled real samples, not just this one file, with
+     a hand-crafted regression test and a full non-regression pass
+     across every other anchor) is real, separate follow-up work, not a
+     guess to make under this task's own explicit instruction not to.
+     Left as a precisely-scoped follow-up: extend
+     `_KNOWN_DEP_TLS_ACCESS_PATTERNS` with (at least) this third
+     compiled shape, with the same rigor as every existing entry, then
+     re-verify the real 010 Editor embed past this exact crash.
