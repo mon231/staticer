@@ -62,6 +62,87 @@ def test_loadlibrary_getprocaddress_resolve_against_embedded_copy(tmp_path):
     )
 
 
+def test_third_party_plugin_statically_importing_embedded_dependency_resolves_against_embedded_copy(tmp_path):
+    """Regression test for the LdrRegisterDllNotification-based hook (see
+    ``staticer/stubs/windows/pe_stub.py``'s ``build_windows_ldr_
+    notification_callback``/``build_windows_ldr_notification_register``,
+    and ``docs/limitations.md``) -- the real-world shape being 010
+    Editor's own Qt platform plugin, ``qwindows.dll``, which the
+    KERNEL32-level LoadLibraryW/LoadLibraryA/GetProcAddress hook above
+    does NOT fix (it only intercepts explicit, application-level
+    LoadLibrary*/GetProcAddress calls, not the OS loader's own internal
+    import-table resolution of a dynamically-loaded module's own static
+    imports).
+
+    ``plugin.dll`` (synthesized small, exactly ``qwindows.dll``-shaped):
+    never statically imported by the host, so embed() never embeds it --
+    it stays a real, genuinely-still-on-disk DLL, loaded dynamically by
+    the host via an explicit LoadLibraryW call (which the KERNEL32-level
+    hook correctly lets through to a real load, since ``plugin.dll``
+    itself isn't embedded). ``plugin.dll`` ITSELF statically imports
+    ``lib.dll`` by name -- the dependency this run embeds.
+
+    Deliberately does NOT delete the real lib.dll from disk first (unlike
+    ``test_loadlibrary_getprocaddress_resolve_against_embedded_copy``
+    above) -- confirmed concretely, by first trying exactly that, that it
+    doesn't test what it looks like it tests here: by the time
+    `LDR_DLL_NOTIFICATION_REASON_LOADED` fires for `plugin.dll`, the real
+    loader has ALREADY had to recursively, really resolve `plugin.dll`'s
+    own static dependency on `lib.dll` via the real filesystem (deleting
+    `lib.dll` first makes `LoadLibraryW("plugin.dll")` itself fail with
+    `ERROR_MOD_NOT_FOUND`/126 regardless of whether this hook works at
+    all -- confirmed live with `cdb`/loader snaps -- since the
+    notification simply never gets a chance to fire for a module whose
+    own dependencies couldn't be resolved in the first place). This is
+    exactly the real 010 Editor shape too: `Qt6Core.dll`/`Qt6Gui.dll`'s
+    own files stay on disk even once embedded (see
+    ``docs/limitations.md``), so the real loader DOES load a real,
+    separate, wasteful-but-successful duplicate copy as a side effect of
+    resolving `qwindows.dll`'s own import table -- this hook's actual job
+    is to redirect `plugin.dll`'s own *calls* through that
+    already-resolved IAT slot to the embedded copy afterward, not to
+    prevent the duplicate load from happening at all.
+
+    So the real proof is address-based: `plugin_get_lib_address()`
+    returns the real address of the `lib.dll` code that actually ran
+    (`lib_value_self_address()` -- the function body itself, not a thunk
+    or an IAT slot, so both the embedded and a real duplicate copy would
+    return a genuinely different value here, unlike plain `lib_value()`,
+    which returns the same `42` either way since both copies run
+    byte-identical code). ``main_plugin_loader.c`` maps that address back
+    to its owning module via `GetModuleHandleExW`
+    (`GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`) and compares it against its
+    own module handle -- the embedded copy lives INSIDE the host's own
+    image with no separate module boundary at all, unlike a real
+    duplicate. Confirmed this actually discriminates (not just "returns
+    0 either way"): running the *unembedded* host directly (no hook
+    installed at all) returns a distinct, non-zero code (5) for this
+    exact reason -- the duplicate-copy gap this hook exists to fix.
+    """
+    dll = build_shared_lib(tmp_path, FIXTURES / "lib.c", "lib.dll", pic=True, bits=64)
+    plugin = build_shared_lib(tmp_path, FIXTURES / "plugin.c", "plugin.dll", pic=True, bits=64, libs=[dll])
+    exe = build_exe(tmp_path, FIXTURES / "main_plugin_loader.c", "main.exe", [dll], pic=True, bits=64)
+    out = tmp_path / "static.exe"
+
+    assert "lib.dll" in list_pe_imports(exe)
+
+    PortableExecutableEmbedder(exe, out, exclude=set(), lib_dir=tmp_path).embed()
+
+    assert "lib.dll" not in list_pe_imports(out)
+    # plugin.dll itself is untouched -- embed() only ever embeds what the
+    # top-level host's own import graph names, and the host here never
+    # statically imports plugin.dll at all.
+    assert "lib.dll" in list_pe_imports(plugin)
+
+    result = subprocess.run([str(out)], capture_output=True)
+    assert result.returncode == 0, (
+        f"expected the LdrRegisterDllNotification hook to redirect plugin.dll's own "
+        f"static import of lib.dll to the embedded copy, got exit code "
+        f"{result.returncode} (5 means it resolved against a real, separate "
+        f"duplicate module instead), stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
 def test_loadlibrary_hook_falls_through_for_non_embedded_names(tmp_path):
     """A sibling check for the "no match -> real LoadLibrary/
     GetProcAddress still work" half of the contract: with an embedded

@@ -35,6 +35,8 @@ from .stubs.windows.pe_stub import (
     build_windows_delay_import_lazy_thunk,
     build_windows_getprocaddress_trampoline,
     build_windows_hook_install,
+    build_windows_ldr_notification_callback,
+    build_windows_ldr_notification_register,
     build_windows_loadlibrary_trampoline,
     build_windows_stub,
     build_windows_tls_index_fixup,
@@ -2852,6 +2854,52 @@ class PortableExecutableEmbedder:
                     for i, api in enumerate(missing_apis):
                         kernel32_hook_slot_vas[api].append(image_base + syn_rva + iat_off + i * ptr_size)
 
+            # -- synthetic ntdll.dll LdrRegisterDllNotification import ------
+            # The LdrRegisterDllNotification-based hook (below, near
+            # `build_windows_ldr_notification_callback`) needs a real call
+            # into ntdll to register its callback. ntdll.dll is always
+            # already loaded for every Windows process (it's the loader
+            # itself) and is never one of this run's embedded/excluded
+            # dependencies, so -- exactly like the KERNEL32 synthetic
+            # imports above -- a plain, eager, unconditional import of it
+            # is always safe, with no optionality concern at all. Same
+            # gate (`hookable_deps_exist`) as the KERNEL32 hook-slot
+            # discovery above: nothing to register a callback for at all
+            # if there's no real embedded dependency to ever redirect
+            # towards.
+            if hookable_deps_exist:
+                _ntdll_name = b"ntdll.dll\x00"
+                _ldrreg_name = b"LdrRegisterDllNotification\x00"
+                ntdll_blob = bytearray()
+                ntdll_blob += _ntdll_name
+                ibn_off = len(ntdll_blob)
+                ntdll_blob += struct.pack("<H", 0) + _ldrreg_name
+                while len(ntdll_blob) % ptr_size:
+                    ntdll_blob += b"\x00"
+                int_off = len(ntdll_blob)
+                ntdll_blob += b"\x00" * (ptr_size * 2)
+                iat_off = len(ntdll_blob)
+                ntdll_blob += b"\x00" * (ptr_size * 2)
+
+                ntdll_rva = next_rva
+                name_rva = ntdll_rva + ibn_off
+                for base_off in (int_off, iat_off):
+                    ntdll_blob[base_off:base_off + ptr_size] = name_rva.to_bytes(ptr_size, "little")
+
+                new_sections.append((
+                    b".sldrimp", bytes(ntdll_blob), ntdll_rva, _SCN_CODE_RWX, len(ntdll_blob),
+                ))
+                next_rva = _align_up(ntdll_rva + len(ntdll_blob), section_alignment)
+
+                merged_descriptors.append({
+                    "name_rva": ntdll_rva,
+                    "orig_first_thunk_rva": ntdll_rva + int_off,
+                    "first_thunk_rva": ntdll_rva + iat_off,
+                })
+                ldrregisterdllnotification_iat_slot_va = image_base + ntdll_rva + iat_off
+            else:
+                ldrregisterdllnotification_iat_slot_va = None
+
             # -- merged/combined import directory -------------------------
             if removed_dll_names_lower or merged_descriptors:
                 combined: List[Dict[str, int]] = []
@@ -2985,6 +3033,15 @@ class PortableExecutableEmbedder:
                     # found", rather than a hard embed() failure).
                     loadlib_entries: List[Tuple[int, int, int]] = []  # (wide_off, ansi_off, hinst)
                     module_table_entries: List[Tuple[int, int, int]] = []  # (hinst, name_tbl_off, ord_tbl_off)
+                    # (ansi_off, name_table_off, ord_table_off) per hooked
+                    # dependency -- the LdrRegisterDllNotification-based
+                    # hook's own by-DLL-name match table (built from the
+                    # exact same per-dependency ANSI name string and
+                    # GetProcAddress-hook name/ordinal sub-tables just
+                    # below, not reinvented -- see
+                    # `build_windows_ldr_notification_callback`'s own
+                    # docstring for why sharing this shape is correct).
+                    ldrhook_dep_table_entries: List[Tuple[int, int, int]] = []
                     for name in init_order_names:
                         hinst, _entry_va = dep_entry_vas[name]
                         if not hinst:
@@ -3028,6 +3085,7 @@ class PortableExecutableEmbedder:
                         _put_plain_u64(0)
 
                         module_table_entries.append((hinst, name_table_off, ord_table_off))
+                        ldrhook_dep_table_entries.append((ansi_off, name_table_off, ord_table_off))
 
                     while len(hook_blob) % 8:
                         hook_blob.append(0)
@@ -3054,6 +3112,15 @@ class PortableExecutableEmbedder:
                     _put_plain_u64(0)
                     _put_plain_u64(0)
 
+                    ldrhook_dep_table_off = len(hook_blob)
+                    for ansi_off, name_off, ord_off in ldrhook_dep_table_entries:
+                        _put_va(_hook_va(ansi_off))
+                        _put_va(_hook_va(name_off))
+                        _put_va(_hook_va(ord_off))
+                    _put_plain_u64(0)
+                    _put_plain_u64(0)
+                    _put_plain_u64(0)
+
                     saved_loadlibw_off = len(hook_blob)
                     _put_plain_u64(0)
                     saved_loadliba_off = len(hook_blob)
@@ -3065,6 +3132,14 @@ class PortableExecutableEmbedder:
                     # calls (see that function's own docstring) -- never
                     # read by anything else, so one shared cell suffices.
                     scratch_dword_off = len(hook_blob)
+                    _put_plain_u64(0)
+                    # Receives `LdrRegisterDllNotification`'s own `*Cookie`
+                    # out-parameter at install time -- never read back by
+                    # anything here afterward (see
+                    # `build_windows_ldr_notification_register`'s own
+                    # docstring on why this project never calls
+                    # `LdrUnregisterDllNotification`).
+                    ldr_notify_cookie_off = len(hook_blob)
                     _put_plain_u64(0)
 
                     loadlibw_code, loadlibw_relocs = build_windows_loadlibrary_trampoline(
@@ -3118,6 +3193,38 @@ class PortableExecutableEmbedder:
                     hook_blob.extend(install_code)
                     hook_reloc_offsets.extend(install_off + off for off in install_relocs)
 
+                    # -- LdrRegisterDllNotification hook: callback + -------
+                    # -- registration code ---------------------------------
+                    # (see docs/limitations.md and this module's own
+                    # docstring for the empirical investigation this is
+                    # built on). Fixes the case the LoadLibraryW/
+                    # LoadLibraryA/GetProcAddress hook above explicitly
+                    # does NOT: a module loaded dynamically by name (e.g.
+                    # a plugin loaded via an explicit LoadLibraryW call,
+                    # which that hook does see and correctly lets through
+                    # to a real load) whose own *statically compiled*
+                    # import table resolves one of this run's embedded
+                    # dependencies by name entirely inside the OS loader's
+                    # own import-snap machinery -- never through any IAT
+                    # slot the KERNEL32-level hook can see or overwrite.
+                    ldrnotify_code, ldrnotify_relocs = build_windows_ldr_notification_callback(
+                        dep_table_va=_hook_va(ldrhook_dep_table_off),
+                        virtualprotect_iat_slot_va=kernel32_hook_slot_vas["virtualprotect"][0],
+                        scratch_qword_va=_hook_va(scratch_dword_off),
+                    )
+                    ldrnotify_off = len(hook_blob)
+                    hook_blob.extend(ldrnotify_code)
+                    hook_reloc_offsets.extend(ldrnotify_off + off for off in ldrnotify_relocs)
+
+                    ldrreg_code, ldrreg_relocs = build_windows_ldr_notification_register(
+                        ldrregisterdllnotification_iat_slot_va=ldrregisterdllnotification_iat_slot_va,
+                        callback_va=_hook_va(ldrnotify_off),
+                        cookie_scratch_va=_hook_va(ldr_notify_cookie_off),
+                    )
+                    ldrreg_off = len(hook_blob)
+                    hook_blob.extend(ldrreg_code)
+                    hook_reloc_offsets.extend(ldrreg_off + off for off in ldrreg_relocs)
+
                     new_sections.append((
                         b".shkdat", bytes(hook_blob), hookdata_rva, _SCN_CODE_RWX, len(hook_blob),
                     ))
@@ -3133,7 +3240,10 @@ class PortableExecutableEmbedder:
                     # pre-existing precedent; this is just the first entry
                     # that specifically needs to run before *every other*
                     # one, not merely alongside its own dependency).
-                    dep_entry_calls = [("__hook_install__", 0, _hook_va(install_off))] + dep_entry_calls
+                    dep_entry_calls = [
+                        ("__hook_install__", 0, _hook_va(install_off)),
+                        ("__ldr_notify_register__", 0, _hook_va(ldrreg_off)),
+                    ] + dep_entry_calls
                     init_order_names = [name for name, _, _ in dep_entry_calls]
                     dep_entry_vas = {name: (hinst, entry) for name, hinst, entry in dep_entry_calls}
 

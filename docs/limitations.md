@@ -78,6 +78,11 @@
     calls through any IAT slot this hook can see or overwrite. See the
     010 Editor Qt-platform-plugin entry below for the real-world case
     this was confirmed against, and exactly what it does and doesn't fix.
+    **Update: this specific gap is now separately fixed** by the
+    LdrRegisterDllNotification-based hook described in that same
+    010-Editor entry below -- the two hooks are complementary, not
+    redundant (this one still covers the explicit-call case the other
+    one doesn't, and vice versa).
 - A "full closure" embed on ELF still bottoms out at glibc's own dynamic
   linker/loader internals, which stay dynamically linked rather than
   embedded. Root cause confirmed concrete, not a vague "loader internals"
@@ -654,10 +659,211 @@
      across Windows versions, trading this problem for an equally real
      version-compatibility one.
 
-     **Current state: genuinely unresolved, not merely unimplemented.**
+     **Previous state: genuinely unresolved, not merely unimplemented.**
      Treat embedding a Qt6 (or any framework with the same "plugin
      loaded by LoadLibrary, plugin statically imports an embedded
      dependency by name" shape) GUI application as capped at "starts
      without crashing/hanging, embeds everything except what a runtime-
      loaded plugin's own import table needs" until one of the two
      research threads above is actually completed, not just scoped.
+
+     **Update: both open questions from thread 2 above are now settled,
+     and the mechanism is implemented and shipping.** A dedicated
+     empirical investigation (a throwaway C test harness, 3 consistent
+     runs plus register-level confirmation under `cdb`, on a real
+     Windows 11 build -- not assumed from documentation) checked both
+     blockers directly, concretely, rather than relying on Microsoft's
+     own documentation (which doesn't settle either one):
+     - `LDR_DLL_NOTIFICATION_REASON_LOADED` fires AFTER the newly-loaded
+       module's own import-table snap has ALREADY completed -- confirmed
+       directly (a watched module's real IAT slot already held its
+       correctly-resolved address at notify time, not a pre-snap
+       placeholder). There is no race to design around: by the time the
+       callback runs, the module's own import resolution already
+       happened the normal way; the hook patches a slot back open
+       afterward, never before anything has settled.
+     - The watched module's IAT-containing page IS read-only at that
+       point (confirmed via `VirtualProtect` returning
+       `oldProtect = PAGE_READONLY`), same as the already-known KERNEL32
+       IAT case the existing hook above already handles with its own
+       `VirtualProtect` wrap -- so the identical wrap/write/restore dance
+       is reused here rather than inventing a second mechanism.
+     - Calling a REAL KERNEL32 function (`VirtualProtect`) from inside
+       the notification callback -- against Microsoft's own documented
+       "unsafe to call other modules" guidance -- worked with no
+       deadlock and no crash in the real test. **This remains
+       unsupported/undocumented behavior**: confirmed empirically on the
+       tested build, NOT architecturally guaranteed by Microsoft across
+       all future Windows versions. Shipped anyway, with the same honest
+       framing this project already uses elsewhere for loader-internals-
+       adjacent work that's "verified working on tested platforms, not
+       guaranteed" (see the real-system-DLL-`DllMain`-nondeterminism
+       entry above).
+     - A sentinel write made during the callback, after flipping
+       protection, was confirmed to survive untouched after
+       `LoadLibraryW` returns (no later re-snap undoes it) -- settling
+       thread 2's second open question directly.
+
+     Implemented as `build_windows_ldr_notification_callback`/
+     `build_windows_ldr_notification_register` in `pe_stub.py` (see that
+     module's own docstring's "Ldr notification hook" section for the
+     full mechanism) -- registered via a synthetic ntdll.dll import of
+     the real `LdrRegisterDllNotification`, spliced into the generated
+     init-call stub the same way as the KERNEL32 hook's own
+     `__hook_install__` entry, so registration happens before any
+     embedded module's own initializer runs. The callback itself walks
+     ANY newly-loaded module's own `IMAGE_IMPORT_DESCRIPTOR`/
+     `IMAGE_THUNK_DATA64` arrays (pure memory reads against its own
+     newly-mapped image) looking for an import whose owning DLL name
+     matches one of this run's embedded dependency names, and on a
+     match, patches that already-snapped IAT slot to the embedded
+     dependency's own resolved address -- reusing the exact same by-name/
+     by-ordinal sub-tables the KERNEL32-level GetProcAddress hook already
+     builds, not a second, parallel table.
+
+     Confirmed via a real, dedicated end-to-end fixture
+     (`tests/windows/test_pe_hook_runtime.py`'s
+     `test_third_party_plugin_statically_importing_embedded_dependency_
+     resolves_against_embedded_copy`, synthesizing the exact `qwindows.
+     dll` shape -- a `plugin.dll` that is never statically imported by the
+     host, loaded dynamically via `LoadLibraryW`, and which itself
+     statically imports the embedded `lib.dll` by name): after a real
+     `embed()`+run, the function the plugin calls through that static
+     import correctly resolves to the EMBEDDED copy, not a fresh,
+     separate load.
+
+     **A real methodology correction worth recording explicitly**: the
+     "delete the real dependency's file from disk first, so a failed
+     redirect fails loudly" proof technique that works for the KERNEL32-
+     level hook (`test_loadlibrary_getprocaddress_resolve_against_
+     embedded_copy`) does NOT work for this hook, and trying it first is
+     what surfaced this -- confirmed concretely, live, with `cdb` and
+     loader snaps (`gflags +sls`): deleting the embedded dependency's
+     real file before loading the third-party plugin makes the PLUGIN's
+     own load fail outright with `ERROR_MOD_NOT_FOUND` (126), regardless
+     of whether this hook is working correctly at all. This is a direct,
+     unavoidable corollary of the already-confirmed "notification fires
+     after the watched module's own import snap already completed"
+     finding above: that snap can only complete at all if every one of
+     the plugin's own dependencies was already resolvable via a real
+     file (or an already-loaded module) -- there is no point at which
+     this hook could intervene *before* that resolution happens, only
+     after. This is also exactly the real 010 Editor shape: `Qt6Core.
+     dll`/`Qt6Gui.dll`'s own files stay on disk even once embedded (see
+     the entry above), so the real loader DOES load a real, separate,
+     wasteful-but-successful duplicate copy as a side effect of resolving
+     `qwindows.dll`'s own import table -- this hook's actual job is to
+     redirect calls through that already-resolved IAT slot to the
+     embedded copy afterward, not to prevent the duplicate load from
+     happening at all. The regression test instead proves this by
+     address: the dependency exposes a function returning its OWN
+     executing code address (not a thunk, not an IAT slot -- the real
+     function body, so a real duplicate copy and the embedded copy
+     provably return different values despite running byte-identical
+     code), and the host maps that address back to its owning module via
+     `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, ...)`
+     and compares it against its own module handle (the embedded copy
+     lives inside the host's own image with no separate module boundary
+     at all). Confirmed this genuinely discriminates, not merely "returns
+     0 either way": running the *unembedded* host directly (no hook
+     installed) returns a distinct, non-zero code for this exact
+     scenario.
+
+     Known, deliberate scope limits for this specific hook (beyond the
+     x64-only scope every mechanism in `pe_stub.py` shares): only
+     `LDR_DLL_NOTIFICATION_REASON_LOADED` is handled (`_UNLOADED` is a
+     no-op); a loaded module's import descriptor with no
+     `OriginalFirstThunk` (no unbound import-name table -- old/rare in
+     practice) is skipped entirely, since there is no other way to
+     recover by-name/by-ordinal import identity once `FirstThunk` has
+     already been snapped to resolved addresses; and an import that
+     doesn't match any hooked dependency's own by-name/by-ordinal
+     sub-table (including an unresolvable forward) is left completely
+     untouched -- no patch at all, not even a NULL write, since unlike
+     GetProcAddress's own explicit "not found" contract, there's no way
+     to signal failure back to the loader's own already-completed snap.
+
+     **The real-world payoff, and a new, genuinely separate blocker found
+     while chasing it**: rebuilding the actual 010 Editor installation
+     (`staticer "C:\Program Files\010 Editor\010Editor.exe" -o
+     "C:\Program Files\010 Editor\onefile_010editor.exe" --exclude
+     kernel32.dll,msvcrt.dll,ntdll.dll,USER32.dll,ole32.dll` -- the exact
+     command every earlier entry in this file was building toward) now
+     gets *past* the Qt-platform-plugin dialog for the first time ever in
+     this project's history (confirmed via loader snaps, `gflags +sls`:
+     `qwindows.dll` and `qwindowsvistastyle.dll` both load, resolve their
+     own static imports of the real, separate, duplicate `Qt6Core.dll`/
+     `Qt6Gui.dll`/`Qt6Widgets.dll` copies, run their own init routines,
+     and the process goes on to spawn real worker threads and execute
+     real Qt widget code) -- but it still doesn't show the real UI: it
+     now crashes with a real `STATUS_ACCESS_VIOLATION` (`c0000005`) a
+     little further in, reading from an unmapped address.
+
+     **Root-caused, not just observed -- and confirmed NOT caused by this
+     task's own hook.** The crash site (`010Editor+0x37263d1`, inside the
+     embedded copy of `Qt6Gui.dll`) is a plain `cmp dword ptr
+     [rip+disp32], eax` -- ordinary compiler-generated code, nothing this
+     project's generated machine code ever executes or writes to.
+     Confirmed by three independent, concrete checks:
+     1. A write watchpoint (`ba w8`) on the exact faulting address, set
+        before the process ever ran, never fired before the crash -- the
+        bad bytes were already wrong in the file on disk, not corrupted
+        at runtime by anything (this hook's callback included).
+     2. The exact same corrupted bytes exist, at the exact same RVA, in a
+        build produced with this task's own `LdrRegisterDllNotification`
+        registration call replaced by a no-op (via a direct monkeypatch
+        of `build_windows_ldr_notification_register`, everything else in
+        `embed()` left untouched) -- i.e. a build using nothing this task
+        added. That "no-hook" build never reaches this code path at all
+        (it still stops at the Qt-plugin dialog, the same as every
+        earlier entry in this file describes), but the bug is already
+        baked into its output file regardless.
+     3. Directly invoking the pre-existing (unmodified by this task)
+        `_patch_dep_tls_access_offsets` against the real `Qt6Gui.dll`
+        confirms it: the genuine `_tls_index` load anchor at blob offset
+        `0x2393bf` (`mov ecx, [rip+disp32]`, correctly resolving to
+        `Qt6Gui.dll`'s own real `_tls_index` RVA) is followed, 18 bytes
+        later, by this unrelated `cmp dword ptr [rip+disp32], eax`
+        instruction at `0x2393d1` -- and `_try_patch_msvc_style_tls_
+        access`'s own forward scan accepts *that* instruction's disp32
+        as if it were the TLS-variable-specific offset to shift, for any
+        shift value tested. It isn't one; it's an ordinary, unrelated
+        global-variable comparison that merely happens to sit close
+        enough after a genuine anchor, with a `mov r32, imm32`-shaped
+        byte sitting where the scanner's corroboration check (described
+        above, under "The host-already-has-TLS merge's byte-pattern
+        scanner...") looks for one. Shifting its disp32 by the TLS
+        merge's own `shift` value corrupts it into pointing far outside
+        the dependency's own image (confirmed: the original, unpatched
+        instruction's own disp32 resolves to a real, in-bounds offset
+        within `Qt6Gui.dll`'s own data; the corrupted one resolves to
+        roughly 2.2x the *entire merged image's* own `SizeOfImage`).
+
+     This is a new, concrete instance of exactly the risk category the
+     "near-miss silently misfires" paragraph above already flags as
+     open (a real anchor can be found correctly while a *different*,
+     unrelated nearby instruction is *also* incorrectly treated as the
+     offset-bearing one) -- found in `Qt6Gui.dll` specifically, not
+     `SHLWAPI.dll`/`SHELL32.dll` (the two instances already fixed), and
+     only reachable at all once the LdrRegisterDllNotification hook let
+     `qwindows.dll`'s own `Qt6Gui.dll` import actually finish resolving
+     and running its own TLS-merged initializer -- every earlier attempt
+     at this real 010 Editor embed stopped (at the Qt-plugin dialog, or
+     earlier) before this exact code path ever executed. Fixing the
+     scanner's corroboration logic further (so it also rules out this
+     specific shape) is real, separate, additional work -- the same kind
+     of narrow, compiler-codegen-specific analysis the SHLWAPI/SHELL32
+     fix already needed, now against a third real-world binary -- and is
+     out of scope for this task (which built and verified the
+     LdrRegisterDllNotification mechanism itself, confirmed correct by
+     its own dedicated end-to-end fixture); left as a concrete, precisely
+     located follow-up rather than something this task should force a
+     quick patch past.
+
+     **Current state**: the LdrRegisterDllNotification hook is
+     implemented, tested, and confirmed working correctly end-to-end on
+     its own synthetic fixture. Against the real 010 Editor binary, it
+     measurably moves the needle (past the Qt-plugin-duplication dialog,
+     for the first time) but does not yet reach the real UI -- blocked
+     by this separate, pre-existing, now precisely located TLS-scanner
+     false-positive in `Qt6Gui.dll`, not by anything this task built.

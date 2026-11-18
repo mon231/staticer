@@ -229,13 +229,22 @@ def shrink_pe_section_header_slack(path: Path) -> None:
 def build_shared_lib(
     tmp_path: Path, source: Path, name: str, *, pic: bool, bits: int,
     extra_flags: Optional[List[str]] = None, strip_relocs: bool = False, cpp: bool = False,
+    libs: Optional[List[Path]] = None,
 ) -> Path:
+    """`libs`: other DLLs (built via this same helper) this one statically
+    imports -- same shape as `build_exe`'s own `libs` parameter, just for
+    a DLL target instead of an EXE one (e.g. a plugin DLL that itself
+    statically imports an already-built dependency DLL by name, mirroring
+    010 Editor's own `qwindows.dll` -> `Qt6Core.dll`/`Qt6Gui.dll` shape --
+    see `tests/windows/test_pe_hook_runtime.py`)."""
     kind, cl_path = _find_compiler()
     out = tmp_path / name
 
     if kind == "msvc":
         _require_msvc_bits(cl_path, bits)
         obj = tmp_path / (Path(name).stem + ".obj")
+        link_libs = [_msvc_import_lib_for(lib) for lib in (libs or [])]
+        extra_flags = [str(lib) for lib in link_libs] + list(extra_flags or [])
         if cpp:
             # /TP ("treat every file on this command line as C++ source")
             # applies to *every* argument, not just the primary source --
@@ -256,7 +265,10 @@ def build_shared_lib(
     compiler = _gnu_cpp_compiler_for_bits(bits) if cpp else _gnu_compiler_for_bits(bits)
     bits_flag = "-m64" if bits == 64 else "-m32"
     pic_flag = "-fPIC" if pic else "-fno-pic"
-    cmd = [compiler, "-shared", bits_flag, pic_flag, "-o", str(out), str(source)] + list(extra_flags or [])
+    cmd = (
+        [compiler, "-shared", bits_flag, pic_flag, "-o", str(out), str(source)]
+        + [str(lib) for lib in (libs or [])] + list(extra_flags or [])
+    )
     if platform.system() == "Windows":
         # mingw-w64 cross/native compiler, producing a PE DLL (used as a
         # cl.exe-less fallback for the Windows/PE embed tests).

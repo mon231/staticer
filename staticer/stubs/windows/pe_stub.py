@@ -131,6 +131,102 @@ write-up):
   ``NULL``, the same as a real "not found"), exactly mirroring this
   project's existing delay-import forward-resolution fallback elsewhere.
 
+Ldr notification hook (implemented, x64 only): fixes exactly the gap the
+hook above explicitly does NOT -- a module loaded dynamically by name
+(e.g. 010 Editor's own Qt platform plugin, `qwindows.dll`, loaded via
+`QPluginLoader`->`LoadLibraryW`) whose own *statically compiled* import
+table resolves one of this run's embedded dependencies by name entirely
+inside the OS loader's own import-snap machinery, never through any IAT
+slot the KERNEL32-level hook above can see or overwrite.
+
+Before writing any of this, a dedicated empirical investigation (a
+throwaway C test harness, 3 consistent runs plus register-level
+confirmation under `cdb`, on a real Windows 11 build) settled the two
+blockers `docs/limitations.md` previously recorded this mechanism as
+genuinely unresolved over:
+
+* `LdrRegisterDllNotification`'s `LDR_DLL_NOTIFICATION_REASON_LOADED`
+  callback fires AFTER the newly-loaded module's own import-table snap has
+  ALREADY completed -- confirmed concretely (a watched module's real IAT
+  slot already held its correctly-resolved address at notify time, not a
+  pre-snap placeholder), not just inferred from "resolution happens before
+  DllMain" documentation. There is no race to design around: this patches
+  a slot back open after the real loader already resolved it the normal
+  way, never before.
+* The watched module's IAT-containing page IS read-only at that point
+  (confirmed via `VirtualProtect` returning `oldProtect = PAGE_READONLY`),
+  same as the already-known KERNEL32 IAT case `build_windows_hook_install`
+  already handles -- so the exact same `VirtualProtect`-wrap/write/restore
+  dance is reused here, not reinvented.
+* Calling a REAL KERNEL32 function (`VirtualProtect`) from inside the
+  notification callback -- against Microsoft's own documented "unsafe for
+  the notification callback to call functions in ANY other module other
+  than itself" guidance -- worked with no deadlock and no crash in the
+  real test. This is unsupported/undocumented behavior: confirmed
+  empirically on the tested build, NOT architecturally guaranteed by
+  Microsoft across all future Windows versions. Shipped anyway, with that
+  same honest framing this project already uses elsewhere for loader-
+  internals-adjacent work that's "verified working on tested platforms,
+  not guaranteed" (see the real-system-DLL-`DllMain`-nondeterminism entry
+  in `docs/limitations.md`).
+
+Mechanism: `build_windows_ldr_notification_register` installs
+`build_windows_ldr_notification_callback` via a real
+`LdrRegisterDllNotification` call (a synthetic ntdll.dll import,
+`pe_embedder.py`'s mirror of its own KERNEL32 synthetic-import handling),
+spliced into the generated init-call stub the same way as
+`__hook_install__` above -- another synthetic, no-op-DllMain-signature
+entry, prepended so registration happens before any embedded module's own
+initializer runs. The callback itself fires on EVERY
+`LDR_DLL_NOTIFICATION_REASON_LOADED` event for ANY newly-loaded module (not
+just a specific expected one -- this has to handle arbitrary future
+dynamic loads, e.g. a Qt platform plugin this project doesn't control or
+know about in advance beyond knowing its own embedded dependency NAMES):
+reads the newly-loaded module's own base/size (a pure memory read against
+already-mapped memory, no cross-module call needed), walks that module's
+own `IMAGE_IMPORT_DESCRIPTOR`/`IMAGE_THUNK_DATA64` arrays (again pure
+memory reads, against its own newly-mapped image), and for each import
+whose owning descriptor's DLL name case-insensitively matches one of this
+run's embedded dependency names, resolves that specific import (by name,
+case-sensitively, or by ordinal) against that dependency's own
+by-name/by-ordinal sub-tables -- the EXACT same tables
+`build_windows_getprocaddress_trampoline`'s own `module_table_va` already
+uses, reused rather than reinvented -- and, on a match, overwrites that
+already-snapped IAT slot with the embedded dependency's own resolved VA
+through the same `VirtualProtect`-wrapped dance `build_windows_hook_
+install` uses. See `build_windows_ldr_notification_callback`'s own
+docstring for the full register-allocation derivation (every value that
+must survive a `VirtualProtect` call lives in a non-volatile register, a
+real constraint this builder has that none of the sentinel-based builders
+elsewhere in this module do, since those only ever persist caller-*known*
+constants across a call, never something computed at runtime).
+
+Known, deliberate scope limits for this specific hook (beyond the x64-only
+scope shared with every mechanism in this module):
+
+* Only `LDR_DLL_NOTIFICATION_REASON_LOADED` is handled; `_UNLOADED` is a
+  no-op (nothing here needs to react to a module unloading).
+* A descriptor with no `OriginalFirstThunk` (no unbound import-name table
+  -- old/rare in practice) is skipped entirely: there is no other way to
+  recover by-name/by-ordinal import identity once `FirstThunk` has already
+  been snapped to resolved addresses.
+* An import that doesn't match any hooked dependency's own by-name/by-
+  ordinal sub-table (including an unresolvable forward, same as the
+  GetProcAddress hook's own identical limit above) is left completely
+  untouched -- no patch at all, not even a NULL write, since unlike
+  GetProcAddress's own explicit "not found" contract, there's no way to
+  signal failure back to the loader's own already-completed snap.
+* Confirmed via a real, dedicated end-to-end fixture
+  (`tests/windows/test_pe_hook_runtime.py`'s
+  `test_third_party_plugin_statically_importing_embedded_dependency_
+  resolves_against_embedded_copy`), synthesizing the exact `qwindows.dll`
+  shape: a real, genuinely-still-on-disk third DLL, never itself embedded,
+  loaded dynamically via `LoadLibraryW`, whose own static import table
+  resolves against the embedded dependency correctly -- confirmed
+  unambiguously by deleting the real embedded dependency's own file from
+  disk first, so a failed redirect would make the whole load fail outright
+  rather than silently misbehave.
+
 Assembly mechanism: every byte sequence below is assembled from real
 x86/x64 assembly *source text* by the Keystone assembler engine
 (``keystone-engine``, a deliberate, documented exception to this
@@ -923,6 +1019,355 @@ def build_windows_hook_install(
     lines = ["sub rsp, 0x28"] + lines + ["add rsp, 0x28", "ret"]
     data = _assemble(True, "\n".join(lines))
     data, offsets = _patch_va_sentinels(data, pairs, 8)
+    return data, offsets
+
+
+# -- LdrRegisterDllNotification hook (a module loaded dynamically by -------
+# -- name that itself statically imports an embedded dependency by name) --
+# See this module's own docstring's "Ldr notification hook" section for the
+# full design derivation and the empirical investigation behind it (see
+# also docs/limitations.md). Everything below is x64 only, same scope as
+# the LoadLibraryW/LoadLibraryA/GetProcAddress hook above.
+
+# A distinct range from `_X64_HOOK_INSTALL_SENTINEL_BASE` purely for
+# readability (the two never coexist in the same assembled buffer, so
+# there's no real collision risk in reusing the same range either).
+_X64_LDRHOOK_SENTINEL_BASE = 0x8888000000000000
+
+
+def _make_ldrhook_sentinels(n: int) -> List[int]:
+    return [_X64_LDRHOOK_SENTINEL_BASE + i for i in range(n)]
+
+
+def build_windows_ldr_notification_callback(
+    *, dep_table_va: int, virtualprotect_iat_slot_va: int, scratch_qword_va: int
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code for the ``PLDR_DLL_NOTIFICATION_FUNCTION`` callback
+    registered (by `build_windows_ldr_notification_register` below, via the
+    real `LdrRegisterDllNotification` ntdll export) at hook-install time.
+
+    Confirmed via a real, dedicated empirical investigation (a throwaway C
+    test harness, 3 consistent runs plus register-level confirmation under
+    `cdb`, on a real Windows 11 build -- see `docs/limitations.md` for the
+    full account) before any of this was written: by the time
+    `LDR_DLL_NOTIFICATION_REASON_LOADED` fires for a newly-loaded module,
+    that module's own import-table snap has ALREADY completed (there is no
+    race to design around -- this patches a slot back open after the real
+    loader already resolved it the normal way, not before), that module's
+    own IAT-containing page is read-only at that point (same as the
+    already-known KERNEL32 IAT case `build_windows_hook_install` already
+    handles), and calling a real KERNEL32 function (`VirtualProtect`) from
+    inside the notification callback -- against Microsoft's own documented
+    "unsafe to call other modules" guidance -- worked with no deadlock and
+    no crash in that real test. This is unsupported/undocumented behavior
+    (confirmed empirically on the tested build, not architecturally
+    guaranteed by Microsoft across all future Windows versions), shipped
+    with that same honest framing.
+
+    Called by the real loader with the standard x64 calling convention
+    (``rcx``=NotificationReason, ``rdx``=``PCLDR_DLL_NOTIFICATION_DATA``,
+    ``r8``=Context, all ignored/read-only here); this is a real callback
+    the loader invokes directly (not spliced into this project's own
+    init-call stub, unlike every other builder in this module), so it
+    must obey the full x64 ABI -- every non-volatile register it uses
+    (``rbx``/``rsi``/``rdi``/``rbp``/``r12``-``r15``) is pushed/popped
+    around the whole body, and it ends in a real ``ret`` rather than a
+    tail-jump.
+
+    On `LDR_DLL_NOTIFICATION_REASON_LOADED` (1; any other reason, notably
+    `_UNLOADED` (2), returns immediately): reads the newly-loaded module's
+    own `DllBase`/`SizeOfImage` from the notification data (offsets 24/32
+    of `LDR_DLL_LOADED_NOTIFICATION_DATA`, a pure memory read against
+    already-mapped memory), then walks that module's own PE headers
+    (`e_lfanew` at +0x3C, import-directory RVA at the standard PE32+
+    `IMAGE_NT_HEADERS64` offset for `DataDirectory[IMAGE_DIRECTORY_ENTRY_
+    IMPORT]`, +0x90) and `IMAGE_IMPORT_DESCRIPTOR`/`IMAGE_THUNK_DATA64`
+    arrays -- all pure memory reads against the module's own newly-mapped
+    image, same PE-structure-walking knowledge this project already has in
+    `pe_embedder.py`'s Python code, now needed as raw machine code.
+
+    `dep_table_va` points at a caller-built array of 24-byte entries --
+    `(ansi_name_va: u64, name_table_va: u64, ord_table_va: u64)`,
+    terminated by one all-zero sentinel entry (`ansi_name_va == 0`) --
+    sharing the exact by-name/by-ordinal sub-table shape
+    `build_windows_getprocaddress_trampoline`'s own `module_table_va`
+    already uses (reused, not reinvented): each hooked dependency's own
+    wide/ANSI name match-table entry's ANSI string, paired with that same
+    dependency's own GetProcAddress-hook name/ordinal sub-tables.
+
+    Each import descriptor whose own `Name` string case-insensitively
+    matches one of `dep_table_va`'s entries has every one of its own
+    `IMAGE_THUNK_DATA64` entries (walked via `OriginalFirstThunk` -- the
+    unbound import-name table; a descriptor with no `OriginalFirstThunk`
+    at all, old/rare, is skipped entirely, a deliberate, documented scope
+    limit) resolved against that matched dependency's own by-name (a
+    real `AddressOfData`-pointed `IMAGE_IMPORT_BY_NAME.Name` string,
+    byte-for-byte case-*sensitive* compared, matching real export-name
+    lookup) or by-ordinal (the low 16 bits of the thunk value, when bit 63
+    -- `IMAGE_ORDINAL_FLAG64` -- is set) sub-table; a thunk that matches
+    neither is left completely untouched (no patch, not even a NULL
+    write), the same safe fallback this project already uses elsewhere for
+    an unresolvable forwarded export.
+
+    A matched thunk's real `FirstThunk` IAT slot -- already holding
+    whatever the real loader's own snap pass resolved it to (a real,
+    separately-loaded, now-duplicate copy's address) -- is overwritten
+    with the matched dependency's own resolved VA instead, through the
+    same real `VirtualProtect`-wrap/write/restore dance
+    `build_windows_hook_install` already uses for the exact same reason
+    (a pre-existing IAT slot can live in a read-only page): `rcx`=page-
+    aligned slot address, `edx`=0x1000, `r8d`=`PAGE_READWRITE` (4) for the
+    first call, restoring the real captured `flOldProtect` for the
+    second -- `scratch_qword_va` is reused across every such pair, same
+    convention as `build_windows_hook_install`'s own `scratch_dword_va`
+    (never read back by anything else, no reentrancy concern -- this
+    callback itself only ever runs synchronously on whichever thread
+    triggered the load).
+
+    Register allocation (every value that must survive across a
+    `VirtualProtect` call lives in a non-volatile register, never
+    reloaded from a caller-unknown runtime-computed address the way the
+    sentinel-based builders elsewhere in this module get away with --
+    those only ever persist caller-*known* constants across a call,
+    nothing computed at runtime): `r12`=module base, `r13`=current import
+    descriptor pointer, `rbx`=matched dependency's own name-table VA,
+    `r15`=matched dependency's own ordinal-table VA, `rbp`=current byte
+    offset within the thunk arrays, `r14`=a matched thunk's own resolved
+    VA (only live across the first of the two `VirtualProtect` calls per
+    patched slot). Every slot/page address is cheaply recomputed from
+    `r13`+`r12`+`rbp` right where it's needed rather than cached in yet
+    another register across a call, deliberately -- recomputation is a
+    few bytes of ALU/load, far cheaper than finding another non-volatile
+    register to dedicate to it.
+    """
+    asm = (
+        "push rbx\n"
+        "push rsi\n"
+        "push rdi\n"
+        "push rbp\n"
+        "push r12\n"
+        "push r13\n"
+        "push r14\n"
+        "push r15\n"
+        "sub rsp, 0x20\n"
+        "cmp ecx, 1\n"
+        "jne ldrhook_done\n"
+        "mov r12, [rdx+24]\n"  # r12 = DllBase
+        "mov eax, dword ptr [r12+0x3C]\n"  # e_lfanew
+        "add rax, r12\n"  # rax = nt headers
+        "mov eax, dword ptr [rax+0x90]\n"  # DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress
+        "test eax, eax\n"
+        "jz ldrhook_done\n"
+        "add rax, r12\n"
+        "mov r13, rax\n"  # r13 = import descriptor array
+        "ldrhook_descriptor_loop:\n"
+        "mov eax, dword ptr [r13+12]\n"  # Name RVA
+        "test eax, eax\n"
+        "jz ldrhook_done\n"  # null-terminator descriptor -> walked every real one
+        "add rax, r12\n"
+        "mov rcx, rax\n"  # rcx = this descriptor's own DLL-name cstring, in the loaded module
+        f"mov r15, {{s0}}\n"
+        "ldrhook_match_try:\n"
+        "mov rbx, [r15]\n"
+        "test rbx, rbx\n"
+        "jz ldrhook_next_descriptor\n"  # not one of our dependencies -> leave this descriptor untouched
+        "mov rsi, rcx\n"
+        "mov rdi, rbx\n"
+        "ldrhook_match_char:\n"
+        "movzx eax, byte ptr [rsi]\n"
+        "movzx edx, byte ptr [rdi]\n"
+        "cmp eax, 0x41\n"
+        "jl ldrhook_fold1_done\n"
+        "cmp eax, 0x5A\n"
+        "jg ldrhook_fold1_done\n"
+        "add eax, 0x20\n"
+        "ldrhook_fold1_done:\n"
+        "cmp edx, 0x41\n"
+        "jl ldrhook_fold2_done\n"
+        "cmp edx, 0x5A\n"
+        "jg ldrhook_fold2_done\n"
+        "add edx, 0x20\n"
+        "ldrhook_fold2_done:\n"
+        "cmp eax, edx\n"
+        "jne ldrhook_match_next\n"
+        "test eax, eax\n"
+        "jz ldrhook_match_found\n"
+        "inc rsi\n"
+        "inc rdi\n"
+        "jmp ldrhook_match_char\n"
+        "ldrhook_match_next:\n"
+        "add r15, 24\n"
+        "jmp ldrhook_match_try\n"
+        "ldrhook_match_found:\n"
+        "mov rbx, [r15+8]\n"  # rbx = matched dependency's own name_table_va
+        "mov r15, [r15+16]\n"  # r15 = matched dependency's own ord_table_va
+        "mov eax, dword ptr [r13+0]\n"  # OriginalFirstThunk RVA
+        "test eax, eax\n"
+        "jz ldrhook_next_descriptor\n"  # no INT -> can't identify imports (documented scope limit)
+        "xor ebp, ebp\n"
+        "ldrhook_thunk_loop:\n"
+        "mov eax, dword ptr [r13+0]\n"
+        "add rax, r12\n"
+        "add rax, rbp\n"
+        "mov rax, [rax]\n"  # thunk value (IMAGE_THUNK_DATA64)
+        "test rax, rax\n"
+        "jz ldrhook_next_descriptor\n"  # null-terminated thunk array -> done with this descriptor
+        "mov rdx, 0x8000000000000000\n"  # IMAGE_ORDINAL_FLAG64
+        "test rax, rdx\n"
+        "jnz ldrhook_thunk_ordinal\n"
+        "mov rcx, rax\n"
+        "mov rdx, 0xFFFFFFFF\n"
+        "and rcx, rdx\n"  # rcx = AddressOfData RVA (IMAGE_IMPORT_BY_NAME)
+        "add rcx, r12\n"
+        "add rcx, 2\n"  # skip the Hint WORD -> rcx = import name cstring
+        "mov r9, rbx\n"
+        "ldrhook_name_scan:\n"
+        "mov rax, [r9]\n"
+        "test rax, rax\n"
+        "jz ldrhook_thunk_advance\n"  # not in this dependency's export table -> leave untouched
+        "mov rsi, rax\n"
+        "mov rdi, rcx\n"
+        "ldrhook_name_cmp:\n"
+        "movzx eax, byte ptr [rsi]\n"
+        "movzx edx, byte ptr [rdi]\n"
+        "cmp eax, edx\n"
+        "jne ldrhook_name_next\n"
+        "test eax, eax\n"
+        "jz ldrhook_name_matched\n"
+        "inc rsi\n"
+        "inc rdi\n"
+        "jmp ldrhook_name_cmp\n"
+        "ldrhook_name_next:\n"
+        "add r9, 16\n"
+        "jmp ldrhook_name_scan\n"
+        "ldrhook_name_matched:\n"
+        "mov r14, [r9+8]\n"
+        "jmp ldrhook_patch_slot\n"
+        "ldrhook_thunk_ordinal:\n"
+        "mov rcx, rax\n"
+        "and rcx, 0xFFFF\n"
+        "mov r9, r15\n"
+        "ldrhook_ord_scan:\n"
+        "mov rax, [r9]\n"
+        "cmp rax, -1\n"
+        "je ldrhook_thunk_advance\n"
+        "cmp rax, rcx\n"
+        "je ldrhook_ord_matched\n"
+        "add r9, 16\n"
+        "jmp ldrhook_ord_scan\n"
+        "ldrhook_ord_matched:\n"
+        "mov r14, [r9+8]\n"
+        "ldrhook_patch_slot:\n"
+        "mov eax, dword ptr [r13+16]\n"  # FirstThunk RVA
+        "add rax, r12\n"
+        "add rax, rbp\n"  # rax = this thunk's own real IAT slot address
+        "mov rcx, rax\n"
+        "mov rdx, 0xFFFFFFFFFFFFF000\n"
+        "and rcx, rdx\n"  # rcx = page-aligned slot address
+        "mov edx, 0x1000\n"
+        "mov r8d, 0x4\n"  # PAGE_READWRITE
+        f"mov r9, {{s1}}\n"
+        f"mov rax, {{s2}}\n"
+        "call qword ptr [rax]\n"
+        "mov eax, dword ptr [r13+16]\n"
+        "add rax, r12\n"
+        "add rax, rbp\n"
+        "mov [rax], r14\n"  # the actual redirect: overwrite the already-snapped slot
+        f"mov rax, {{s3}}\n"
+        "mov r8d, dword ptr [rax]\n"  # restore: flNewProtect = the real original value
+        "mov eax, dword ptr [r13+16]\n"
+        "add rax, r12\n"
+        "add rax, rbp\n"
+        "mov rcx, rax\n"
+        "mov rdx, 0xFFFFFFFFFFFFF000\n"
+        "and rcx, rdx\n"
+        "mov edx, 0x1000\n"
+        f"mov r9, {{s4}}\n"
+        f"mov rax, {{s5}}\n"
+        "call qword ptr [rax]\n"
+        "ldrhook_thunk_advance:\n"
+        "add rbp, 8\n"
+        "jmp ldrhook_thunk_loop\n"
+        "ldrhook_next_descriptor:\n"
+        "add r13, 20\n"
+        "jmp ldrhook_descriptor_loop\n"
+        "ldrhook_done:\n"
+        "add rsp, 0x20\n"
+        "pop r15\n"
+        "pop r14\n"
+        "pop r13\n"
+        "pop r12\n"
+        "pop rbp\n"
+        "pop rdi\n"
+        "pop rsi\n"
+        "pop rbx\n"
+        "ret"
+    )
+    s0, s1, s2, s3, s4, s5 = _make_ldrhook_sentinels(6)
+    data = _assemble(True, asm.format(s0=s0, s1=s1, s2=s2, s3=s3, s4=s4, s5=s5))
+    data, offsets = _patch_va_sentinels(
+        data,
+        [
+            (s0, dep_table_va),
+            (s1, scratch_qword_va),
+            (s2, virtualprotect_iat_slot_va),
+            (s3, scratch_qword_va),
+            (s4, scratch_qword_va),
+            (s5, virtualprotect_iat_slot_va),
+        ],
+        8,
+    )
+    return data, offsets
+
+
+def build_windows_ldr_notification_register(
+    *, ldrregisterdllnotification_iat_slot_va: int, callback_va: int, cookie_scratch_va: int
+) -> Tuple[bytes, List[int]]:
+    """x64 machine code that actually installs the callback above, via a
+    real call to ntdll's `LdrRegisterDllNotification(Flags=0,
+    NotificationFunction=callback_va, Context=NULL, Cookie=&scratch)`.
+
+    Spliced into the generated init-call stub as one more synthetic,
+    no-op-DllMain-signature entry (`hinst=0`), prepended alongside
+    `build_windows_hook_install`'s own `__hook_install__` entry -- same
+    "runs before any embedded module's own initializer" ordering
+    requirement, and the same "no live incoming arguments this needs to
+    preserve" calling convention (see `build_windows_hook_install`'s own
+    docstring).
+
+    `ldrregisterdllnotification_iat_slot_va` is an IAT slot address to
+    call *through* (`call qword ptr [slot]`), not
+    `LdrRegisterDllNotification`'s own address directly -- same convention
+    as every other real-API call-through slot this module already uses
+    (`loadlibrarya_iat_slot_va`, `virtualprotect_iat_slot_va`, ...).
+    `cookie_scratch_va` is a caller-supplied writable qword to receive the
+    out-parameter `*Cookie` -- never read back by anything here (this
+    project never calls `LdrUnregisterDllNotification`; see
+    `docs/limitations.md`'s process-detach-cleanup entry for the existing,
+    broader "no teardown" precedent this follows).
+    """
+    asm = (
+        "sub rsp, 0x28\n"
+        "xor ecx, ecx\n"  # Flags = 0
+        "mov rdx, {s0}\n"  # NotificationFunction
+        "xor r8, r8\n"  # Context = NULL
+        "mov r9, {s1}\n"  # &Cookie
+        "mov rax, {s2}\n"
+        "call qword ptr [rax]\n"
+        "add rsp, 0x28\n"
+        "ret"
+    )
+    s0, s1, s2 = _make_ldrhook_sentinels(3)
+    data = _assemble(True, asm.format(s0=s0, s1=s1, s2=s2))
+    data, offsets = _patch_va_sentinels(
+        data,
+        [
+            (s0, callback_va),
+            (s1, cookie_scratch_va),
+            (s2, ldrregisterdllnotification_iat_slot_va),
+        ],
+        8,
+    )
     return data, offsets
 
 
